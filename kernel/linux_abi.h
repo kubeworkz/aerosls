@@ -1389,4 +1389,39 @@ int linux_sig_mask_fault_owned(int sig_active, int fault_active);
 int linux_sig_mask_step(uint64_t cur, uint64_t how, uint64_t set,
                         uint64_t *out);
 
+/* ─── E7 increment 34: the reveal a trap-handler unmask still owes ─────────
+ * Increment 33 answered a trap handler's 14 from the kernel's mask, which
+ * closed the reading half — but an unmask has a second half that is not
+ * arithmetic: a signal that was BLOCKED and is now UNBLOCKED must be
+ * REVEALED, and what that means (discard, terminate, or a refusal this v1
+ * cannot perform) depends on the PENDING set and the dispositions, both of
+ * which live in the sidecar. Answering the call locally therefore left a
+ * bit pending until after the handler returned, where a tkill-delivered
+ * handler has always revealed it inside the call.
+ *
+ * `linux_sig_mask_reveals()` names when that second half exists at all: a
+ * bit that was blocked and is now free. A BLOCK never reveals, a SETMASK
+ * reveals exactly when it clears a blocked bit, and an UNBLOCK reveals when
+ * the bit it lifts was blocked.
+ *
+ * `linux_sig_mask_fault_plan()` is the whole decision the dispatch makes for
+ * one call: the arithmetic plus "does this owe a reveal". 1 with both outputs
+ * written, 0 on a `how` Linux does not have (nothing written, so the caller
+ * answers -EINVAL with the mask unmoved).
+ */
+int linux_sig_mask_reveals(uint64_t old, uint64_t new_mask);
+
+int linux_sig_mask_fault_plan(uint64_t old, uint64_t how, uint64_t set,
+                              uint64_t *new_mask, int *needs_probe);
+
+/* The word that turns a forwarded 14 into that reveal PROBE: the kernel owns
+ * the mask for the window, so the forward carries the mask it computed in
+ * args[4] and this tag in args[5], asks the sidecar to run its reveal ladder
+ * and to leave ITS OWN mask alone (the kernel commits the real one at the
+ * reply). A control request, not the child's call — the child never sees
+ * these words, and the kernel writes them only when it has a reveal to
+ * probe, so no `how` or pointer is being reinterpreted. The sidecar's
+ * SIG_MASK_REVEAL_TAG is the same number (clause AD holds the two). */
+#define LINUX_SIG_REVEAL_TAG 0x53475256ull   /* "SGRV" */
+
 #endif /* LINUX_ABI_H */

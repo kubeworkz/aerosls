@@ -998,6 +998,47 @@ uint64_t k_linux_deliver(uint32_t pid, uint16_t ch_r, uint64_t expect_num) {
                      * hear. linux_sig_return_reply_ok names that single
                      * condition, so the refusal falls through to `return rax`
                      * — which IS that errno — with the frame untouched. */
+                    /* E7 increment 34: the tagged reveal probe's answer.
+                     * The kernel answered the MASK of a trap handler's 14
+                     * itself (increment 33); what it forwarded was only the
+                     * half the sidecar owns — the pending set and the
+                     * dispositions that decide what unblocking a pending
+                     * signal means — so this reply is a verdict, not a
+                     * value: status 0 is "the reveal ran", and the task's
+                     * answer is the mask and the oldset the kernel holds.
+                     * Anything else (E_NOSYS for a reveal this v1 cannot
+                     * perform, or -EPROTO from a malformed answer) is the
+                     * refusal the task hears, with NOTHING moved — not the
+                     * oldset, not the mask. Only on consent are they
+                     * written, oldset first, so a bad pointer is -EFAULT
+                     * with the mask where it was. */
+                    if (expect_num == LINUX_RT_SIGPROCMASK && pd &&
+                        pd->linux_sig_mask_stage_valid) {
+                        uint64_t old = pd->linux_sig_mask_stage_old;
+                        uint64_t nm  = pd->linux_sig_mask_stage_new;
+                        uint64_t dst = pd->linux_sig_mask_stage_dst;
+                        int was_probe = pd->linux_sig_mask_stage_probe;
+                        pd->linux_sig_mask_stage_valid = 0;
+                        pd->linux_sig_mask_stage_probe = 0;
+                        pd->linux_sig_mask_stage_old   = 0;
+                        pd->linux_sig_mask_stage_new   = 0;
+                        pd->linux_sig_mask_stage_dst   = 0;
+                        if (rax != 0) return rax;
+                        if (dst != 0 &&
+                            linux_user_copy_in((const uint8_t *)&old,
+                                               pd->cr3, dst,
+                                               LINUX_SIGSET_BYTES) != 0)
+                            return (uint64_t)(int64_t)(-LINUX_EFAULT);
+                        pd->linux_sig_mask = nm;
+                        kernel_serial_printf(
+                            "[E7] rt_sigprocmask: committed mask %lx\n",
+                            (unsigned long)nm);
+                        if (was_probe)
+                            kernel_serial_printf(
+                                "[E7] fault handler unmask: mask %lx, the reveal ran inside the handler\n",
+                                (unsigned long)nm);
+                        return 0;
+                    }
                     if (expect_num == LINUX_RT_SIGRETURN) {
                         /* E7 increment 32: a FAULT-delivered handler's
                          * return has no sidecar delivery behind it — the
@@ -1135,6 +1176,22 @@ uint64_t k_linux_deliver(uint32_t pid, uint16_t ch_r, uint64_t expect_num) {
                      * refusal rather than the success the reply claimed
                      * for bytes that never landed. */
                     return (uint64_t)(int64_t)(-LINUX_EFAULT);
+                }
+                /* E7 increment 34: this shape is a 14 that carried its
+                 * oldset back, so the kernel's copy of the mask follows the
+                 * call it just answered — on a consent only. The stage is
+                 * consumed either way: a refusal (rax != 0) leaves the copy
+                 * where it was, and a stale stage must never answer a later
+                 * 14. */
+                if (expect_num == LINUX_RT_SIGPROCMASK && pd &&
+                    pd->linux_sig_mask_stage_valid) {
+                    uint64_t nm = pd->linux_sig_mask_stage_new;
+                    pd->linux_sig_mask_stage_valid = 0;
+                    pd->linux_sig_mask_stage_probe = 0;
+                    pd->linux_sig_mask_stage_old   = 0;
+                    pd->linux_sig_mask_stage_new   = 0;
+                    pd->linux_sig_mask_stage_dst   = 0;
+                    if (rax == 0) pd->linux_sig_mask = nm;
                 }
                 return rax;
             }

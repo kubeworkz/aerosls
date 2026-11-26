@@ -39,11 +39,20 @@ static FAULT_HANDLER: &[u8] =
 /// returns through `rt_sigreturn(15)`, so the retried instruction runs.
 static FAULT_RETURN: &[u8] =
     include_bytes!("../fixtures/e7_fault_return_probe.flat");
+/// `fixtures/e7_fault_reveal_probe.S` — E7 increment 34's arm: SIGTERM is
+/// blocked and pended BEFORE the fault, and the trap handler UNBLOCKS it, so
+/// the sidecar's reveal must run inside that call and the task dies there.
+static FAULT_REVEAL: &[u8] =
+    include_bytes!("../fixtures/e7_fault_reveal_probe.flat");
 
 pub const FAULT_NAME: &str = "e7.tdeath.fault.0";
 pub const GROUP_NAME: &str = "e7.tdeath.group.0";
 pub const FAULT_HANDLER_NAME: &str = "e7.fault.handler.0";
 pub const FAULT_RETURN_NAME: &str = "e7.fault.return.0";
+/// E7 increment 34: a SIGTERM blocked before the fault, pending by the time
+/// the handler runs, and UNBLOCKED from inside it — the reveal must run in
+/// the handler, so the task dies there.
+pub const FAULT_REVEAL_NAME: &str = "e7.fault.reveal.0";
 
 pub const PROBE_RESERVE: u64 = 64 * 1024;
 
@@ -170,4 +179,15 @@ pub fn spawn_fault_return<K: aerosls_proto::kabi::Kernel>(
     budget_len: u64,
 ) -> Result<Spawned, i32> {
     spawn_one(k, budget_base, budget_len, FAULT_RETURN, FAULT_RETURN_NAME)
+}
+
+/// E7 increment 34: the fault whose handler UNBLOCKS a pended SIGTERM — the
+/// reveal must run inside the handler (the sidecar's ladder), not after the
+/// return, so the task dies inside the call it made.
+pub fn spawn_fault_reveal<K: aerosls_proto::kabi::Kernel>(
+    k: &K,
+    budget_base: u64,
+    budget_len: u64,
+) -> Result<Spawned, i32> {
+    spawn_one(k, budget_base, budget_len, FAULT_REVEAL, FAULT_REVEAL_NAME)
 }

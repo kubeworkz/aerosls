@@ -962,6 +962,7 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
             static GROUP_SPAWNED: AtomicBool = AtomicBool::new(false);
             static FH_SPAWNED: AtomicBool = AtomicBool::new(false);
             static FR_SPAWNED: AtomicBool = AtomicBool::new(false);
+            static FRV_SPAWNED: AtomicBool = AtomicBool::new(false);
             let n = PASSES.fetch_add(1, Ordering::Relaxed) + 1;
             if n % 4 == 0 {
                 if !FAULT_SPAWNED.load(Ordering::Relaxed) {
@@ -1028,6 +1029,27 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
                             ) {
                                 FR_SPAWNED.store(true, Ordering::Relaxed);
                                 klog(b"[E7] fault-return: spawned ch_r=", sp.ch_r, b"");
+                            }
+                        }
+                    }
+                }
+                // E7 increment 34: an UNMASK inside a trap handler must
+                // REVEAL what it frees. SIGTERM is blocked and pended before
+                // the fault; the handler unblocks it, so the sidecar's reveal
+                // ladder runs inside that call and the task dies there — a
+                // boot line naming sig=15 is the positive, and the handler's
+                // own E7RV-AFTER is the failure.
+                if !FRV_SPAWNED.load(Ordering::Relaxed) {
+                    if let Ok(sp) = crate::e7_thread_death::spawn_fault_reveal(
+                        &RealKernel, caps.budget_base, caps.budget_len) {
+                        if let Ok(vt) = booted.proc.vfs.add_task() {
+                            if crate::linux::track(
+                                sp.ch_r, sp.ch_w,
+                                crate::e7_thread_death::FAULT_REVEAL_NAME,
+                                0, sp.heap_base, sp.heap_limit, vt, false,
+                            ) {
+                                FRV_SPAWNED.store(true, Ordering::Relaxed);
+                                klog(b"[E7] fault-reveal: spawned ch_r=", sp.ch_r, b"");
                             }
                         }
                     }

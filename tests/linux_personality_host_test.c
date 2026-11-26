@@ -1691,6 +1691,9 @@ int main(void)
               linux_reply_zero_ok(LINUX_GETDENTS64) == 1 &&
               /* sigaltstack(&new, NULL) owes no old-stack payload. */
               linux_reply_zero_ok(LINUX_SIGALTSTACK) == 1 &&
+              /* tkill's payload is the delivery; a pending, ignored or
+               * SIG 0 answer owes none and is a 0-byte success. */
+              linux_reply_zero_ok(LINUX_TKILL) == 1 &&
               linux_reply_zero_ok(LINUX_STAT) == 0 &&
               linux_reply_zero_ok(LINUX_CLOCK_GETTIME) == 0 &&
               linux_reply_zero_ok(LINUX_RT_SIGACTION) == 0,

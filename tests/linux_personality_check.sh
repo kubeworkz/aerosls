@@ -68,7 +68,10 @@ for f in kernel/linux_abi.h kernel/linux_abi.c kernel/process.h kernel/process.c
          arch/x86/interrupt.asm arch/x86/switch_lazy.asm \
          kernel/kernel.c kernel/stubs.c tests/fpu_enable_host_test.c \
          tests/user_map_identity_host_test.c tests/linux_clone_host_test.c \
-         tests/linux_fault_return_host_test.c tests/linux_sig_mask_host_test.c; do
+         tests/linux_fault_return_host_test.c tests/linux_sig_mask_host_test.c \
+         tests/linux_fault_reveal_check.sh \
+         user/sidecar/fixtures/e7_fault_reveal_probe.S \
+         user/sidecar/fixtures/e7_fault_reveal_probe.flat; do
     if [ ! -f "$f" ]; then
         echo "ABORT: $f missing — the guard cannot be evaluated at all." >&2
         exit 2
@@ -1836,12 +1839,12 @@ if grep -qF 'int linux_sig_mask_fault_owned(int sig_active, int fault_active);' 
    grep -qF 'case 0: *out = cur | set;  return 1;' "$LABC" && \
    grep -qF 'case 1: *out = cur & ~set; return 1;' "$LABC" && \
    grep -qF 'case 2: *out = set;        return 1;' "$LABC" && \
-   grep -qF 'linux_sig_mask_fault_owned(cur->linux_sig_active,' "$DISP" && \
-   grep -qF 'cur->linux_sig_fault_active)) {' "$DISP" && \
-   [ "$(grep -nF 'if (num == LINUX_RT_SIGPROCMASK &&' "$DISP" | head -1 | cut -d: -f1)" -lt \
+   grep -qF 'int owned = linux_sig_mask_fault_owned(' "$DISP" && \
+   grep -qF 'cur->linux_sig_fault_active);' "$DISP" && \
+   [ "$(grep -nF 'if (num == LINUX_RT_SIGPROCMASK) {' "$DISP" | head -1 | cut -d: -f1)" -lt \
      "$(grep -nF 'linux_syscall_describe(&req, num, largs);' "$DISP" | head -1 | cut -d: -f1)" ] && \
    grep -qF 'linux_user_copy_out((uint8_t *)&set, cur->cr3,' "$DISP" && \
-   grep -qF 'linux_sig_mask_step(old, largs[0], set,' "$DISP" && \
+   grep -qF 'linux_sig_mask_fault_plan(old, largs[0], set,' "$DISP" && \
    grep -qF 'linux_user_copy_in((const uint8_t *)&old, cur->cr3,' "$DISP" && \
    [ "$(grep -nF 'linux_user_copy_in((const uint8_t *)&old, cur->cr3,' "$DISP" | head -1 | cut -d: -f1)" -lt \
      "$(grep -nF 'cur->linux_sig_mask = new_mask;' "$DISP" | head -1 | cut -d: -f1)" ] && \
@@ -1855,6 +1858,60 @@ if grep -qF 'int linux_sig_mask_fault_owned(int sig_active, int fault_active);' 
     ok "AC. the mask inside a trap-delivered handler is the handler's own: the #PF delivery moved the KERNEL's linux_sig_mask to the handler's set while the sidecar — told nothing, because a trap has no round trip — kept the pre-delivery one, so a forwarded 14 reported the narrower set and computed BLOCK/UNBLOCK on the wrong base. linux_sig_mask_fault_owned asks BOTH questions (an installed frame AND a trap delivery), which leaves the tkill path (reply_apply cleared fault_active because the sidecar entered that one and moved its mask) on the forward it always had; linux_sig_mask_step is the sidecar's own arithmetic, replayed in the host test so the two languages cannot drift; the dispatch branch answers from linux_sig_mask, writes the oldset through the validated copy, commits the new mask only after that write lands, posts nothing, and refuses a foreign \`how\` with -EINVAL and the mask unmoved. The live arm's handler asks for its own mask before it fixes the fault and requires 0x400 — the whole set its frame installed — writing E7FR-MASK if it is given the narrower one."
 else
     bad "AC. the mask inside a trap-delivered handler is not wired, in one of the ways that matter: without the branch a forwarded 14 answers the sidecar's stale pre-delivery set (the narrower mask, and the wrong base for BLOCK/UNBLOCK); a gate that asked only 'a handler is active' would take the tkill path's 14 away from the sidecar that moved its mask for it; arithmetic that differed from the sidecar's own would make the two ends disagree in a way no boot line names; committing the mask before the oldset write lands would move state on a call that answers -EFAULT; and a live arm that never asks for the mask leaves the whole window unobserved, which is what E7FR-MASK would have said."
+fi
+
+# ─── AD. E7 increment 34 (P1-C): the reveal an unmask owes ─────────────────
+# Increment 33 made the kernel answer a trap handler's 14 out of its own
+# mask. An unmask has a second half that is not arithmetic: a signal that was
+# BLOCKED and is now UNBLOCKED must be REVEALED, and what that means depends
+# on the PENDING set and the dispositions — both the sidecar's. Answering
+# locally left the bit pending until after the return, which a tkill-delivered
+# handler's unblock has never done.
+#
+# AD pins the whole crossing: the predicate that names when a call frees a bit
+# (old & ~new — the inverse would call every BLOCK a reveal), the single plan
+# the dispatch runs for every 14, the tagged CONTROL forward that spends a
+# round trip only when a reveal is owed, the sidecar arm that runs the SAME
+# ladder the tkill path runs while leaving its own mask alone, and the reply
+# hook that commits the kernel's copy only on a consent.
+#
+# The prerequisite is pinned too: the kernel's mask used to move only at
+# DELIVERIES, so a signal blocked between two signals was invisible to the
+# fault path — its frame carried the wrong mask, and a trap handler could not
+# free a bit the kernel never knew was blocked. Every 14 now stages what it
+# moved to; a refusal commits nothing, and the sidecar still answers every
+# unblock it answered before.
+if grep -qF '#define LINUX_SIG_REVEAL_TAG 0x53475256ull' "$LABH" && \
+   grep -qF 'int linux_sig_mask_reveals(uint64_t old, uint64_t new_mask);' "$LABH" && \
+   grep -qF 'int linux_sig_mask_fault_plan(uint64_t old, uint64_t how, uint64_t set,' "$LABH" && \
+   grep -qF 'return (old & ~new_mask) != 0;' "$LABC" && \
+   grep -qF 'if (needs_probe) *needs_probe = linux_sig_mask_reveals(old, nm);' "$LABC" && \
+   grep -qF 'int owned = linux_sig_mask_fault_owned(' "$DISP" && \
+   grep -qF 'cur->linux_sig_fault_active);' "$DISP" && \
+   grep -qF 'linux_sig_mask_fault_plan(old, largs[0], set,' "$DISP" && \
+   grep -qF 'if (owned && !probe) {' "$DISP" && \
+   grep -qF 'cur->linux_sig_mask_stage_dst   = owned ? largs[2] : 0;' "$DISP" && \
+   grep -qF 'largs[5] = LINUX_SIG_REVEAL_TAG;' "$DISP" && \
+   [ "$(grep -nF 'cur->linux_sig_mask_stage_valid = 1;' "$DISP" | head -1 | cut -d: -f1)" -lt \
+     "$(grep -nF 'linux_syscall_describe(&req, num, largs);' "$DISP" | head -1 | cut -d: -f1)" ] && \
+   grep -qF '[E7] fault handler unmask: mask %lx, the reveal ran inside the handler' "$CANC" && \
+   grep -qF 'if (rax == 0) pd->linux_sig_mask = nm;' "$CANC" && \
+   [ "$(grep -nF 'if (rax == 0) pd->linux_sig_mask = nm;' "$CANC" | head -1 | cut -d: -f1)" -gt \
+     "$(grep -nF 'linux_user_copy_in(pay, pd->cr3, sva, n) != 0' "$CANC" | head -1 | cut -d: -f1)" ] && \
+   grep -qF 'const SIG_MASK_REVEAL_TAG: u64 = 0x5347_5256;' "$LRS" && \
+   grep -qF '} else if args[5] == SIG_MASK_REVEAL_TAG {' "$LRS" && \
+   grep -qF 'fn reveal_verdict(sig: &SigState, new_mask: u64) -> (u8, u64) {' "$LRS" && \
+   [ "$(grep -cF 'sig.mask = new_mask;' "$LRS")" -eq 1 ] && \
+   grep -qF 'linux_sig_mask_reveals(0x4400ull, 0x400ull) == 1' tests/linux_sig_mask_host_test.c && \
+   grep -qF 'linux_sig_mask_fault_plan(0x4400ull, 1, term_bit, &new_mask,' tests/linux_sig_mask_host_test.c && \
+   grep -qF 'linux_sig_mask_reveals(0x400ull, 0x400ull) == 0' tests/linux_sig_mask_host_test.c && \
+   grep -qF 'E7RV-AFTER' user/sidecar/fixtures/e7_fault_reveal_probe.S && \
+   grep -qF 'pub fn spawn_fault_reveal<' user/sidecar/src/e7_thread_death.rs && \
+   grep -qF 'crate::e7_thread_death::spawn_fault_reveal' "$LRE" && \
+   grep -qF 'sig=15 default-action -> kill' tests/linux_fault_reveal_check.sh; then
+    ok "AD. an unmask inside a trap-delivered handler REVEALS what it frees: a bit that leaves the mask (old & ~new) may be pending, and only the sidecar knows the pending set and the dispositions that decide what revealing it means — so the kernel forwards a TAGGED control probe (the mask in args[4], LINUX_SIG_REVEAL_TAG in args[5]) instead of the child's call, the sidecar runs the SAME reveal ladder the tkill arm has always run while leaving its own mask alone, and the kernel commits its copy (and writes the oldset) only on the sidecar's consent, so a refusal moves nothing and the two copies still agree after the return. The prerequisite is wired too: every 14 now stages the mask it moved to, so a signal blocked BEFORE a fault is in the fault frame's mask and can be freed inside the handler at all — a tkill-delivered handler's unblock is untouched, still answered by the sidecar. The live arm blocks SIGTERM, pends it with tkill, faults, and unblocks it from the handler: the sidecar's ladder must kill the task inside that call (\`sig=15 default-action -> kill\`, after E7RV-ARM), so the handler's own E7RV-AFTER is the named failure."
+else
+    bad "AD. an unmask inside a trap-delivered handler still skips the reveal, in one of the ways that matter: without the probe the bit stays pending until after the return (the handler runs on and writes E7RV-AFTER); a probe that fired on a mask which never freed a bit would spend a round trip on every BLOCK, and one that used new & ~old would call every BLOCK a reveal; a sidecar arm that moved its own mask would recreate the divergence increment 33 closed; a commit before the sidecar's consent would move the mask on a call that answers E_NOSYS; and a kernel whose mask only moves at DELIVERIES cannot see a block made before the fault, so the handler could not free that bit even with the probe wired."
 fi
 
 # ─── P. E7 increment 26 (P1-C): the signal frame ───────────────────────────

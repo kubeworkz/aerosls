@@ -80,9 +80,13 @@ FILES=(
     # the returning arm's fixture and its check script — same rule as D.
     tests/linux_fault_return_host_test.c
     tests/linux_fault_return_check.sh
-    # AC (increment 33, the mask inside a trap handler) reads its own host
-    # test, same rule.
+    # AC (increment 33, the mask inside a trap handler) and AD (increment 34,
+    # the reveal an unmask owes) read their own host test, the revealing arm's
+    # fixture and its LIVE check — same rule as above.
     tests/linux_sig_mask_host_test.c
+    tests/linux_fault_reveal_check.sh
+    user/sidecar/fixtures/e7_fault_reveal_probe.S
+    user/sidecar/fixtures/e7_fault_reveal_probe.flat
     user/sidecar/fixtures/e7_fault_return_probe.S
     user/sidecar/fixtures/e7_fault_return_probe.flat
     # Y (the soft mprotect transition) reads the helper's fake-table test.
@@ -1440,8 +1444,28 @@ tooth fault-mask-uncommitted AC "the kernel answered 14 without committing the m
 # tkill path's rt_sigprocmask — whose mask the sidecar moved before it
 # answered, and whose frame it entered — is answered by the kernel instead.
 seed "$W/t168"
-sed -i 's/cur->linux_sig_fault_active)) {/1)) {/' "$W/t168/kernel/syscall_dispatch.c"
+sed -i 's/int owned = linux_sig_mask_fault_owned(/int owned = 1 || linux_sig_mask_fault_owned(/' "$W/t168/kernel/syscall_dispatch.c"
 tooth fault-mask-gate-too-wide AC "the kernel claimed a sidecar-delivered handler's mask" "$W/t168"
+
+# t169: the probe is never tagged, so the forward stays the child's own call
+# and the sidecar answers it as the ordinary arm does — the reveal the window
+# owes never runs, and the pending bit waits for after the return.
+seed "$W/t169"
+sed -i '/largs\[5\] = LINUX_SIG_REVEAL_TAG;/d' "$W/t169/kernel/syscall_dispatch.c"
+tooth fault-reveal-untagged AD "the reveal probe stopped being tagged" "$W/t169"
+
+# t170: the sidecar stops recognising the probe, so the tagged request falls
+# through to the ordinary arm — which parses it as a QUERY (no set, no oldset)
+# and answers 0 without a single reveal.
+seed "$W/t170"
+sed -i 's/if args\[5\] == SIG_MASK_REVEAL_TAG {/if false {/' "$W/t170/user/sidecar/src/linux.rs"
+tooth fault-reveal-arm-gone AD "the sidecar stopped recognising the reveal probe" "$W/t170"
+
+# t171: the kernel commits the staged mask whatever the sidecar answered, so a
+# refused reveal moves the mask it was asked to keep still.
+seed "$W/t171"
+sed -i 's/if (rax == 0) pd->linux_sig_mask = nm;/pd->linux_sig_mask = nm;/' "$W/t171/kernel/chan.c"
+tooth fault-reveal-blind-commit AD "the kernel committed the mask without the sidecar's consent" "$W/t171"
 
 echo
 echo "linux_personality_check_smoke: $pass passed, $fail failed"

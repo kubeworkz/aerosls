@@ -941,6 +941,15 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                 cur->reply_stage_kind  = 0;
                 cur->reply_stage_aux   = 0;
                 cur->reply_stage_valid = 0;
+                /* E7 increment 34: a reveal probe's stage lives for exactly
+                 * one forward, so it is cleared here with the rest — a
+                 * stage from a forward that never reached a reply must not
+                 * commit its mask at a later 14. */
+                cur->linux_sig_mask_stage_valid = 0;
+                cur->linux_sig_mask_stage_probe = 0;
+                cur->linux_sig_mask_stage_old   = 0;
+                cur->linux_sig_mask_stage_new   = 0;
+                cur->linux_sig_mask_stage_dst   = 0;
                 /* E7 increment 5, plan half: BEFORE the describe (the
                  * clamp must be IN the description) and before the
                  * channel lookup (a refusal the first trap can produce
@@ -1040,11 +1049,26 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                  * handler AND moved the sidecar's mask before answering, so
                  * it clears linux_sig_fault_active — which is what
                  * linux_sig_mask_fault_owned asks beside sig_active. */
-                if (num == LINUX_RT_SIGPROCMASK &&
-                    linux_sig_mask_fault_owned(cur->linux_sig_active,
-                                               cur->linux_sig_fault_active)) {
+                if (num == LINUX_RT_SIGPROCMASK) {
+                    /* E7 increment 34: whose mask answers, whether the call
+                     * owes a REVEAL, and — the prerequisite both rest on —
+                     * the kernel's own copy of the thread's blocked set,
+                     * which this forward is about to change. Until now that
+                     * copy moved only at DELIVERIES, so a guest that blocked
+                     * a signal (or unblocked one) between two signals was
+                     * invisible to the fault path: its frame would carry the
+                     * wrong mask, and a trap handler could not free a bit the
+                     * kernel never knew was blocked. Every 14 therefore
+                     * stages what it moved to, and the reply hook commits it
+                     * only on a consent — the sidecar still answers every
+                     * unblock it answered before, unchanged. */
+                    int owned = linux_sig_mask_fault_owned(
+                                    cur->linux_sig_active,
+                                    cur->linux_sig_fault_active);
                     uint64_t old = cur->linux_sig_mask;
                     uint64_t new_mask = old;
+                    int probe = 0;
+                    int planned = 0;
 
                     if (largs[1] != 0) {
                         uint64_t set = 0;
@@ -1052,31 +1076,95 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                                                 largs[1],
                                                 LINUX_SIGSET_BYTES) != 0)
                             return (uint64_t)(int64_t)(-LINUX_EFAULT);
-                        if (!linux_sig_mask_step(old, largs[0], set,
-                                                 &new_mask)) {
-                            kernel_serial_printf(
-                                "[E7] rt_sigprocmask inside a fault handler "
-                                "refused: how=%lu is not BLOCK/UNBLOCK/"
-                                "SETMASK\n",
-                                (unsigned long)largs[0]);
-                            return (uint64_t)(int64_t)(-LINUX_EINVAL);
+                        planned = linux_sig_mask_fault_plan(old, largs[0], set,
+                                                           &new_mask, &probe);
+                        if (!planned) {
+                            /* A `how` Linux does not have. The trap window
+                             * answers for itself (increment 33's EINVAL);
+                             * outside it the sidecar's own arm answers,
+                             * exactly as before — and nothing is staged,
+                             * because a refusal moves nothing. */
+                            if (owned) {
+                                kernel_serial_printf(
+                                    "[E7] rt_sigprocmask inside a fault "
+                                    "handler refused: how=%lu is not "
+                                    "BLOCK/UNBLOCK/SETMASK\n",
+                                    (unsigned long)largs[0]);
+                                return (uint64_t)(int64_t)(-LINUX_EINVAL);
+                            }
                         }
                     }
-                    /* The oldset is the mask BEFORE this call, written
-                     * through the validated copy; the new mask is committed
-                     * only after that write lands, so a bad oldset pointer
-                     * is -EFAULT with nothing moved. */
-                    if (largs[2] != 0 &&
-                        linux_user_copy_in((const uint8_t *)&old, cur->cr3,
-                                           largs[2],
-                                           LINUX_SIGSET_BYTES) != 0)
-                        return (uint64_t)(int64_t)(-LINUX_EFAULT);
-                    cur->linux_sig_mask = new_mask;
+                    if (owned && !probe) {
+                        /* E7 increment 33's answer, unchanged: nothing went
+                         * from BLOCKED to UNBLOCKED, so nothing can be
+                         * revealed and the arithmetic IS the whole call. The
+                         * oldset is written through the validated copy and
+                         * the mask committed only after it lands, so a bad
+                         * pointer is -EFAULT with nothing moved. */
+                        if (largs[2] != 0 &&
+                            linux_user_copy_in((const uint8_t *)&old, cur->cr3,
+                                               largs[2],
+                                               LINUX_SIGSET_BYTES) != 0)
+                            return (uint64_t)(int64_t)(-LINUX_EFAULT);
+                        cur->linux_sig_mask = new_mask;
+                        kernel_serial_printf(
+                            "[E7] rt_sigprocmask in a fault handler: oldset "
+                            "%lx -> %lx (the kernel is the mask's authority "
+                            "here)\n",
+                            (unsigned long)old, (unsigned long)new_mask);
+                        return 0;
+                    }
+                    /* E7 increment 34: this call frees a blocked bit, so it
+                     * may REVEAL a pending signal — and `pending` and the
+                     * dispositions that decide what a reveal means are the
+                     * sidecar's, not the kernel's. The kernel still owns the
+                     * mask for the window, so the forward is a tagged
+                     * CONTROL request rather than the child's call: SETMASK
+                     * (a shape the 14 arm already parses), no set and no
+                     * oldset pointers, no payload, the mask it computed in
+                     * args[4] and the tag in args[5]. The sidecar runs its
+                     * own reveal ladder and leaves ITS mask alone; a consent
+                     * commits ours at the reply (kernel/chan.c) and a refusal
+                     * moves nothing at all — so the two copies still agree
+                     * after the return, and a tkill-delivered handler's
+                     * unblock is untouched (the whole window is gated on the
+                     * trap flag above). */
+                    if (!planned) {
+                        /* A query moves nothing: no stage, and the forward
+                         * below is the child's own call. */
+                    } else {
+                    cur->linux_sig_mask_stage_valid = 1;
+                    cur->linux_sig_mask_stage_probe = owned ? 1 : 0;
+                    cur->linux_sig_mask_stage_old   = old;
+                    cur->linux_sig_mask_stage_new   = new_mask;
+                    cur->linux_sig_mask_stage_dst   = owned ? largs[2] : 0;
+                    if (!owned) {
+                        /* The sidecar answers this one — a tkill-delivered
+                         * handler's unblock, or an ordinary task's call.
+                         * Nothing about that changed: the stage only lets the
+                         * reply hook keep the KERNEL's copy in step, which
+                         * the fault window and the fault delivery's blocked
+                         * check both read. */
+                        kernel_serial_printf(
+                            "[E7] rt_sigprocmask: mask %lx staged for the reply\n",
+                            (unsigned long)new_mask);
+                    } else {
+                    plan.src  = 0;
+                    plan.len  = 0;
+                    rplan.dst = 0;
+                    rplan.len = 0;
+                    rplan.aux = 0;
+                    rplan.kind = LINUX_STAGE_NONE;
+                    largs[0] = 2;   /* the arm's SETMASK shape          */
+                    largs[1] = 0;   /* no set, no oldset, no payload    */
+                    largs[2] = 0;
+                    largs[4] = new_mask;
+                    largs[5] = LINUX_SIG_REVEAL_TAG;
                     kernel_serial_printf(
-                        "[E7] rt_sigprocmask in a fault handler: oldset %lx "
-                        "-> %lx (the kernel is the mask's authority here)\n",
-                        (unsigned long)old, (unsigned long)new_mask);
-                    return 0;
+                        "[E7] fault handler unmask: forwarding the reveal, mask %lx\n",
+                        (unsigned long)new_mask);
+                    }
+                    }
                 }
                 /* E7 increment 6 (the mem class, §5.4), stage half: a
                  * brk's requested break is captured HERE — before the

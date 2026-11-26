@@ -4543,12 +4543,21 @@ the forward it always had — its mask was never the kernel's to answer.
 
 **What the window does not do, by name.** The sidecar's pending *reveal* — the
 unblock that delivers a blocked `tkill` — is itself a delivery and needs the
-sidecar, so a `SIG_UNBLOCK` inside a trap-delivered handler moves the mask
-without revealing; the bit stays pending and the first forwarded 14 after the
-return reveals it, which is a legal POSIX timing. And a nested delivery
-inside such a handler still nests two frames: unchanged by this increment.
-At the return the two agree again for free — the kernel restores
-`uc_sigmask`, the pre-handler set, and the sidecar never left that value.
+sidecar, so an unmask here answered the mask and left the reveal for after
+the return (closed by §10.29, which forwards a tagged probe for exactly that
+half). A nested delivery inside such a handler still nests two frames:
+unchanged by this increment. At the return the two agree again for free — the
+kernel restores `uc_sigmask`, the pre-handler set, and the sidecar never left
+that value.
+
+**The prerequisite §10.29 needed, recorded here because §10.28 is where it
+bit.** `pd->linux_sig_mask` moved only at DELIVERIES, so a guest that blocked
+or unblocked a signal between two signals was invisible to the fault path:
+the frame it built carried the wrong mask, and a trap handler could not free a
+bit the kernel never knew was blocked. Every forwarded 14 now stages the
+mask it moved to and the reply hook commits it on a consent only — the
+sidecar still answers every unblock it answered before, and the kernel's
+copy finally follows the thread's own blocks.
 
 **Evidence.** `tests/linux_sig_mask_host_test.c` (22 checks, links the real
 `linux_abi.c`): the gate's four corners — trap frame answers, a
@@ -4568,6 +4577,92 @@ is handed the narrower one, and the boot's own account of the same answer is
 (the answer is never committed, so later BLOCK/UNBLOCK compute on a stale
 base), **t168** (the gate stops asking whether the frame came from the trap,
 so the sidecar's own delivery is answered by the kernel).
+
+---
+
+## 10.29 E7 increment 34 — the reveal an unmask owes
+
+Increment 33 answered a trap handler's `rt_sigprocmask` out of the kernel's
+mask, which closed the *reading* half. An unmask has a second half that is
+not arithmetic: a signal that was BLOCKED and is now UNBLOCKED must be
+**revealed** — discarded if its disposition is IGN, terminated if its default
+action terminates, refused if this v1 cannot perform it — and what that means
+depends on the PENDING set and the dispositions, both of which live in the
+sidecar. Answering locally therefore left the bit pending until after the
+handler returned, where a tkill-delivered handler's unmask has always
+revealed it *inside the call*.
+
+**The stage this needed first.** `pd->linux_sig_mask` used to move only at
+deliveries, so a block made between two signals never reached the fault path:
+the frame carried the wrong mask, and a handler could not free a bit the
+kernel did not know existed. Every forwarded 14 now stages the mask it moved
+to (`linux_sig_mask_stage_*`) and the reply hook commits it **only on a
+consent** — a refusal moves nothing, exactly as the sidecar's own arm leaves
+it. With that, a signal blocked before a fault is in the frame's mask and can
+be freed from inside the handler at all.
+
+**The second thing the arm found: a pending `tkill` was `-EPROTO`.** The
+stage's 80-byte delivery request belongs to a handler disposition alone, but
+the kernel arms that stage for EVERY forwarded `tkill` — the disposition is
+the sidecar's to read, so the kernel cannot know which answer it will get —
+and the shape-1 rule refuses a *payloadless* success on a staged number.
+Every pending, ignored and `SIG 0` tkill therefore came back `-EPROTO` to a
+task that asked for no protocol, and the live arm's own `tkill` step is where
+it surfaced: the bit was pending (the sidecar said so) and the call still
+reported failure, so the fixture went to its `E7RV-FAIL` line instead of the
+fault. `linux_reply_zero_ok()` now names tkill beside read and getdents64 —
+a payloadless success is the 0 Linux answers — while a delivery answer that
+arrives WITHOUT its frame is still refused: that reply is 80 bytes and
+shape 2, where `linux_reply_shape_ok` holds `n` to the exact bound, so
+Increment 28's P9 clause keeps its teeth (t149's narrowed bound is still
+caught).
+
+**The probe.** `linux_sig_mask_reveals(old, new)` names when a call frees a
+bit — `old & ~new`, not `new & ~old`, or every BLOCK would read as a reveal.
+`linux_sig_mask_fault_plan()` is the one decision the dispatch makes for a
+14: the new mask plus whether it owes a reveal. When it does, the forward
+stops being the child's call and becomes a tagged **control request**:
+`SIG_SETMASK` (a shape the arm already parses), no set and no oldset
+pointers, no payload, the mask the kernel computed in `args[4]` and
+`LINUX_SIG_REVEAL_TAG` in `args[5]`. The sidecar's `reveal_verdict()` — the
+same ladder the ordinary arm calls, lifted out so the two cannot drift —
+runs over its own `pending` and dispositions, and its tagged arm deliberately
+leaves `sig.mask` alone: the kernel owns that for the window and restores the
+frame's at the return, so moving it here would recreate the divergence §10.28
+closed. The answer is a verdict, not a value: status 0 commits the staged
+mask (writing the oldset through the validated copy first), and anything else
+is the refusal the task hears with nothing moved.
+
+**Whose call is whose.** The whole window is gated on the TRAP flag, so a
+tkill-delivered handler's unmask is untouched — it still goes to the sidecar,
+whose copy it moved at the delivery, and whose answer the child has always
+heard. The control request exists only where the kernel answers the mask and
+the sidecar answers the reveal, and the two must not be swapped.
+
+**What stays open.** The nested-delivery limit from §10.28 is unchanged (a
+delivery inside a trap handler still nests two frames), and `pending` is
+still a bitmask with `tkill` as its only producer.
+
+**Evidence.** `tests/linux_sig_mask_host_test.c` (39 checks now — 22 from
+§10.28, 17 here): the reveal predicate both ways, the live arm's own numbers
+(SIGTERM blocked before the fault, freed from a 0x4400 handler mask), BLOCK
+and identity owing no probe, a `SETMASK` that drops blocked bits owing one,
+a foreign `how` writing neither output, and the tag being one number for both
+ends. Clause **AD** pins the crossing and its order (the stage is armed
+before the describe, the commit sits after the payload copy, the sidecar's
+file has exactly ONE `sig.mask = new_mask;`, which is the ordinary arm's).
+`tests/linux_personality_host_test.c` (249 checks) carries the prerequisite
+the arm needed: tkill's three payloadless successes are 0-byte successes
+alongside read and getdents64, while a staged struct number still refuses
+one.
+The live arm `e7.fault.reveal.0` blocks SIGTERM, pends it with `tkill`, faults
+into its handler, and unblocks it there: the sidecar's ladder must kill the
+task inside that call, so the boot shows
+`[E7] fault handler unmask: forwarding the reveal, mask 400` and then
+`sig=15 default-action -> kill` after `E7RV-ARM`, with the handler's own
+`E7RV-AFTER` the named failure (`tests/linux_fault_reveal_check.sh`). Teeth:
+**t169** (the probe is never tagged), **t170** (the sidecar stops recognising
+it), **t171** (the kernel commits without the sidecar's consent).
 
 ---
 

@@ -10,8 +10,17 @@
  * no round trip to carry the mask. Its copy therefore still holds the
  * pre-delivery set, and a forwarded 14 from inside the handler reported that
  * narrower mask — while a BLOCK/UNBLOCK there did its arithmetic on the wrong
- * base. Increment 32 named the split; this increment closes it by making the
- * kernel the mask's authority for exactly that window.
+ * base. Increment 32 named the split; increment 33 closed the reading half
+ * by making the kernel the mask's authority for exactly that window, and
+ * increment 34 closes the second half — the REVEAL an unmask owes.
+ *
+ * Sections 1–5 are increment 33's (whose copy answers, with what
+ * arithmetic). Section 6 is increment 34's: whether moving to a mask FREES
+ * anything (only then can a pending signal be revealed), the single plan the
+ * dispatch runs for every rt_sigprocmask, the tag the probe rides, and that
+ * the kernel's copy of the mask follows the thread's own blocks — which is
+ * what lets a signal blocked BEFORE a fault be freed inside its handler at
+ * all.
  *
  *   linux_sig_mask_fault_owned() — WHOSE copy answers. Both flags, so the
  *     tkill path (a frame the SIDECAR entered, whose mask it moved before it
@@ -146,6 +155,77 @@ int main(void)
     CHECK(linux_sig_mask_step(0x400ull, 2, 0ull, &new_mask) == 1 &&
           new_mask == 0ull,
           "SETMASK 0 clears the mask — the handler may lift its own signal");
+
+    /* ═══ 6. The unmask that must REVEAL (increment 34) ════════════════ */
+    int probe = 0;
+    const uint64_t term_bit = 1ull << (15 - 1);   /* SIGTERM's bit, 0x4000 */
+
+    CHECK(term_bit == 0x4000ull,
+          "SIGTERM is bit 14 — the bit the live arm frees from a handler");
+
+    /* A bit can only be revealed if it WAS blocked, so the rule is
+     * old & ~new: what left the mask. (The inverse — new & ~old — would
+     * call every BLOCK a reveal and every UNBLOCK a non-event.) */
+    CHECK(linux_sig_mask_reveals(0x400ull, 0x400ull) == 0,
+          "nothing left the mask: nothing can be revealed");
+    CHECK(linux_sig_mask_reveals(0x400ull, 0ull) == 1,
+          "freeing the handler's own signal is a reveal");
+    CHECK(linux_sig_mask_reveals(0x400ull, 0x402ull) == 0,
+          "SIG_BLOCK only ADDS to the mask, so it never reveals");
+    CHECK(linux_sig_mask_reveals(0x402ull, 0x400ull) == 1,
+          "SIG_UNBLOCK of a blocked bit is a reveal");
+    CHECK(linux_sig_mask_reveals(0ull, ~0ull) == 0,
+          "a mask that only grows frees nothing");
+
+    /* The live arm's numbers: the kernel's mask now tracks the thread's own
+     * blocked set (0x4000 — SIGTERM blocked BEFORE the fault), the delivery
+     * adds SIGSEGV's bit, and the handler frees SIGTERM again. */
+    CHECK(linux_sig_mask_reveals(0x4400ull, 0x400ull) == 1,
+          "SIGTERM blocked before the fault, freed inside the handler, IS a\n"
+          "      reveal — the case the increment exists for");
+    CHECK(linux_sig_mask_step(0ull, 0, term_bit, &new_mask) == 1 &&
+          new_mask == 0x4000ull,
+          "the pre-fault block is a mask the kernel now tracks (it used to\n"
+          "      move only at deliveries, so the fault frame lost it)");
+
+    CHECK(linux_sig_mask_fault_plan(0x4400ull, 1, term_bit, &new_mask,
+                                    &probe) == 1 &&
+          new_mask == 0x400ull && probe == 1,
+          "the live arm's unblock moves to 0x400 and owes a probe");
+    CHECK(linux_sig_mask_fault_plan(0x400ull, 0, 0x2ull, &new_mask,
+                                    &probe) == 1 &&
+          new_mask == 0x402ull && probe == 0,
+          "BLOCK is arithmetic only: no probe, so no round trip is spent");
+    CHECK(linux_sig_mask_fault_plan(0x400ull, 2, 0x400ull, &new_mask,
+                                    &probe) == 1 &&
+          new_mask == 0x400ull && probe == 0,
+          "SETMASK to the mask already in force owes nothing");
+    CHECK(linux_sig_mask_fault_plan(0x4400ull, 2, term_bit, &new_mask,
+                                    &probe) == 1 &&
+          new_mask == term_bit && probe == 1,
+          "a SETMASK that drops blocked bits owes a reveal for them");
+
+    new_mask = 0xDEADBEEFull;
+    probe = 7;
+    CHECK(linux_sig_mask_fault_plan(0x4400ull, 9, 0ull, &new_mask, &probe) == 0 &&
+          new_mask == 0xDEADBEEFull && probe == 7,
+          "a foreign `how` refuses and writes NEITHER output, so the caller\n"
+          "      answers -EINVAL with the mask unmoved");
+    CHECK(linux_sig_mask_fault_plan(0x4400ull, 1, term_bit, NULL, NULL) == 0,
+          "no output pointer is a refusal, never a write through NULL");
+    CHECK(linux_sig_mask_fault_plan(0x4400ull, 1, term_bit, &new_mask, NULL) == 1 &&
+          new_mask == 0x400ull,
+          "the probe flag is optional; the arithmetic is not");
+    {
+        uint64_t a = 0, b = 0;
+        CHECK(linux_sig_mask_step(0x4400ull, 1, term_bit, &a) == 1 &&
+              linux_sig_mask_fault_plan(0x4400ull, 1, term_bit, &b, NULL) == 1 &&
+              a == b,
+              "the plan's mask IS step()'s — one arithmetic, not two");
+    }
+    CHECK(LINUX_SIG_REVEAL_TAG == 0x53475256ull,
+          "the probe's tag is the one number both ends carry (the sidecar's\n"
+          "      SIG_MASK_REVEAL_TAG, held to it by clause AD)");
 
     printf("\nlinux_sig_mask_host_test: %d passed, %d failed\n",
            checks_passed, checks_failed);

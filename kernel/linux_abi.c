@@ -1182,6 +1182,18 @@ int linux_reply_zero_ok(uint64_t num)
      * payload. When args[1] is non-NULL the sidecar returns the 24-byte
      * stack_t and this arm is not reachable for it (shape 2). */
     if (num == LINUX_SIGALTSTACK) return 1;
+    /* tkill's staged payload IS the delivery request, and only a handler
+     * disposition owes one (shape 2, 80 bytes). The other three successes
+     * of that same arm owe NOTHING and Linux answers 0 for each: the
+     * signal was blocked and now PENDS, its disposition is SIG_IGN, or the
+     * call is the SIG 0 existence probe. The stage is armed for every
+     * forwarded tkill because the kernel cannot know which answer the
+     * disposition will produce, so without this rule the shape-1 check
+     * would refuse all three with -EPROTO — a protocol complaint to a task
+     * that asked for none. A delivery answer that arrives WITHOUT its
+     * frame is still refused: that reply is 80 bytes and shape 2, where
+     * linux_reply_shape_ok holds n to the exact bound. */
+    if (num == LINUX_TKILL) return 1;
     return 0;
 }
 
@@ -1504,6 +1516,32 @@ int linux_sig_mask_step(uint64_t cur, uint64_t how, uint64_t set,
     case 2: *out = set;        return 1;   /* SIG_SETMASK */
     default: return 0;                     /* not a `how` Linux has */
     }
+}
+
+/* E7 increment 34: does moving from `old` to `new_mask` UNBLOCK anything?
+ * That is the only way a pending signal can be revealed, so it is the whole
+ * condition under which the call owes the sidecar a probe — the arithmetic
+ * is the kernel's (increment 33), the reveal is not. Total and pure: a bit
+ * that was already free cannot be revealed by freeing it again. */
+int linux_sig_mask_reveals(uint64_t old, uint64_t new_mask)
+{
+    return (old & ~new_mask) != 0;
+}
+
+/* The one decision the dispatch makes for a trap handler's 14: the new mask
+ * (the sidecar's own arithmetic) and whether the call also owes a reveal.
+ * Both outputs are written only on success, so a refusal is -EINVAL with the
+ * caller's state exactly as it was. */
+int linux_sig_mask_fault_plan(uint64_t old, uint64_t how, uint64_t set,
+                              uint64_t *new_mask, int *needs_probe)
+{
+    uint64_t nm = 0;
+
+    if (!new_mask) return 0;
+    if (!linux_sig_mask_step(old, how, set, &nm)) return 0;
+    *new_mask = nm;
+    if (needs_probe) *needs_probe = linux_sig_mask_reveals(old, nm);
+    return 1;
 }
 
 int linux_sig_deliver(uint64_t root, const struct LinuxSigDeliverReq *req,

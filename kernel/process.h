@@ -342,6 +342,19 @@ struct ProcessDescriptor {
      * frame and never moved the sidecar's mask, is the authority for this
      * one return. See linux_sig_fault_return_ok(). */
     uint8_t    linux_sig_fault_active;
+    /* E7 increment 34: the mask a trap handler's unmask moved to, while the
+     * REVEAL half of that call is out on the wire. The kernel answers the
+     * arithmetic itself (increment 33) but the pending set and the
+     * dispositions are the sidecar's, so an unmask that frees a blocked bit
+     * forwards a tagged probe — and commits the mask only when the sidecar
+     * consents, exactly like every other staged forward. Cleared at the head
+     * of every forward beside the other stages, consumed (or dropped) at the
+     * reply, so no stage can outlive the call that armed it. */
+    uint8_t    linux_sig_mask_stage_valid;
+    uint8_t    linux_sig_mask_stage_probe;  /* 1 = the tagged reveal probe */
+    uint64_t   linux_sig_mask_stage_old;   /* the mask the oldset reports */
+    uint64_t   linux_sig_mask_stage_new;   /* what the call moves to       */
+    uint64_t   linux_sig_mask_stage_dst;   /* the child's oldset pointer   */
     uint64_t   linux_cr2;
     /* E7 increment 31: the KERNEL's own copy of the four fault signals'
      * actions, recorded from the bytes the guest installs at rt_sigaction's

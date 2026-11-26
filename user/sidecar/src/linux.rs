@@ -210,6 +210,15 @@ const GATE_EPOCH_SECS: u64 = 1_767_744_000;
 const SIGACT_BYTES: usize = 32; /* kernel-ABI struct sigaction: four u64s */
 const SIGACT_WORDS: usize = SIGACT_BYTES / 8;
 const SIGSET_BYTES: u64 = 8;    /* the sigset this seam crosses            */
+/// E7 increment 34: the word in args[5] that makes a forwarded rt_sigprocmask
+/// a REVEAL PROBE rather than a call: the kernel owns the mask for a
+/// trap-delivered handler (it moved it, it answers the arithmetic), but the
+/// pending set and the dispositions that decide what unblocking a pending
+/// signal means are this side's — so the kernel forwards a control request
+/// carrying the mask it computed in args[4], and this arm runs the reveal
+/// ladder while leaving `sig.mask` alone. The kernel's
+/// `LINUX_SIG_REVEAL_TAG` is the same number (guard clause AD holds the two).
+const SIG_MASK_REVEAL_TAG: u64 = 0x5347_5256;   /* "SGRV" */
 
 /// How far a signal number may run: Linux x86-64 signals are 1..=64
 /// (1..31 standard, 32..64 real-time; 0 is tkill's existence probe and
@@ -563,6 +572,44 @@ fn dispo(sig: &SigState, no: u64) -> u8 {
         1 => DISPO_IGN,
         _ => DISPO_HANDLER,
     }
+}
+
+/// E7 increment 34: the REVEAL ladder, one decision in one place. What does
+/// unblocking down to `new_mask` do to the signals still pending? An IGN
+/// disposition (or an ignore-by-default signal) is DISCARDED — that IS its
+/// delivery; a default-terminate signal kills the task inside this very call;
+/// a handler this v1 cannot invoke, and a default-stop signal, refuse the
+/// call before anything moves. Returns (0 proceed, 1 kill, 2 refuse) and,
+/// for a kill, WHICH signal earns it.
+///
+/// Called by the ordinary 14 arm (whose text this is verbatim) and by the
+/// kernel's tagged probe, so a trap-delivered handler's unmask cannot mean
+/// something a tkill-delivered handler's does not. It reads `sig` only: the
+/// caller owns the mutation, so a refusal leaves the pending set and the
+/// mask exactly as they were.
+fn reveal_verdict(sig: &SigState, new_mask: u64) -> (u8, u64) {
+    let mut revealed = sig.pending & !new_mask;
+    while revealed != 0 {
+        let bit = revealed.trailing_zeros();
+        revealed &= !(1u64 << bit);
+        let sig_no = bit + 1;
+        if dispo(sig, sig_no as u64) == DISPO_IGN
+            || default_action(sig_no as u64) == ACT_IGNORE
+        {
+            continue; /* discard — its delivery is a no-op */
+        } else if dispo(sig, sig_no as u64) == DISPO_HANDLER {
+            /* A handler this shim recorded but cannot invoke (no signal
+             * frame, no rt_sigreturn). Refuse the CALL before the mask
+             * moves — running the default action instead would be a signal
+             * the caller never asked for. */
+            return (2, 0);
+        } else if default_action(sig_no as u64) == ACT_TERMINATE {
+            return (1, sig_no as u64);
+        } else {
+            return (2, 0);
+        }
+    }
+    (0, 0)
 }
 
 /// Linux's `SA_RESTART` (x86-64 UAPI): the handler runs, and the syscall
@@ -1044,6 +1091,29 @@ fn answer(
         LINUX_RT_SIGPROCMASK => {
             if args[3] != SIGSET_BYTES {
                 Answer::Reply(0, E_INVAL)
+            } else if args[5] == SIG_MASK_REVEAL_TAG {
+                /* E7 increment 34: the KERNEL's tagged probe. A handler the
+                 * #PF entered runs under a mask the kernel moved and keeps,
+                 * so only the PENDING half of its unmask is this side's:
+                 * args[4] is the mask the task moved to, and the ladder runs
+                 * exactly as the arm below runs it. `sig.mask` is left
+                 * ALONE — the kernel owns it for the window and restores the
+                 * frame's at the return, so moving it here would recreate
+                 * the divergence increment 33 closed. Status 0 means the
+                 * reveal ran (nothing rides back: the kernel writes the
+                 * oldset it holds), the kill variant is a default action
+                 * dying inside this call, and E_NOSYS is a reveal this v1
+                 * cannot perform, with the pending set untouched. */
+                let new_mask = args[4];
+                let (verdict, kill_sig) = reveal_verdict(sig, new_mask);
+                match verdict {
+                    1 => Answer::SignalKill(kill_sig),
+                    2 => Answer::Reply(0, E_NOSYS),
+                    _ => {
+                        sig.pending &= new_mask;
+                        Answer::Reply(0, STATUS_OK)
+                    }
+                }
             } else if args[1] == 0 && args[2] == 0 {
                 Answer::Reply(0, STATUS_OK) /* nothing in, nothing back */
             } else if args[1] == 0 {
@@ -1068,41 +1138,14 @@ fn answer(
                             1 => old & !set, /* SIG_UNBLOCK  */
                             _ => set,        /* SIG_SETMASK  */
                         };
-                        /* Pass 1: what does the new mask REVEAL? Discards
-                         * (an IGN disposition, or an ignore-by-default
-                         * signal) are invisible either way; a
-                         * default-terminate signal KILLS right here — no
-                         * reply, this syscall never returns to its caller;
-                         * a default-stop signal refuses the CALL before
-                         * anything moves (not even the mask). */
-                        let mut revealed = sig.pending & !new_mask;
-                        let mut verdict = 0u8; /* 0 proceed, 1 kill, 2 refuse */
-                        let mut kill_sig = 0u64; /* WHICH revealed signal earns
-                                                  * the kill — carried on the
-                                                  * Answer so the line names it
-                                                  * (increment 14) */
-                        while revealed != 0 && verdict == 0 {
-                            let bit = revealed.trailing_zeros();
-                            revealed &= !(1u64 << bit);
-                            let sig_no = bit + 1;
-                            if dispo(sig, sig_no as u64) == DISPO_IGN
-                                || default_action(sig_no as u64) == ACT_IGNORE
-                            {
-                                continue; /* discard — its delivery is a no-op */
-                            } else if dispo(sig, sig_no as u64) == DISPO_HANDLER {
-                                /* A handler this shim recorded but cannot
-                                 * invoke (no signal frame, no rt_sigreturn).
-                                 * Refuse the CALL before the mask moves —
-                                 * running the default action instead would
-                                 * be a signal the caller never asked for. */
-                                verdict = 2;
-                            } else if default_action(sig_no as u64) == ACT_TERMINATE {
-                                verdict = 1;
-                                kill_sig = sig_no as u64;
-                            } else {
-                                verdict = 2;
-                            }
-                        }
+                        /* Pass 1: what does the new mask REVEAL? The ladder
+                         * is one decision in one place (reveal_verdict), so
+                         * the kernel's tagged probe runs exactly the rule
+                         * this arm has always run — an IGN discard, a
+                         * default-terminate KILL right here (no reply, this
+                         * syscall never returns to its caller), or a refusal
+                         * that leaves the mask and the pending set alone. */
+                        let (verdict, kill_sig) = reveal_verdict(sig, new_mask);
                         match verdict {
                             1 => Answer::SignalKill(kill_sig),
                             2 => Answer::Reply(0, E_NOSYS),

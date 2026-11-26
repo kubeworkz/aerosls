@@ -169,6 +169,14 @@ static void proc_clear_resume_state(struct ProcessDescriptor* pd) {
     pd->linux_sig_active = 0;
     pd->linux_sig_frame_rsp   = 0;
     pd->linux_sig_fault_active = 0;
+    /* E7 increment 34: a reveal probe's stage is per-forward, not per-thread
+     * state that may survive a slot's reuse — a stale one would commit a
+     * stranger's mask at the next 14's reply. */
+    pd->linux_sig_mask_stage_valid = 0;
+    pd->linux_sig_mask_stage_probe = 0;
+    pd->linux_sig_mask_stage_old   = 0;
+    pd->linux_sig_mask_stage_new   = 0;
+    pd->linux_sig_mask_stage_dst   = 0;
     pd->linux_cr2        = 0;
     for (unsigned fi = 0; fi < LINUX_FAULT_SIG_COUNT; fi++) {
         pd->linux_fault_act[fi].handler  = 0;
