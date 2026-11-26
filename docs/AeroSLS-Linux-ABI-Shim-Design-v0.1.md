@@ -4684,8 +4684,11 @@ syscall with `rsp <= frame_rsp`. `siglongjmp` restores `rsp` to the
 `sigsetjmp` caller — the interrupted context's side of the frame, strictly
 above it. `linux_sig_frame_abandoned(frame_rsp, user_rsp)` is that one
 comparison, pure: `1` when a frame address is recorded and `rsp` is above it,
-`0` otherwise, including no frame at all (an ordinary task, or a
-tkill-delivered frame, whose address is recorded nowhere). A `longjmp` copies
+`0` otherwise, including no frame at all (an ordinary task). A tkill-delivered
+frame **does** record its address — `linux_sig_reply_apply` stores
+`linux_sig_frame_rsp` for that path too — so the predicate is not what excludes
+it; the gate is, because `fault_active` is 0 for a frame the sidecar entered.
+A `longjmp` copies
 nothing back into the frame, so the frame's **bytes** cannot answer this — the
 address comparison is the only structural fact a syscall can see. The current
 `rsp` is read the way every other late read is: `proc_read_user_rsp()` reads
@@ -4714,9 +4717,25 @@ increment exists to prevent. The sanctioned exit is exact rather than lossy:
 `siglongjmp`'s own `__sigprocmask` put the kernel on that same set through
 this very number before the jump.
 
+**The predicate's one false positive.** A handler that runs on a stack
+*above* its frame — `makecontext`/`swapcontext` switching to a context whose
+stack sits higher in the address space, or a handler that copies its ucontext
+to such a stack and jumps there — makes a 14 with `rsp > frame_rsp` while the
+frame is still live. The predicate reads that as an abandonment and closes the
+window early: the mask is realigned to `uc_sigmask`, the frame is dropped, the
+handler's later 15 answers `-EINVAL`, and any mask edit it made after the
+switch is lost. Named rather than solved: the geometry cannot tell "the frame
+is behind me" from "I am above it", and no syscall-visible state distinguishes
+the two. The ordinary shapes — the ladder below the frame, `siglongjmp` above
+it — are the ones this increment is for.
+
 **The tkill path.** Untouched, and doubly so: the whole branch is gated on
-`linux_sig_fault_active`, and a sidecar-entered frame records no address
-(`frame_rsp` is 0 unless the trap path recorded one).
+`linux_sig_fault_active`, which `linux_sig_reply_apply` clears for a frame the
+sidecar entered — that frame's address *is* recorded (both delivery paths
+write `linux_sig_frame_rsp`), so the flag, not a missing address, is what keeps
+that path's 14s on the forward the sidecar answers. And the mask, too: the
+sidecar moved its copy to the handler's set before it entered, so there is no
+divergence there to close.
 
 **Evidence.** `tests/linux_sig_mask_host_test.c` (44 checks now — five here):
 `rsp` exactly at the frame is the entry point, `rsp` below it is a live

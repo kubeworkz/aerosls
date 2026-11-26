@@ -233,7 +233,10 @@ int main(void)
      * longjmp pops rsp back to the sigsetjmp caller — the interrupted
      * context's side of the frame, strictly ABOVE it — and copies nothing
      * back into the frame, which is why the ADDRESS comparison, not the
-     * frame's bytes, is what names the abandonment a 15 will never name. */
+     * frame's bytes, is what names the abandonment a 15 will never name.
+     * Its one false positive, named and not solved: a handler that runs on a
+     * stack ABOVE its frame (makecontext/swapcontext) looks identical here,
+     * so it would close the window early — geometry cannot tell the two. */
     CHECK(linux_sig_frame_abandoned(0x7000ull, 0x7000ull) == 0,
           "rsp exactly at the frame is the handler's ENTRY point, not an exit");
     CHECK(linux_sig_frame_abandoned(0x7000ull, 0x6f00ull) == 0,
@@ -244,8 +247,10 @@ int main(void)
           "one word above the frame is already the setjmp caller: the frame\n"
           "      is behind the task and the window closes with no 15 coming");
     CHECK(linux_sig_frame_abandoned(0ull, 0x7008ull) == 0,
-          "no recorded frame is nothing to abandon — a tkill-delivered frame\n"
-          "      records no address, and an ordinary task has none at all");
+          "no recorded frame is nothing to abandon — an ordinary task has\n"
+          "      none. A tkill-delivered frame DOES record one (reply_apply\n"
+          "      stores frame_rsp); it is out of the closure because its\n"
+          "      fault_active is 0, not because the address is missing");
     CHECK(linux_sig_frame_abandoned(0x7000ull, 0x7040ull) == 1,
           "the live shape: siglongjmp has popped rsp 0x40 above the frame");
 
