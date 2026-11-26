@@ -44,6 +44,12 @@ static FAULT_RETURN: &[u8] =
 /// the sidecar's reveal must run inside that call and the task dies there.
 static FAULT_REVEAL: &[u8] =
     include_bytes!("../fixtures/e7_fault_reveal_probe.flat");
+/// `fixtures/e7_fault_abandon_probe.S` — E7 increment 35's arm: the trap
+/// handler leaves its frame by a longjmp-style rsp pop instead of a 15, and
+/// the first 14 afterwards must close the kernel's mask window (its answer,
+/// and a 15 that must now be -EINVAL, both come from the sidecar again).
+static FAULT_ABANDON: &[u8] =
+    include_bytes!("../fixtures/e7_fault_abandon_probe.flat");
 
 pub const FAULT_NAME: &str = "e7.tdeath.fault.0";
 pub const GROUP_NAME: &str = "e7.tdeath.group.0";
@@ -53,6 +59,9 @@ pub const FAULT_RETURN_NAME: &str = "e7.fault.return.0";
 /// the handler runs, and UNBLOCKED from inside it — the reveal must run in
 /// the handler, so the task dies there.
 pub const FAULT_REVEAL_NAME: &str = "e7.fault.reveal.0";
+/// E7 increment 35: the trap handler leaves its frame by longjmp; the first
+/// rt_sigprocmask made above the abandoned frame must close the mask window.
+pub const FAULT_ABANDON_NAME: &str = "e7.fault.abandon.0";
 
 pub const PROBE_RESERVE: u64 = 64 * 1024;
 
@@ -190,4 +199,16 @@ pub fn spawn_fault_reveal<K: aerosls_proto::kabi::Kernel>(
     budget_len: u64,
 ) -> Result<Spawned, i32> {
     spawn_one(k, budget_base, budget_len, FAULT_REVEAL, FAULT_REVEAL_NAME)
+}
+
+/// E7 increment 35: the fault whose handler LEAVES the frame by longjmp — the
+/// first 14 above the frame must close the kernel's window (mask back to the
+/// frame's recorded set, frame dropped), so the query answers the sidecar's
+/// copy and a following 15 is refused instead of restoring a dead frame.
+pub fn spawn_fault_abandon<K: aerosls_proto::kabi::Kernel>(
+    k: &K,
+    budget_base: u64,
+    budget_len: u64,
+) -> Result<Spawned, i32> {
+    spawn_one(k, budget_base, budget_len, FAULT_ABANDON, FAULT_ABANDON_NAME)
 }

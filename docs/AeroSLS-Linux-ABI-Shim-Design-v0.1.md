@@ -4737,15 +4737,37 @@ that path's 14s on the forward the sidecar answers. And the mask, too: the
 sidecar moved its copy to the handler's set before it entered, so there is no
 divergence there to close.
 
+**Live arm.** `e7.fault.abandon.0`
+(`user/sidecar/fixtures/e7_fault_abandon_probe.S`, spawned by the sidecar like
+the other fault arms) blocks SIGTERM before the fault — a forwarded 14, so
+both copies hold `0x4000` and the frame **records** it — then reads a
+PROT_NONE page. The handler blocks SIGUSR1 inside the window (the kernel's
+copy moves to `0x4600`, the sidecar is told nothing), writes `E7AB-LEAP` and
+leaves the way `siglongjmp` does: pop `rsp` to the saved setjmp caller, above
+the frame. The first 14 after the jump is the call under test. It must log
+`[E7] fault handler abandoned the frame at … : mask window closed at 4000`,
+return the **frame's** recorded `0x4000` (not the dead handler's `0x4600`,
+which is what an open window would answer — `E7AB-MASK`), and leave the task
+on the sidecar's forward, so the rt_sigreturn(15) that follows answers
+`-EINVAL` instead of restoring the frame — `E7AB-RET` names a restore and
+`E7AB-LOOP` a faulting load that ran again. `E7AB-OK` is written only when
+the mask and the refusal both hold, and the boot check requires the
+abandoned line to sit between `E7AB-LEAP` and `E7AB-OK`
+(`tests/linux_fault_abandon_check.sh`).
+
 **Evidence.** `tests/linux_sig_mask_host_test.c` (44 checks now — five here):
 `rsp` exactly at the frame is the entry point, `rsp` below it is a live
 handler (the case every ordinary 14 of a handler takes, which must NOT close
 the window), one word above is an abandonment, no recorded frame is nothing
 to abandon, and the live shape (`siglongjmp` 0x40 above). Clause **AE** pins
 the predicate, the `[gs:0]` accessor, the check's place **before** the
-ownership read, the `uc_sigmask` restore, and the three clears; teeth
-**t172** (the gate stops asking whether the frame was the trap's) and
-**t173** (the frame is dropped but the dead handler's mask is kept).
+ownership read, the `uc_sigmask` restore, the three clears, and the live
+arm's wiring (fixture, spawn function, entry point and the boot check's own
+`0x4000` assertion). Teeth: **t172** (the gate stops asking whether the frame
+was the trap's), **t173** (the frame is dropped but the dead handler's mask is
+kept), **t174** (the arm's handler stops popping `rsp` above its frame) and
+**t175** (the sidecar stops spawning the arm, so the closure is never reached
+on a boot).
 
 ---
 

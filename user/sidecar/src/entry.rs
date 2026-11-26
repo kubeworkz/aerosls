@@ -963,6 +963,7 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
             static FH_SPAWNED: AtomicBool = AtomicBool::new(false);
             static FR_SPAWNED: AtomicBool = AtomicBool::new(false);
             static FRV_SPAWNED: AtomicBool = AtomicBool::new(false);
+            static AB_SPAWNED: AtomicBool = AtomicBool::new(false);
             let n = PASSES.fetch_add(1, Ordering::Relaxed) + 1;
             if n % 4 == 0 {
                 if !FAULT_SPAWNED.load(Ordering::Relaxed) {
@@ -1050,6 +1051,27 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
                             ) {
                                 FRV_SPAWNED.store(true, Ordering::Relaxed);
                                 klog(b"[E7] fault-reveal: spawned ch_r=", sp.ch_r, b"");
+                            }
+                        }
+                    }
+                }
+                // E7 increment 35: a handler that LEAVES its fault frame by
+                // longjmp never sends the 15 that closes the mask window. The
+                // first 14 made above the frame must close it — the mask goes
+                // back to the frame's recorded set and the frame is dropped,
+                // so the query is answered by the sidecar and a later 15 is
+                // -EINVAL again.
+                if !AB_SPAWNED.load(Ordering::Relaxed) {
+                    if let Ok(sp) = crate::e7_thread_death::spawn_fault_abandon(
+                        &RealKernel, caps.budget_base, caps.budget_len) {
+                        if let Ok(vt) = booted.proc.vfs.add_task() {
+                            if crate::linux::track(
+                                sp.ch_r, sp.ch_w,
+                                crate::e7_thread_death::FAULT_ABANDON_NAME,
+                                0, sp.heap_base, sp.heap_limit, vt, false,
+                            ) {
+                                AB_SPAWNED.store(true, Ordering::Relaxed);
+                                klog(b"[E7] fault-abandon: spawned ch_r=", sp.ch_r, b"");
                             }
                         }
                     }

@@ -87,6 +87,9 @@ FILES=(
     tests/linux_fault_reveal_check.sh
     user/sidecar/fixtures/e7_fault_reveal_probe.S
     user/sidecar/fixtures/e7_fault_reveal_probe.flat
+    tests/linux_fault_abandon_check.sh
+    user/sidecar/fixtures/e7_fault_abandon_probe.S
+    user/sidecar/fixtures/e7_fault_abandon_probe.flat
     user/sidecar/fixtures/e7_fault_return_probe.S
     user/sidecar/fixtures/e7_fault_return_probe.flat
     # Y (the soft mprotect transition) reads the helper's fake-table test.
@@ -1480,6 +1483,19 @@ tooth fault-abandon-gate-too-wide AE "the abandoned-frame check stopped asking w
 seed "$W/t173"
 sed -i '/cur->linux_sig_mask         = agreed;/d' "$W/t173/kernel/syscall_dispatch.c"
 tooth fault-abandon-keeps-divergent-mask AE "the closure dropped the frame but kept the dead handler's mask" "$W/t173"
+
+# t174: the live arm's handler stops leaving the frame — it falls through to the
+# after-jump code with rsp still inside it, so the 14 arrives inside the window
+# and nothing on the machine ever exercises the abandonment the clause names.
+seed "$W/t174"
+sed -i '/mov     0(%r12), %rsp/d' "$W/t174/user/sidecar/fixtures/e7_fault_abandon_probe.S"
+tooth fault-abandon-no-jump AE "the abandoning arm stopped popping rsp above its frame" "$W/t174"
+
+# t175: the sidecar stops spawning the arm, so the closure is never reached on
+# a boot even though every line it is built from is still there.
+seed "$W/t175"
+sed -i '/crate::e7_thread_death::spawn_fault_abandon(/d' "$W/t175/user/sidecar/src/entry.rs"
+tooth fault-abandon-unspawned AE "the sidecar stopped spawning the abandoning arm" "$W/t175"
 
 echo
 echo "linux_personality_check_smoke: $pass passed, $fail failed"
