@@ -147,6 +147,28 @@ _start:
     cmp     0(%r12), %rax           /* …must be THIS program's trap page */
     jne     .Lbad
 
+    /* E7 increment 33: ask for the mask this handler is RUNNING under.
+     * `set` NULL is a query, so `how` is ignored; the answer must be the
+     * handler's whole set — the pre-delivery 0 | sa_mask (0) | SIGSEGV's
+     * bit = 0x400 — because the #PF delivery moved the KERNEL's mask and
+     * the sidecar, which never heard of it, still holds the narrower 0.
+     * A 0 here is exactly the defect this arm exists to catch. */
+    sub     $16, %rsp
+    mov     %rdx, 8(%rsp)           /* 3rd arg is the oldset here: keep
+                                     * the ucontext pointer, which the fix
+                                     * below writes through */
+    mov     $2, %edi                /* SIG_SETMASK (ignored: set NULL) */
+    xor     %esi, %esi
+    mov     %rsp, %rdx
+    mov     $8, %r10d
+    mov     $14, %eax
+    syscall
+    mov     (%rsp), %rax
+    mov     8(%rsp), %rdx           /* the ucontext pointer back */
+    add     $16, %rsp
+    cmp     $0x400, %rax
+    jne     .Lmask
+
     /* Count the entries: the second one means the first return did not
      * reach the interrupted instruction, so say so by name. */
     incq    16(%r12)
@@ -164,6 +186,16 @@ _start:
     lea     .Lloopmsg(%rip), %rsi
     mov     $1, %edi
     mov     $.Lloopmsg_end-.Lloopmsg, %edx
+    mov     $1, %eax
+    syscall
+    mov     $1, %edi
+    mov     $60, %eax
+    syscall
+
+.Lmask:
+    lea     .Lmaskmsg(%rip), %rsi
+    mov     $1, %edi
+    mov     $.Lmaskmsg_end-.Lmaskmsg, %edx
     mov     $1, %eax
     syscall
     mov     $1, %edi
@@ -203,6 +235,9 @@ _start:
 .Lok:
     .ascii  "E7FR-OK\n"
 .Lok_end:
+.Lmaskmsg:
+    .ascii  "E7FR-MASK\n"
+.Lmaskmsg_end:
 .Lbadmsg:
     .ascii  "E7FR-BAD\n"
 .Lbadmsg_end:

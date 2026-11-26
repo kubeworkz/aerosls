@@ -80,6 +80,9 @@ FILES=(
     # the returning arm's fixture and its check script — same rule as D.
     tests/linux_fault_return_host_test.c
     tests/linux_fault_return_check.sh
+    # AC (increment 33, the mask inside a trap handler) reads its own host
+    # test, same rule.
+    tests/linux_sig_mask_host_test.c
     user/sidecar/fixtures/e7_fault_return_probe.S
     user/sidecar/fixtures/e7_fault_return_probe.flat
     # Y (the soft mprotect transition) reads the helper's fake-table test.
@@ -1425,6 +1428,20 @@ tooth fault-return-parkctx AB "the return went back to reading the frame at park
 seed "$W/t166"
 sed -i 's/^    ret .*$/    jmp     .Lbad/' "$W/t166/user/sidecar/fixtures/e7_fault_return_probe.S"
 tooth fault-return-no-ret AB "the handler no longer returns through its restorer" "$W/t166"
+
+# t167: the kernel answers 14 inside the window but never commits the
+# result, so the handler's mask stops being the mask's state — the query
+# reads right once and every BLOCK/UNBLOCK after it computes on a stale base.
+seed "$W/t167"
+sed -i '/cur->linux_sig_mask = new_mask;/d' "$W/t167/kernel/syscall_dispatch.c"
+tooth fault-mask-uncommitted AC "the kernel answered 14 without committing the mask" "$W/t167"
+
+# t168: the gate stops asking whether the frame came from the TRAP, so the
+# tkill path's rt_sigprocmask — whose mask the sidecar moved before it
+# answered, and whose frame it entered — is answered by the kernel instead.
+seed "$W/t168"
+sed -i 's/cur->linux_sig_fault_active)) {/1)) {/' "$W/t168/kernel/syscall_dispatch.c"
+tooth fault-mask-gate-too-wide AC "the kernel claimed a sidecar-delivered handler's mask" "$W/t168"
 
 echo
 echo "linux_personality_check_smoke: $pass passed, $fail failed"

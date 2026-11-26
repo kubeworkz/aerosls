@@ -1478,6 +1478,34 @@ int linux_sig_fault_return_ok(int sig_active, int fault_active, uint64_t rax,
     return rax == (uint64_t)(int64_t)(-LINUX_EINVAL);
 }
 
+/* E7 increment 33: the window's two decisions (see the header). The gate is
+ * a conjunction because the two flags answer different questions — a frame
+ * is installed, and THAT frame came from the trap — and only both together
+ * mean the sidecar was never told which mask the task is running under. */
+int linux_sig_mask_fault_owned(int sig_active, int fault_active)
+{
+    return sig_active && fault_active;
+}
+
+/* POSIX's three mask operations, written the way the sidecar's 14 arm writes
+ * them so the two ends cannot drift: BLOCK unions, UNBLOCK differences,
+ * SETMASK replaces, and a `how` Linux does not have refuses with `*out`
+ * untouched (a failed call never half-changes the mask). No KILL/STOP bit is
+ * stripped, because the sidecar's arm strips none — the twin rule P9 holds.
+ * The QUERY shape (`set` NULL) never reaches here: Linux ignores `how` then,
+ * and so does the arm this mirrors. */
+int linux_sig_mask_step(uint64_t cur, uint64_t how, uint64_t set,
+                        uint64_t *out)
+{
+    if (!out) return 0;
+    switch (how) {
+    case 0: *out = cur | set;  return 1;   /* SIG_BLOCK   */
+    case 1: *out = cur & ~set; return 1;   /* SIG_UNBLOCK */
+    case 2: *out = set;        return 1;   /* SIG_SETMASK */
+    default: return 0;                     /* not a `how` Linux has */
+    }
+}
+
 int linux_sig_deliver(uint64_t root, const struct LinuxSigDeliverReq *req,
                       const struct LinuxSigRegs *ctx, uint64_t cr2,
                       struct LinuxSigRegs *entry, uint64_t *entry_mask)

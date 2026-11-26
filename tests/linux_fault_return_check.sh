@@ -59,6 +59,12 @@ grep -qE '^    ret .*Lrestorer' user/sidecar/fixtures/e7_fault_return_probe.S \
 grep -qF 'E7FR-LOOP' user/sidecar/fixtures/e7_fault_return_probe.S \
     && sok "the handler names a second entry (a return that did not take effect)" \
     || sbad "the fixture lost its double-delivery detector"
+grep -qF 'mov     $14, %eax' user/sidecar/fixtures/e7_fault_return_probe.S \
+    && sok "the handler asks for the mask it runs under (rt_sigprocmask, increment 33)" \
+    || sbad "the handler no longer queries the mask it runs under"
+grep -qF 'E7FR-MASK' user/sidecar/fixtures/e7_fault_return_probe.S \
+    && sok "a narrower mask is a named failure (E7FR-MASK), not a silent one" \
+    || sbad "the fixture lost its mask-divergence marker"
 grep -qF 'crate::e7_thread_death::spawn_fault_return' user/sidecar/src/entry.rs \
     && sok "the sidecar spawns the returning arm through the real create" \
     || sbad "entry.rs no longer spawns the returning arm"
@@ -140,6 +146,11 @@ grep -aqF 'E7FR-BAD' "$LOG" && bad "the resumed context was wrong (E7FR-BAD) —
     || ok "the resumed context was accepted (no E7FR-BAD)"
 grep -aqF 'E7FR-LOOP' "$LOG" && bad "the handler was entered twice (E7FR-LOOP): the first rt_sigreturn restored nothing" \
     || ok "the handler was entered exactly once (no E7FR-LOOP)"
+grep -aqF 'E7FR-MASK' "$LOG" && bad "the handler was given the narrower mask (E7FR-MASK): rt_sigprocmask inside a trap-delivered handler did not report the handler's set" \
+    || ok "the handler read the mask its frame installed (0x400), not the sidecar's pre-delivery 0 (no E7FR-MASK)"
+grep -aqF '[E7] rt_sigprocmask in a fault handler: oldset 400 -> 400' "$LOG" \
+    && ok "the kernel answered 14 from its own mask inside the handler ([E7] rt_sigprocmask in a fault handler: oldset 400 -> 400)" \
+    || bad "no '[E7] rt_sigprocmask in a fault handler: oldset 400 -> 400' line — the handler's 14 was forwarded, or answered with another mask"
 
 grep -aqF 'E7FR-OK' "$LOG" \
     && ok "the faulting load ran AGAIN after the return and read the page the handler supplied (E7FR-OK)" \

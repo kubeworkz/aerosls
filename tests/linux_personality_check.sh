@@ -68,7 +68,7 @@ for f in kernel/linux_abi.h kernel/linux_abi.c kernel/process.h kernel/process.c
          arch/x86/interrupt.asm arch/x86/switch_lazy.asm \
          kernel/kernel.c kernel/stubs.c tests/fpu_enable_host_test.c \
          tests/user_map_identity_host_test.c tests/linux_clone_host_test.c \
-         tests/linux_fault_return_host_test.c; do
+         tests/linux_fault_return_host_test.c tests/linux_sig_mask_host_test.c; do
     if [ ! -f "$f" ]; then
         echo "ABORT: $f missing — the guard cannot be evaluated at all." >&2
         exit 2
@@ -1810,6 +1810,51 @@ if grep -qF 'int linux_sig_fault_return_ok(int sig_active, int fault_active, uin
     ok "AB. a fault-delivered handler can RETURN: rt_sigreturn's sidecar half refuses it (it entered nothing, moved no mask), and the kernel takes exactly that one return — linux_sig_fault_return_ok requires an installed frame, a TRAP delivery, a refusal (never status 0 or -EPROTO) and the exact -EINVAL the task would have heard, so the no-handler refusal still reaches the task and a different errno is never swallowed. The frame's ADDRESS is recorded at delivery (park_ctx is not on the fault path) and read back by the return, the resume installs the restored context, and the live arm proves the whole trip: its handler rewrites the interrupted r13 through its own ucontext (80(%rdx) — the host test pins that offset to the frame's sigcontext) and RETURNS through the frame's pretcode, so the restorer's 15 is the return under test, and the retried faulting load reads the page the handler supplied, writing E7FR-OK only then — with E7FR-LOOP if the handler ran twice, so a missing return is a named line and not a hang. The increment-31 arm is unchanged: its handler still exits instead of returning."
 else
     bad "AB. a fault handler's return is not wired, in one of the ways that matter: without the gate the sidecar's truthful EINVAL still reaches a handler that has a frame waiting, so every fault-delivered handler dies the moment it returns; a gate that fired on status 0 would restore a frame the sidecar's own -EPROTO check never vetted; one that fired on ANY errno would swallow a real refusal; a return that read park_ctx.user_rsp would restore a stale park context because the trap never parks; and a frame address recorded nowhere means the return cannot find the 440 bytes it owes, which is why the live arm would print E7FR-BAD (the restorer's 15 came back with an errno) or E7FR-LOOP (the retried instruction faulted again)."
+fi
+
+# ─── AC. E7 increment 33 (P1-C): the mask inside a trap handler ────────────
+# The #PF delivery moves the KERNEL's mask to the handler's set, and nothing
+# ever told the sidecar — a trap has no round trip to ride — so its copy still
+# held the pre-delivery one and a forwarded 14 answered the narrower set.
+#
+# AC pins the window in which the kernel answers instead: an rt_sigprocmask
+# from a TRAP-delivered frame is answered out of linux_sig_mask, with the
+# sidecar's own arithmetic, and posted nowhere (the branch sits before the
+# forward's describe). The order that makes it honest is pinned too: the
+# oldset is written through the validated copy BEFORE the new mask is
+# committed, so a bad pointer refuses with nothing moved.
+#
+# And the gate is BOTH flags, which is what leaves the tkill path alone: its
+# frame was entered by the sidecar, reply_apply cleared fault_active for
+# exactly that reason, and its 14 keeps the forward whose mask the sidecar
+# already moved.
+if grep -qF 'int linux_sig_mask_fault_owned(int sig_active, int fault_active);' "$LABH" && \
+   grep -qF 'int linux_sig_mask_step(uint64_t cur, uint64_t how, uint64_t set,' "$LABH" && \
+   grep -qF 'int linux_sig_mask_fault_owned(int sig_active, int fault_active)' "$LABC" && \
+   grep -qF 'return sig_active && fault_active;' "$LABC" && \
+   grep -qF 'if (!out) return 0;' "$LABC" && \
+   grep -qF 'case 0: *out = cur | set;  return 1;' "$LABC" && \
+   grep -qF 'case 1: *out = cur & ~set; return 1;' "$LABC" && \
+   grep -qF 'case 2: *out = set;        return 1;' "$LABC" && \
+   grep -qF 'linux_sig_mask_fault_owned(cur->linux_sig_active,' "$DISP" && \
+   grep -qF 'cur->linux_sig_fault_active)) {' "$DISP" && \
+   [ "$(grep -nF 'if (num == LINUX_RT_SIGPROCMASK &&' "$DISP" | head -1 | cut -d: -f1)" -lt \
+     "$(grep -nF 'linux_syscall_describe(&req, num, largs);' "$DISP" | head -1 | cut -d: -f1)" ] && \
+   grep -qF 'linux_user_copy_out((uint8_t *)&set, cur->cr3,' "$DISP" && \
+   grep -qF 'linux_sig_mask_step(old, largs[0], set,' "$DISP" && \
+   grep -qF 'linux_user_copy_in((const uint8_t *)&old, cur->cr3,' "$DISP" && \
+   [ "$(grep -nF 'linux_user_copy_in((const uint8_t *)&old, cur->cr3,' "$DISP" | head -1 | cut -d: -f1)" -lt \
+     "$(grep -nF 'cur->linux_sig_mask = new_mask;' "$DISP" | head -1 | cut -d: -f1)" ] && \
+   grep -qF 'pd->linux_sig_fault_active = 0;   /* the sidecar entered this one */' "$PDC" && \
+   grep -qF 'linux_sig_mask_fault_owned(1, 1) == 1' tests/linux_sig_mask_host_test.c && \
+   grep -qF 'linux_sig_mask_fault_owned(1, 0) == 0' tests/linux_sig_mask_host_test.c && \
+   grep -qF 'linux_sig_mask_step(0x400ull, 2, 0x400ull, &new_mask) == 1' tests/linux_sig_mask_host_test.c && \
+   grep -qF 'linux_sig_mask_step(0ull, 0, 0x2ull, &new_mask) == 1' tests/linux_sig_mask_host_test.c && \
+   grep -qF 'mov     $14, %eax' user/sidecar/fixtures/e7_fault_return_probe.S && \
+   grep -qF 'E7FR-MASK' user/sidecar/fixtures/e7_fault_return_probe.S; then
+    ok "AC. the mask inside a trap-delivered handler is the handler's own: the #PF delivery moved the KERNEL's linux_sig_mask to the handler's set while the sidecar — told nothing, because a trap has no round trip — kept the pre-delivery one, so a forwarded 14 reported the narrower set and computed BLOCK/UNBLOCK on the wrong base. linux_sig_mask_fault_owned asks BOTH questions (an installed frame AND a trap delivery), which leaves the tkill path (reply_apply cleared fault_active because the sidecar entered that one and moved its mask) on the forward it always had; linux_sig_mask_step is the sidecar's own arithmetic, replayed in the host test so the two languages cannot drift; the dispatch branch answers from linux_sig_mask, writes the oldset through the validated copy, commits the new mask only after that write lands, posts nothing, and refuses a foreign \`how\` with -EINVAL and the mask unmoved. The live arm's handler asks for its own mask before it fixes the fault and requires 0x400 — the whole set its frame installed — writing E7FR-MASK if it is given the narrower one."
+else
+    bad "AC. the mask inside a trap-delivered handler is not wired, in one of the ways that matter: without the branch a forwarded 14 answers the sidecar's stale pre-delivery set (the narrower mask, and the wrong base for BLOCK/UNBLOCK); a gate that asked only 'a handler is active' would take the tkill path's 14 away from the sidecar that moved its mask for it; arithmetic that differed from the sidecar's own would make the two ends disagree in a way no boot line names; committing the mask before the oldset write lands would move state on a call that answers -EFAULT; and a live arm that never asks for the mask leaves the whole window unobserved, which is what E7FR-MASK would have said."
 fi
 
 # ─── P. E7 increment 26 (P1-C): the signal frame ───────────────────────────

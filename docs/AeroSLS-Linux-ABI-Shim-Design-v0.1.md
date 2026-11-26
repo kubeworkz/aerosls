@@ -4496,12 +4496,78 @@ sidecar's). Teeth: **t164** (a fault delivery that no longer marks itself as
 the trap's — increment 31 stays green, the return dies), **t165** (the
 return reads `park_ctx` again), **t166** (the live handler stops returning).
 
-**Still open, by name.** During a fault-delivered handler the kernel's
-`linux_sig_mask` carries the handler's mask while the sidecar's copy still
-holds the pre-delivery one, so an `rt_sigprocmask(14, NULL)` from inside such
-a handler reports the narrower set; the two agree again at the return. No
-restart window, no `fpstate`, no `sigaltstack`, and no async preemption
-remain the P1-C remainders they were.
+**Still open, by name.** No restart window, no `fpstate`, no `sigaltstack`,
+and no async preemption remain the P1-C remainders they were. (The mask split
+this section named — the kernel holding the handler's set while the sidecar
+still held the pre-delivery one — is closed by §10.28.)
+
+
+## 10.28 E7 increment 33 — the mask inside a trap-delivered handler
+
+Increment 32 ended with a named disagreement. A handler entered by a ring-3
+`#PF` runs under the handler's set — the kernel's `linux_sig_mask` is the
+blocked set | `sa_mask` | the signal — while the sidecar, which entered
+nothing and was told nothing, still held the **pre-delivery** set. So an
+`rt_sigprocmask(14, NULL)` from inside such a handler reported the narrower
+mask, and a `SIG_BLOCK`/`SIG_UNBLOCK` there did its arithmetic on the wrong
+base. The `tkill` path never had the split: its 14 arm moved the sidecar's
+copy to that same number *before* it answered, which is the one decision
+clause P9 holds both ends to.
+
+**Why the kernel answers instead of forwarding.** There is no round trip to
+ride: a trap has no syscall behind it, so nothing can carry this delivery's
+mask to the sidecar. Rewriting the forwarded request would fix the reading
+half, but it would leave the sidecar's copy at the handler's last value after
+the return instead of at the pre-handler set the frame restores — a
+divergence moved, not removed. So for exactly the window in which a
+TRAP-delivered frame is active, the kernel is the mask's authority: it
+answers 14 itself, out of `pd->linux_sig_mask`, posts nothing, and writes the
+oldset back through the same validated copy every reply uses.
+
+**The arithmetic is the sidecar's own.** `linux_sig_mask_step()` — BLOCK is
+union, UNBLOCK is difference, SETMASK is replacement, `how` outside 0..2 is a
+refusal that moves nothing, and no KILL/STOP bit is filtered because the
+sidecar's arm filters none. The host test replays that arm's own worked
+example (`0b101`/`0b010`/`0b001`) rather than inventing a second set of
+numbers, so the two languages cannot drift in silence. A query (`set` NULL)
+never reaches it: Linux ignores `how` then and so does the arm it mirrors,
+and the identity that matters is that the answer is the handler's 0x400, not
+the sidecar's stale 0.
+
+**The gate is two questions.** `linux_sig_mask_fault_owned(sig_active,
+fault_active)` — a frame installed *and* delivered by the trap. Whose copy is
+stale is decided by who built the frame, not by "a handler is active":
+`linux_sig_reply_apply` clears `linux_sig_fault_active` precisely because the
+sidecar entered that frame and moved its own mask, so the `tkill` path keeps
+the forward it always had — its mask was never the kernel's to answer.
+
+**What the window does not do, by name.** The sidecar's pending *reveal* — the
+unblock that delivers a blocked `tkill` — is itself a delivery and needs the
+sidecar, so a `SIG_UNBLOCK` inside a trap-delivered handler moves the mask
+without revealing; the bit stays pending and the first forwarded 14 after the
+return reveals it, which is a legal POSIX timing. And a nested delivery
+inside such a handler still nests two frames: unchanged by this increment.
+At the return the two agree again for free — the kernel restores
+`uc_sigmask`, the pre-handler set, and the sidecar never left that value.
+
+**Evidence.** `tests/linux_sig_mask_host_test.c` (22 checks, links the real
+`linux_abi.c`): the gate's four corners — trap frame answers, a
+sidecar-entered frame and a bare task do not — and the arithmetic, including
+the two bases disagreeing (`BLOCK` of 0x2 is 0x402 from the handler's set and
+0x2 from the stale one), a foreign `how` leaving the output untouched, and
+`SETMASK ~0` keeping the KILL bit the way the sidecar does. Clause **AC**
+pins the wiring and its order: the branch sits after every first-trap refusal
+and before the forward's describe (nothing is posted), the oldset is written
+**before** the new mask is committed (a bad pointer refuses with nothing
+moved), and the gate reads both flags while `reply_apply` still clears the
+fault one. The live arm's handler now asks for its own mask
+(`rt_sigprocmask(SIG_SETMASK, NULL, &old, 8)`) before it fixes the fault and
+requires `old == 0x400` — its frame's whole set — writing `E7FR-MASK` if it
+is handed the narrower one, and the boot's own account of the same answer is
+`[E7] rt_sigprocmask in a fault handler: oldset 400 -> 400`. Teeth: **t167**
+(the answer is never committed, so later BLOCK/UNBLOCK compute on a stale
+base), **t168** (the gate stops asking whether the frame came from the trap,
+so the sidecar's own delivery is answered by the kernel).
 
 ---
 

@@ -1023,6 +1023,61 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                     }
                     rplan = rp;
                 }
+                /* E7 increment 33: rt_sigprocmask INSIDE a trap-delivered
+                 * handler. The #PF delivery moved this kernel's mask to the
+                 * handler's set, but the sidecar entered nothing and was
+                 * told nothing (a trap has no round trip to ride), so its
+                 * copy still holds the pre-delivery one: forwarding would
+                 * report the narrower set on a query and compute BLOCK /
+                 * UNBLOCK on the wrong base. For exactly this window the
+                 * kernel is the mask's authority — it answers 14 here, from
+                 * pd->linux_sig_mask, with the sidecar's own arithmetic, and
+                 * posts nothing (nothing is half-answered). It sits AFTER
+                 * every first-trap refusal above (sigsetsize, the set's
+                 * span, the oldset's span), so those keep their answers.
+                 *
+                 * The tkill path is untouched: reply_apply entered that
+                 * handler AND moved the sidecar's mask before answering, so
+                 * it clears linux_sig_fault_active — which is what
+                 * linux_sig_mask_fault_owned asks beside sig_active. */
+                if (num == LINUX_RT_SIGPROCMASK &&
+                    linux_sig_mask_fault_owned(cur->linux_sig_active,
+                                               cur->linux_sig_fault_active)) {
+                    uint64_t old = cur->linux_sig_mask;
+                    uint64_t new_mask = old;
+
+                    if (largs[1] != 0) {
+                        uint64_t set = 0;
+                        if (linux_user_copy_out((uint8_t *)&set, cur->cr3,
+                                                largs[1],
+                                                LINUX_SIGSET_BYTES) != 0)
+                            return (uint64_t)(int64_t)(-LINUX_EFAULT);
+                        if (!linux_sig_mask_step(old, largs[0], set,
+                                                 &new_mask)) {
+                            kernel_serial_printf(
+                                "[E7] rt_sigprocmask inside a fault handler "
+                                "refused: how=%lu is not BLOCK/UNBLOCK/"
+                                "SETMASK\n",
+                                (unsigned long)largs[0]);
+                            return (uint64_t)(int64_t)(-LINUX_EINVAL);
+                        }
+                    }
+                    /* The oldset is the mask BEFORE this call, written
+                     * through the validated copy; the new mask is committed
+                     * only after that write lands, so a bad oldset pointer
+                     * is -EFAULT with nothing moved. */
+                    if (largs[2] != 0 &&
+                        linux_user_copy_in((const uint8_t *)&old, cur->cr3,
+                                           largs[2],
+                                           LINUX_SIGSET_BYTES) != 0)
+                        return (uint64_t)(int64_t)(-LINUX_EFAULT);
+                    cur->linux_sig_mask = new_mask;
+                    kernel_serial_printf(
+                        "[E7] rt_sigprocmask in a fault handler: oldset %lx "
+                        "-> %lx (the kernel is the mask's authority here)\n",
+                        (unsigned long)old, (unsigned long)new_mask);
+                    return 0;
+                }
                 /* E7 increment 6 (the mem class, §5.4), stage half: a
                  * brk's requested break is captured HERE — before the
                  * describe and before the post — because the reply can

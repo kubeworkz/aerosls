@@ -1358,4 +1358,35 @@ int linux_sig_return_reply_ok(uint64_t num, uint64_t rax, int32_t status);
 int linux_sig_fault_return_ok(int sig_active, int fault_active, uint64_t rax,
                               int32_t status);
 
+/* ─── E7 increment 33: the mask inside a trap-delivered handler ────────────
+ * A #PF delivery moves the KERNEL's `linux_sig_mask` to the handler's set
+ * (blocked | sa_mask | the signal), but the sidecar never saw that delivery
+ * and was told nothing about it — a trap has no round trip to ride — so its
+ * own copy still holds the pre-delivery set. A forwarded 14 would then
+ * report the NARROWER mask from inside the handler, and a forwarded
+ * BLOCK/UNBLOCK would compute on the wrong base. The tkill path has no such
+ * split: its 14 arm moved the sidecar's copy to the same number BEFORE it
+ * answered (clause P9 holds the two ends to one decision).
+ *
+ * So for exactly the window in which a TRAP-delivered frame is active, the
+ * kernel answers 14 itself, out of `pd->linux_sig_mask`. These two functions
+ * are that window's whole decision, pure so the host test drives them:
+ *
+ *   linux_sig_mask_fault_owned() — WHOSE copy answers. Both flags, not
+ *     "a handler is active": `linux_sig_reply_apply` clears fault_active
+ *     precisely because the sidecar entered that frame and moved its own
+ *     mask, so the tkill path keeps the forward it always had.
+ *
+ *   linux_sig_mask_step() — the arithmetic, the sidecar's own (BLOCK is
+ *     union, UNBLOCK is difference, SETMASK is replacement; a `how`
+ *     outside 0..2 is a refusal that moves nothing, and no KILL/STOP bit is
+ *     filtered out, because the sidecar's arm filters none).
+ */
+int linux_sig_mask_fault_owned(int sig_active, int fault_active);
+
+/* 1 and `*out` written on a `how` the sidecar's arm accepts, 0 otherwise
+ * with `*out` untouched — the caller refuses by name with -EINVAL. */
+int linux_sig_mask_step(uint64_t cur, uint64_t how, uint64_t set,
+                        uint64_t *out);
+
 #endif /* LINUX_ABI_H */
