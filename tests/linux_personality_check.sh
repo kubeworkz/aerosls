@@ -1079,7 +1079,7 @@ fi
 
 capfn="$(awk '/^static void proc_capture_entry_regs\(struct CapParkCtx\* ctx\) \{/{f=1} f{print} f&&/^}/{exit}' "$PDC")"
 if printf '%s\n' "$capfn" | grep -qF '%%gs:0x50' && \
-   printf '%s\n' "$capfn" | grep -qF 'ctx->linux_args[5]'; then
+   printf '%s\n' "$capfn" | grep -qF 'ctx->linux_args)'; then
     ok "U2. proc_capture_entry_regs snapshots the six argument registers into park_ctx beside the pushed set — a parked task's registers outlive the per-CPU block every later entry overwrites"
 else
     bad "U2. the entry capture no longer reads [gs:0x50..0x80) into park_ctx — a parked task loses its argument registers to the next trap on that core, and every resume after it restores someone else's"
@@ -1100,8 +1100,9 @@ else
 fi
 
 if grep -qF 'offsetof(struct CapParkCtx, linux_args) == 72' "$CCT" && \
-   grep -qF 'sizeof(struct CapParkCtx) == 120' "$CCT"; then
-    ok "U5. the host test pins the layout the resume asm indexes by byte — linux_args at 72 (p[9]), the full ctx 120 — so a reordered field is a red host test, not a boot that sysrets misaligned registers"
+   grep -qF 'offsetof(struct CapParkCtx, rax) == 120' "$CCT" && \
+   grep -qF 'sizeof(struct CapParkCtx) == 128' "$CCT"; then
+    ok "U5. the host test pins the layout the resume asm indexes by byte — linux_args at 72 (p[9]), the increment-29 rax at 120, the full ctx 128 — so a reordered field is a red host test, not a boot that sysrets misaligned registers"
 else
     bad "U5. the cap_create host test no longer pins CapParkCtx's layout — the resume asm's 72(%1)…112(%1) offsets would be argued from these greps alone"
 fi
