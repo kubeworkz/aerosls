@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# tests/run_source_smokes.sh — runs the SOURCE-ONLY guard smokes.
+# tests/run_source_smokes.sh — runs the SOURCE-ONLY guard smokes and the
+# source-only launcher harness.
 #
 # ─── Why this exists ───────────────────────────────────────────────────────
 # run_guard_smokes.sh globs tests/*_smoke.sh, but ten of the
@@ -37,7 +38,14 @@
 # run is a failure, not a skip, so a smoke that stops being source-only
 # cannot silently go dark.
 #
-# Exit: 0 if every smoke passed, 1 otherwise, 2 if no smokes were found.
+# The launcher harness (tests/run_cluster_harness.sh) is appended
+# explicitly: it is not named *_smoke.sh, but it is source-only (stub
+# qemu/make/grub on PATH, no build) and drives run-cluster.sh's arms,
+# including the sidecar RAM floor. The launcher must be exercised on every
+# push, not only on a build host, so it is held to the same exit contract
+# as the smokes.
+#
+# Exit: 0 if every test passed, 1 otherwise, 2 if no smokes were found.
 set -u
 cd "$(dirname "$0")/.."   # repo root
 
@@ -52,6 +60,11 @@ shopt -s nullglob
 smokes=(tests/*_smoke.sh)
 shopt -u nullglob
 
+# Not a *_smoke.sh by name, but source-only and part of the launcher's
+# guard teeth. Appended explicitly so the glob's fail-closed rule still
+# governs every smoke, and this harness is held to the same contract.
+extra=(tests/run_cluster_harness.sh)
+
 if [ "${#smokes[@]}" -eq 0 ]; then
     echo "ABORT: no tests/*_smoke.sh found. Run from the repo root." >&2
     exit 2
@@ -64,7 +77,7 @@ echo "run_source_smokes"
 echo "================="
 echo
 
-for s in "${smokes[@]}"; do
+for s in "${smokes[@]}" "${extra[@]}"; do
     name="$(basename "$s")"
     case " $BUILD_SMOKES " in
         *" $name "*) continue ;;

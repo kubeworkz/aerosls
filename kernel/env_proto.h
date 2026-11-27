@@ -93,9 +93,9 @@
 #define ENV_REG_OFF_TASK_NAMES (ENV_REG_OFF_N_TASKS + 4u)
 #define ENV_REG_TASK_NAME_STRIDE ENV_CKPT_NAME_LEN
 #define ENV_REG_OFF_TASK_KINDS \
-    (ENV_REG_OFF_TASK_NAMES + ENV_CKPT_MAX_TASKS * ENV_REG_TASK_NAME_STRIDE)
+    (ENV_REG_OFF_TASK_NAMES + ENV_CKPT_REG_TASKS * ENV_REG_TASK_NAME_STRIDE)
 #define ENV_REGISTER_REPLY_BODY_SIZE \
-    (ENV_REG_OFF_TASK_KINDS + ENV_CKPT_MAX_TASKS * 4u)
+    (ENV_REG_OFF_TASK_KINDS + ENV_CKPT_REG_TASKS * 4u)
 
 /* The body is a padded-free image of the struct, so the two MUST describe the
  * same number of bytes. If a field is added to one and not the other this is a
@@ -197,12 +197,12 @@ static inline void env_register_reply_encode(uint8_t* b, const struct EnvCkptReg
     for (uint32_t i = 0; i < ENV_CKPT_MAX_CHANS; i++)
         env_put_u32(b, (size_t)ENV_REG_OFF_CHANS + (size_t)i * 4u, r->chans[i]);
     env_put_u32(b, ENV_REG_OFF_N_TASKS, r->n_tasks);
-    for (uint32_t i = 0; i < ENV_CKPT_MAX_TASKS; i++) {
+    for (uint32_t i = 0; i < ENV_CKPT_REG_TASKS; i++) {
         size_t o = (size_t)ENV_REG_OFF_TASK_NAMES + (size_t)i * ENV_REG_TASK_NAME_STRIDE;
         for (uint32_t c = 0; c < ENV_CKPT_NAME_LEN; c++)
             b[o + c] = (uint8_t)r->task_name[i][c];
     }
-    for (uint32_t i = 0; i < ENV_CKPT_MAX_TASKS; i++)
+    for (uint32_t i = 0; i < ENV_CKPT_REG_TASKS; i++)
         env_put_u32(b, (size_t)ENV_REG_OFF_TASK_KINDS + (size_t)i * 4u, r->task_kind[i]);
 }
 
@@ -229,7 +229,7 @@ static inline int env_register_reply_parse(const uint8_t* b, size_t len,
     for (uint32_t i = 0; i < ENV_CKPT_MAX_CHANS; i++)
         out->chans[i] = env_read_u32(b, (size_t)ENV_REG_OFF_CHANS + (size_t)i * 4u);
     out->n_tasks = env_read_u32(b, ENV_REG_OFF_N_TASKS);
-    for (uint32_t i = 0; i < ENV_CKPT_MAX_TASKS; i++) {
+    for (uint32_t i = 0; i < ENV_CKPT_REG_TASKS; i++) {
         size_t o = (size_t)ENV_REG_OFF_TASK_NAMES + (size_t)i * ENV_REG_TASK_NAME_STRIDE;
         for (uint32_t c = 0; c < ENV_CKPT_NAME_LEN; c++)
             out->task_name[i][c] = (char)b[o + c];

@@ -322,6 +322,38 @@ static uint64_t* present_child(uint64_t* parent, size_t idx) {
         ? (uint64_t*)(uintptr_t)(parent[idx] & USER_PTE_FRAME_MASK) : 0;
 }
 
+/* E7 §10.15: a non-allocating protection rewrite for one present 4 KiB
+ * leaf. It is deliberately not user_map_page(): that walk may allocate an
+ * intermediate table from a tenant-supplied address, while this one must
+ * only change a mapping that already exists. The live frame, PWT/PCD, A/D
+ * and a 4 KiB leaf's PAT bit stay put; the caller supplies PRESENT plus
+ * the new U/S, W and NX bits. Refuses a supervisor-only leaf and any huge
+ * page, so an mprotect can never edit a shared kernel mapping. */
+int user_protect_page(uint64_t* pml4, uint64_t vaddr, uint64_t flags) {
+    uint64_t* pdpt;
+    uint64_t* pd;
+    uint64_t* pt;
+    uint64_t e;
+    uint64_t keep;
+
+    if (!pml4 || !(flags & USER_PTE_PRESENT)) return -1;
+    pdpt = present_child(pml4, PML4_IDX(vaddr));
+    if (!pdpt || !(pdpt[PDPT_IDX(vaddr)] & USER_PTE_USER)) return -1;
+    if (pdpt[PDPT_IDX(vaddr)] & USER_PTE_PAT) return -1;   /* 1 GiB PS */
+    pd = present_child(pdpt, PDPT_IDX(vaddr));
+    if (!pd || !(pd[PD_IDX(vaddr)] & USER_PTE_USER)) return -1;
+    if (pd[PD_IDX(vaddr)] & USER_PTE_PAT) return -1;       /* 2 MiB PS */
+    pt = present_child(pd, PD_IDX(vaddr));
+    if (!pt) return -1;
+    e = pt[PT_IDX(vaddr)];
+    if (!(e & USER_PTE_PRESENT)) return -1;
+    if (!(e & (USER_PTE_USER | USER_PTE_SOFT_NONE))) return -1;
+    keep = e & (USER_PTE_FRAME_MASK | USER_PTE_PWT | USER_PTE_PCD |
+                USER_PTE_ACCESSED | USER_PTE_DIRTY | USER_PTE_PAT);
+    pt[PT_IDX(vaddr)] = keep | flags;
+    return 0;
+}
+
 void user_unmap_page(uint64_t* pml4, uint64_t vaddr) {
     uint64_t* pdpt = present_child(pml4, PML4_IDX(vaddr));
     if (!pdpt) return;
@@ -415,13 +447,22 @@ static uint32_t user_free_subtree(uint64_t* tbl, int depth, uint32_t* seen) {
          * resuming to a NULL return address. A us=0 leaf inside a
          * process-owned table (own_table's replicated identity chunk, a
          * supervisor-flagged DEV map) aliases a frame owned by someone
-         * else; skipping it leaks nothing — its true owner frees it. */
-        if (!(e & USER_PTE_USER)) continue;
+         * else; skipping it leaks nothing — its true owner frees it.
+         * E7 §10.15 adds the one exception: a 4 KiB leaf carrying
+         * USER_PTE_SOFT_NONE is present, supervisor-only and STILL owned by
+         * this process. It must be freed here or an mprotect(PROT_NONE)
+         * followed by teardown leaks the frame it protected. */
         /* Leaf test mirrors clone_user_levels(): PTEs at depth 3 are
          * leaves; at depths 1-2 a set PS bit (bit 7) marks a 1 GiB / 2 MiB
          * large page — also a leaf. (At depth 3 bit 7 is PAT, hence the
          * depth check first.) */
         if (depth >= 3 || (depth > 0 && (e & 0x80))) {
+            if (depth >= 3) {
+                if (!(e & USER_PTE_USER) && !(e & USER_PTE_SOFT_NONE))
+                    continue;
+            } else if (!(e & USER_PTE_USER)) {
+                continue;
+            }
             uint64_t pa = e & USER_PTE_FRAME_MASK;
             /* Phase 14c: `seen` (a per-walk bitmap owned by
              * user_destroy_page_table) makes the cached-frame check also
@@ -437,6 +478,7 @@ static uint32_t user_free_subtree(uint64_t* tbl, int depth, uint32_t* seen) {
             }
             continue;
         }
+        if (!(e & USER_PTE_USER)) continue;
         /* Intermediate table: recurse first (its children are read before
          * anything is freed), then free the table frame itself. */
         uint64_t* child = (uint64_t*)(uintptr_t)(e & USER_PTE_FRAME_MASK);

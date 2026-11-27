@@ -81,8 +81,9 @@
  * assumption buried in the write path.
  */
 
-/* One store per environment; ENV_CKPT_MAX is the same number (8) because
- * the descriptor and the store are per-environment resources. */
+/* One store per environment. This stays 8 even though ENV_CKPT_MAX is 4 in
+ * the TG-2a record layout: the store table is a separate resource, and the
+ * record cap is sized by the one-frame NVMe constraint, not by storage. */
 #define ENV_STORAGE_MAX          8u
 
 /* The extent: exactly the tenant ramdisk's region (RD_STORAGE_FRAMES 256 ×

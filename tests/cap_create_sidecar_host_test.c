@@ -123,10 +123,11 @@
  *       -o /tmp/cap_create_sidecar_host_test \
  *       tests/cap_create_sidecar_host_test.c kernel/cap.c kernel/chan.c \
  *           kernel/console_service.c kernel/env_console.c kernel/linux_abi.c \
- *           kernel/elf64_load.c
+ *           kernel/elf64_load.c kernel/linux_thread.c
  *   /tmp/cap_create_sidecar_host_test
  */
 #include "kernel/cap.h"
+#include "kernel/linux_thread.h"   /* E7 TG-1 I1: the Linux group owns the span */
 #include "linux_abi.h"       /* E7 increment 7 (§5.2): PROC_PERSONALITY_LINUX
                                 * and the LINUX_AT_* the stack image carries */
 #include "kernel/entropy.h"  /* E7 increment 7: ENTROPY_* for the AT_RANDOM
@@ -973,6 +974,7 @@ int main(void) {
 
     /* Plant the parent process (the init sidecar, in a real boot). */
     memset(proc_table, 0, sizeof(proc_table));
+    linux_groups_init();   /* E7 TG-1 I1: a raw reset leaves slots group-less */
     proc_table[0].pid = 100;
     proc_table[0].active = 1;
     proc_table[0].state = PROC_SUSPENDED;
@@ -3294,9 +3296,9 @@ int main(void) {
         CHECK(si.argv0_vaddr >= STACK_BASE && si.argv0_vaddr < BIB_VADDR &&
               rnd_va >= STACK_BASE && rnd_va < BIB_VADDR,
               "L1: every in-image pointer lands inside the child's stack region");
-        CHECK(lc && lc->linux_heap_base == BIB_STACK_TOP &&
-              lc->linux_heap_limit == BIB_STACK_TOP + BUDGET_MEM &&
-              lc->linux_brk_cur == lc->linux_heap_base,
+        CHECK(lc && linux_group_heap_base(lc) == BIB_STACK_TOP &&
+              linux_group_heap_limit(lc) == BIB_STACK_TOP + BUDGET_MEM &&
+              linux_group_brk(lc) == linux_group_heap_base(lc),
               "L1: the heap span starts above the stack (the increment-6 twin)");
         CHECK(leaf_pte(BIB_VADDR) != 0,
               "L1: the BIB's page is still mapped at the stack top");

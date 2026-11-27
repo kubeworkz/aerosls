@@ -18,11 +18,16 @@
 # It therefore requires the exact green verdict, so a recording that turned
 # into a tooth run (or a vacuous replay that printed nothing) cannot pass.
 #
-# ─── The test seam ─────────────────────────────────────────────────────────
-# E7_EVIDENCE_DIR overrides the recording directory. It exists so the guard's
-# failure side can be exercised against a copied recording (for example, flip
-# facts' payloads=1 to 0 and require this script to exit 1); the committed
-# default is the only path CI uses.
+# ─── The counterexample is part of every run ───────────────────────────────
+# A guard that only proves the good recording passes can rot into a guard that
+# accepts everything. Every default run therefore copies the recording, flips
+# `payloads=1` to `payloads=0`, and requires the replay to fail with B1 red.
+# The manual proof we ran once was not enough: the failure side now has to
+# survive every edit to this file, the harness, or the recording.
+#
+# E7_EVIDENCE_DIR overrides the recording for a single external check. The
+# self-test is skipped then, because the caller is usually supplying a bad
+# copy to prove this guard still exits 1 on it.
 #
 # Exit: 0 pass, 1 fail. It never exits 2: a missing recording is a failure of
 # the evidence it is supposed to guard, not a reason to skip the check.
@@ -31,25 +36,68 @@ cd "$(dirname "$0")/.."   # repo root, so the harness's relative paths resolve
 
 ART="${E7_EVIDENCE_DIR:-evidence/e7_gate_drill_adaptive}"
 
-for f in boot1.log boot2.log facts; do
-    if [ ! -f "$ART/$f" ]; then
-        echo "FAIL  e7_gate_evidence_check: $ART/$f is missing — the committed recording is incomplete"
-        exit 1
+fail() {
+    echo "FAIL  e7_gate_evidence_check: $*" >&2
+    exit 1
+}
+
+# check_recording DIR EXPECT
+#   EXPECT=pass: exit 0 and the exact green verdict line.
+#   EXPECT=fail: nonzero exit and B1 named in the failure output.
+check_recording() {
+    dir="$1"
+    expect="$2"
+    for f in boot1.log boot2.log facts; do
+        [ -f "$dir/$f" ] || fail "$dir/$f is missing — the recording is incomplete"
+    done
+
+    out="$(bash tests/e7_gate_check.sh --replay "$dir" 2>&1)"
+    rc=$?
+
+    if [ "$expect" = "pass" ]; then
+        if [ "$rc" -ne 0 ]; then
+            printf '%s\n' "$out"
+            fail "the recording at $dir no longer replays green (exit $rc)"
+        fi
+        printf '%s\n' "$out" |
+            grep -qF -- "e7_gate_check: the recorded run in $dir passes the gate's clauses" ||
+            {
+                printf '%s\n' "$out"
+                fail "--replay exited 0 without the green verdict — a tooth recording is not a passing gate"
+            }
+    else
+        if [ "$rc" -eq 0 ]; then
+            printf '%s\n' "$out"
+            fail "the payloads=0 counterexample was accepted as a pass (exit 0)"
+        fi
+        printf '%s\n' "$out" | grep -qF -- "FAIL: B1." ||
+            {
+                printf '%s\n' "$out"
+                fail "the payloads=0 counterexample did not redden B1"
+            }
     fi
-done
+}
 
-out="$(bash tests/e7_gate_check.sh --replay "$ART" 2>&1)"
-rc=$?
-if [ "$rc" -ne 0 ]; then
-    printf '%s\n' "$out"
-    echo "FAIL  e7_gate_evidence_check: the recording at $ART no longer replays green (exit $rc)"
-    exit 1
+if [ -n "${E7_EVIDENCE_DIR:-}" ]; then
+    check_recording "$ART" pass
+    echo "e7_gate_evidence_check: $ART replays green — the recording is still accepted by its clauses"
+    exit 0
 fi
 
-if ! printf '%s\n' "$out" | grep -qF -- "e7_gate_check: the recorded run in $ART passes the gate's clauses"; then
-    printf '%s\n' "$out"
-    echo "FAIL  e7_gate_evidence_check: --replay exited 0 without the green verdict — a tooth recording is not a passing gate"
-    exit 1
-fi
+check_recording "$ART" pass
 
-echo "e7_gate_evidence_check: $ART replays green — the committed gate evidence is still accepted by its clauses"
+tmp="$(mktemp -d "evidence/.e7_gate_bad.XXXXXX")" ||
+    fail "could not create the counterexample directory"
+trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+cp "$ART/boot1.log" "$ART/boot2.log" "$ART/facts" "$tmp/" ||
+    fail "could not copy the recording into $tmp"
+sed 's/^payloads=1$/payloads=0/' "$ART/facts" > "$tmp/facts" ||
+    fail "could not write the counterexample facts file"
+grep -qx 'payloads=0' "$tmp/facts" ||
+    fail "the counterexample facts file did not flip payloads to 0"
+
+check_recording "$tmp" fail
+rm -rf "$tmp"
+trap - EXIT HUP INT TERM
+
+echo "e7_gate_evidence_check: $ART replays green; its payloads=0 counterexample reddens B1"

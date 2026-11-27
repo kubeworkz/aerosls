@@ -49,18 +49,26 @@ fi
 trap 'git checkout -- "$DOC" 2>/dev/null || true' EXIT
 
 sed -i 's/"hex"/"data"/g' "$DOC"
-out="$(bash "$guard" 2>&1)"
-rc=$?
-git checkout -- "$DOC"
-
-expected="docs/COMMANDS.md does not document the 'hex' field"
-if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -qF "$expected"; then
-    echo "TOOTH OK   hex-vs-data — guard failed with: $expected"
-else
-    echo "TOOTH FAIL hex-vs-data — guard rc=$rc, expected failure '$expected'"
-    printf '%s\n' "$out" | sed 's/^/           /'
+# VACUITY GUARD. If the doc no longer spells the field "hex", the sed applies
+# nothing and the guard is green; without this the tooth would report a guard
+# failure that is really a drift in the mutation.
+if git diff --quiet -- "$DOC"; then
+    echo "TOOTH FAIL hex-vs-data — mutation did not apply: no \"hex\" field was replaced, so the guard would run against the pristine doc"
     fails=$((fails + 1))
+else
+    out="$(bash "$guard" 2>&1)"
+    rc=$?
+
+    expected="docs/COMMANDS.md does not document the 'hex' field"
+    if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -qF "$expected"; then
+        echo "TOOTH OK   hex-vs-data — guard failed with: $expected"
+    else
+        echo "TOOTH FAIL hex-vs-data — guard rc=$rc, expected failure '$expected'"
+        printf '%s\n' "$out" | sed 's/^/           /'
+        fails=$((fails + 1))
+    fi
 fi
+git checkout -- "$DOC"
 
 # Final restore check — prove the doc is byte-identical again, so this
 # smoke can never leave a footprint for a later step (or a local run).

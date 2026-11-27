@@ -126,8 +126,13 @@ syscall_entry_stub:
     je  .do_sls_tx_recover
     cmp rax, 130
     je  .do_sls_svc_list
-    cmp rax, 131
-    je  .do_sls_svc_crash
+    ; 131 (sigaltstack in the Linux census) is deliberately NOT routed here.
+    ; This table runs BEFORE do_syscall's personality branch, so an asm route
+    ; would decide the number's meaning by number alone: the real firstuser's
+    ; sigaltstack(NULL, &old) became an SLS svc_crash of a NULL service name,
+    ; its old stack_t stayed zeroed, and Rust std skipped the guard-page
+    ; mmap+mprotect. SLS still reaches sys_sls_svc_crash through do_syscall's
+    ; SYS_SLS_SVC_CRASH arm, so only the Linux personality changes.
     cmp rax, 132
     je  .do_sls_svc_restart
     cmp rax, 133
@@ -221,11 +226,6 @@ syscall_entry_stub:
 .do_sls_svc_list:
     ; no arguments
     call sys_sls_svc_list
-    jmp  syscall_return_path
-
-.do_sls_svc_crash:
-    ; RDI = const char* name
-    call sys_sls_svc_crash
     jmp  syscall_return_path
 
 .do_sls_svc_restart:

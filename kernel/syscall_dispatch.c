@@ -6,6 +6,8 @@
 #include "tier_mgr.h"
 #include "query_engine.h"
 #include "process.h"
+#include "linux_thread.h"
+#include "linux_futex.h"
 #include "loader.h"
 #include "agent.h"
 #include "../kernel/webapp.h"
@@ -36,6 +38,7 @@
 #include "cap.h"            // Seed Kernel Phase 1 -- SYS_SLS_CAP_* (289-297)
 #include "kernel_io.h"      // kernel_serial_print/printf -- the control-plane refusal lines
 #include "linux_abi.h"      // E7 increment 2 -- the Linux-personality branch (§3.3)
+#include "env_ckpt.h"       // E7 TG-2a -- the clone's group-thread record stamp
 #include "timer.h"         // E7 increment 24 -- SYS_SLS_NOW_NS
 #include "../arch/x86/user_paging.h"  // E7 §5.3 (the plan's inc 4) -- user_write_fs_base,
                                       // the MSR write of a granted ARCH_SET_FS
@@ -170,6 +173,7 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                      * "the holder went away under us" is -EIO, never a
                      * raw CAP code. */
                     cur->park_syscall = 0;
+                    linux_forward_lease_release(cur);
                     return (uint64_t)(int64_t)linux_errno_from_cap(
                         CAP_ERR_REVOKED);
                 }
@@ -178,6 +182,11 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                                                    (uint64_t)(uintptr_t)arg);
                     cur->park_syscall = 0;  /* in-flight closes HERE — the
                                             * next stray refuses again */
+                    /* I4: the reply is applied, so the group's one forward
+                     * slot is free again. The release may grant the lease to
+                     * a parked sibling and restart its syscall; that frame is
+                     * built but not entered (no switch here). */
+                    linux_forward_lease_release(cur);
                     /* E7 increment 21: the gate workload's stop, at the
                      * sysret that closes a read(fd 3). `rax` is the value
                      * the sysret will deliver and park_ctx is the read's own
@@ -261,10 +270,10 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                         if (snum == LINUX_BRK) {
                             struct LinuxMemBrkVerdict v =
                                 linux_mem_brk_verdict(
-                                    cur->linux_heap_base,
-                                    cur->linux_heap_limit,
-                                    cur->linux_mmap_top,
-                                    cur->linux_brk_cur, sa0, rax);
+                                    linux_group_heap_base(cur),
+                                    linux_group_heap_limit(cur),
+                                    linux_group_mmap_top(cur),
+                                    linux_group_brk(cur), sa0, rax);
                             if (v.malformed) {
                                 kernel_serial_printf(
                                     "[E7] brk reply 0x%lx for request "
@@ -273,10 +282,10 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                                     "the refusal - break unmoved\n",
                                     (unsigned long)rax,
                                     (unsigned long)sa0,
-                                    (unsigned long)cur->linux_heap_base,
-                                    (unsigned long)cur->linux_heap_limit,
-                                    (unsigned long)cur->linux_brk_cur);
-                                rax = cur->linux_brk_cur;
+                                    (unsigned long)linux_group_heap_base(cur),
+                                    (unsigned long)linux_group_heap_limit(cur),
+                                    (unsigned long)linux_group_brk(cur));
+                                rax = linux_group_brk(cur);
                             } else if (v.map_pages) {
                                 uint64_t *pml4 =
                                     (uint64_t *)(uintptr_t)cur->cr3;
@@ -302,7 +311,7 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                                     done++;
                                 }
                                 if (done == v.map_pages) {
-                                    cur->linux_brk_cur = v.new_cur;
+                                    linux_group_set_brk(cur, v.new_cur);
                                 } else {
                                     while (done) {
                                         uint64_t f;
@@ -320,7 +329,7 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                                         "exhaustion mid-batch - batch "
                                         "unwound, break unmoved\n",
                                         (unsigned long)v.new_cur);
-                                    rax = cur->linux_brk_cur;
+                                    rax = linux_group_brk(cur);
                                 }
                             }
                         } else if (snum == LINUX_MMAP) {
@@ -368,10 +377,10 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                                 mreq.prot  = sa2;
                                 mreq.flags = sa3;
                                 v = linux_mem_mmap_verdict(
-                                    cur->linux_heap_base,
-                                    cur->linux_heap_limit,
-                                    cur->linux_brk_cur,
-                                    cur->linux_mmap_top, &mreq, rax);
+                                    linux_group_heap_base(cur),
+                                    linux_group_heap_limit(cur),
+                                    linux_group_brk(cur),
+                                    linux_group_mmap_top(cur), &mreq, rax);
                                 if (v.malformed) {
                                     kernel_serial_printf(
                                         "[E7] mmap reply 0x%lx for "
@@ -383,10 +392,10 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                                         (unsigned long)rax,
                                         (unsigned long)sa0,
                                         (unsigned long)sa1,
-                                        (unsigned long)cur->linux_heap_base,
-                                        (unsigned long)cur->linux_heap_limit,
-                                        (unsigned long)cur->linux_brk_cur,
-                                        (unsigned long)cur->linux_mmap_top);
+                                        (unsigned long)linux_group_heap_base(cur),
+                                        (unsigned long)linux_group_heap_limit(cur),
+                                        (unsigned long)linux_group_brk(cur),
+                                        (unsigned long)linux_group_mmap_top(cur));
                                     rax = (uint64_t)(int64_t)
                                           (-LINUX_ENOMEM);
                                 } else {
@@ -459,8 +468,8 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                                         rax = (uint64_t)(int64_t)
                                               (-LINUX_ENOMEM);
                                     } else {
-                                        cur->linux_mmap_top =
-                                            v.new_mmap_top;
+                                        linux_group_set_mmap_top(cur,
+                                            v.new_mmap_top);
                                     }
                                 }
                             } else if (snum == LINUX_MUNMAP) {
@@ -493,9 +502,9 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                                 mreq.addr = sa0;
                                 mreq.len  = sa1;
                                 v = linux_mem_munmap_verdict(
-                                    cur->linux_heap_base,
-                                    cur->linux_heap_limit,
-                                    cur->linux_brk_cur, &mreq, rax);
+                                    linux_group_heap_base(cur),
+                                    linux_group_heap_limit(cur),
+                                    linux_group_brk(cur), &mreq, rax);
                                 if (v.malformed) {
                                     kernel_serial_printf(
                                         "[E7] munmap reply 0x%lx for "
@@ -506,9 +515,9 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                                         (unsigned long)rax,
                                         (unsigned long)sa0,
                                         (unsigned long)sa1,
-                                        (unsigned long)cur->linux_heap_base,
-                                        (unsigned long)cur->linux_heap_limit,
-                                        (unsigned long)cur->linux_brk_cur);
+                                        (unsigned long)linux_group_heap_base(cur),
+                                        (unsigned long)linux_group_heap_limit(cur),
+                                        (unsigned long)linux_group_brk(cur));
                                     rax = (uint64_t)(int64_t)
                                           (-LINUX_EINVAL);
                                 } else if (v.unmap_pages) {
@@ -541,6 +550,99 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                                         (unsigned long)(v.unmap_pages -
                                                         freed));
                                 }
+                            } else if (snum == LINUX_MPROTECT) {
+                                /* E7 §10.15 apply half: the sidecar's
+                                 * grant is re-checked over the staged
+                                 * words and the task's own windows, then
+                                 * EVERY page is prewalked before the first
+                                 * PTE changes. No frame is allocated or
+                                 * freed: a present leaf keeps its frame and
+                                 * only its protection bits move. A missing
+                                 * page — including the no-frame reservation
+                                 * created by mmap(PROT_NONE) — answers
+                                 * -ENOMEM with nothing changed. */
+                                struct LinuxMprotectReq mreq;
+                                struct LinuxMemMprotectVerdict v;
+                                mreq.addr = sa0;
+                                mreq.len  = sa1;
+                                mreq.prot = sa2;
+                                v = linux_mem_mprotect_verdict(
+                                    linux_group_image_lo(cur),
+                                    linux_group_image_hi(cur),
+                                    cur->linux_stack_base,
+                                    cur->linux_stack_base +
+                                        (uint64_t)cur->linux_stack_pages * 4096ull,
+                                    linux_group_heap_base(cur),
+                                    linux_group_heap_limit(cur), &mreq, rax);
+                                if (v.malformed) {
+                                    kernel_serial_printf(
+                                        "[E7] mprotect reply 0x%lx for "
+                                        "request addr=0x%lx len=%lu "
+                                        "prot=0x%lx is not success - "
+                                        "nothing changed\n",
+                                        (unsigned long)rax,
+                                        (unsigned long)sa0,
+                                        (unsigned long)sa1,
+                                        (unsigned long)sa2);
+                                    rax = (uint64_t)(int64_t)
+                                          (-LINUX_EINVAL);
+                                } else if (v.pages) {
+                                    uint64_t *pml4 =
+                                        (uint64_t *)(uintptr_t)cur->cr3;
+                                    uint64_t va = v.va;
+                                    uint64_t idx;
+                                    int absent = 0;
+
+                                    for (idx = 0; idx < v.pages; idx++) {
+                                        if (!linux_user_page_frame(
+                                                cur->cr3, va)) {
+                                            absent = 1;
+                                            break;
+                                        }
+                                        va += 4096;
+                                    }
+                                    if (absent) {
+                                        kernel_serial_printf(
+                                            "[E7] mprotect addr=0x%lx "
+                                            "len=%lu: page 0x%lx is "
+                                            "absent - nothing changed\n",
+                                            (unsigned long)sa0,
+                                            (unsigned long)sa1,
+                                            (unsigned long)va);
+                                        rax = (uint64_t)(int64_t)
+                                              (-LINUX_ENOMEM);
+                                    } else {
+                                        uint64_t flags = USER_PTE_PRESENT;
+                                        if (mreq.prot == LINUX_PROT_NONE) {
+                                            flags |= USER_PTE_SOFT_NONE |
+                                                     USER_PTE_NOEXEC;
+                                        } else {
+                                            flags |= USER_PTE_USER;
+                                            if (mreq.prot & LINUX_PROT_WRITE)
+                                                flags |= USER_PTE_WRITE;
+                                            if (!(mreq.prot & LINUX_PROT_EXEC))
+                                                flags |= USER_PTE_NOEXEC;
+                                        }
+                                        va = v.va;
+                                        for (idx = 0; idx < v.pages; idx++) {
+                                            user_protect_page(pml4, va,
+                                                             flags);
+                                            user_invlpg(va);
+                                            va += 4096;
+                                        }
+                                        kernel_serial_printf(
+                                            "[E7] mprotect addr=0x%lx "
+                                            "len=%lu prot=0x%lx: %lu "
+                                            "page(s) %s\n",
+                                            (unsigned long)sa0,
+                                            (unsigned long)sa1,
+                                            (unsigned long)sa2,
+                                            (unsigned long)v.pages,
+                                            mreq.prot == LINUX_PROT_NONE
+                                                ? "soft-protected (P=1 U=0)"
+                                                : "re-protected");
+                                    }
+                                }
                             }
                         }
                     return rax;
@@ -566,6 +668,217 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                 uint32_t fwd_len = (uint32_t)sizeof(struct SLSLinuxSyscallRequest);
                 int status;
                 proc_read_linux_args(largs);
+                /* E7 TG-1 I2: the task class — identity and thread exit are
+                 * kernel-local. getpid is the GROUP's id (the leader's pid),
+                 * gettid this descriptor's own pid, and exit(60) releases ONE
+                 * thread: its syscall stack and identity go, the group's cr3,
+                 * cap table and sidecar row stay while siblings live. The
+                 * last thread destroys the group exactly once. */
+                if (num == LINUX_GETPID)
+                    return (uint64_t)cur->tgid;
+                if (num == LINUX_GETTID)
+                    return (uint64_t)cur->tid;
+                if (num == LINUX_EXIT) {
+                    struct LinuxThreadGroup* eg = linux_group_of(cur);
+                    if (eg && !cur->is_group_leader)
+                        (void)env_ckpt_linux_group_thread_drop(
+                            cur->partition_id, eg->group_id,
+                            cur->thread_index);
+                    kernel_serial_printf(
+                        "[E7] exit(%lu) from TID %u group %u: thread-local "
+                        "teardown (no sidecar request)\n",
+                        (unsigned long)largs[0], cur->tid, cur->tgid);
+                    linux_thread_exit(cur, (uint32_t)largs[0]);
+                }
+                /* E7 TG-1 I5: set_tid_address (218) is still the sidecar's to
+                 * answer — that arm is where the tid tkill matches against is
+                 * recorded — but the WORD it names is the kernel's, because
+                 * the kernel is what writes it at exit. Capturing it here, at
+                 * the first trap, keeps one authority per half: the sidecar
+                 * owns the tid, the kernel owns the clear. A word that is not
+                 * a canonical user address is stored as 0, so the glue never
+                 * has an address to try. */
+                if (num == LINUX_SET_TID_ADDRESS) {
+                    cur->linux_clear_tid =
+                        linux_ctid_ok(largs[0]) ? largs[0] : 0;
+                }
+                /* E7 increment 31 (P1-C's fault arm): rt_sigaction is also the
+                 * fault path's only chance to learn a handler. A ring-3 #PF
+                 * has no syscall behind it and cannot be parked, so the
+                 * kernel keeps its OWN copy of the four fault signals' acts,
+                 * read here at the first trap — the same 32 bytes the forward
+                 * carries, through the same validated walker, and before any
+                 * post. A read that fails records nothing: the fault path then
+                 * keeps its attributed kill, which is the honest answer to a
+                 * handler this kernel could not see. */
+                if (num == LINUX_RT_SIGACTION && largs[1] != 0) {
+                    uint8_t actb[LINUX_SIGACT_BYTES];
+                    if (linux_user_copy_out(actb, cur->cr3, largs[1],
+                                            LINUX_SIGACT_BYTES) == 0)
+                        (void)linux_fault_act_record(cur->linux_fault_act,
+                                                     (uint32_t)largs[0],
+                                                     actb);
+                }
+                /* E7 TG-1 I5: set_robust_list (273) is kernel-local for the
+                 * same reason futex is: the list lives in the group's page
+                 * table and its walk ends in this scheduler's wakes. The
+                 * length must be the head this shim understands, so a caller
+                 * with a different struct is refused by name rather than
+                 * walked with the wrong strides. */
+                if (num == LINUX_SET_ROBUST_LIST) {
+                    if (!linux_robust_list_ok(largs[0], largs[1])) {
+                        kernel_serial_printf(
+                            "[E7] set_robust_list head=0x%lx len=%lu "
+                            "refused: not a canonical 8-aligned user head "
+                            "of %u bytes\n",
+                            (unsigned long)largs[0], (unsigned long)largs[1],
+                            (unsigned)LINUX_ROBUST_LIST_HEAD_BYTES);
+                        return (uint64_t)(int64_t)(-LINUX_EINVAL);
+                    }
+                    cur->linux_robust_list = largs[0];
+                    kernel_serial_printf(
+                        "[E7] set_robust_list: TID %u head=0x%lx len=%lu "
+                        "recorded (walked at this thread's exit)\n",
+                        cur->tid, (unsigned long)largs[0],
+                        (unsigned long)largs[1]);
+                    return 0;
+                }
+                /* E7 TG-1 I3: futex (202) is kernel-local. The sidecar owns
+                 * no page table and is not the scheduler, so the kernel reads
+                 * the waited-on word through the caller's own root, compares
+                 * it, and parks the caller in the group's wait table; a
+                 * sibling's FUTEX_WAKE resumes it with rax=0, the deadline
+                 * tick with -ETIMEDOUT. The check and the enqueue are inside
+                 * this ONE trap (interrupts off), so a wake cannot slip
+                 * between them: it either finds the record or the waiter's
+                 * own value check answers EAGAIN. */
+                if (num == LINUX_FUTEX) {
+                    uint32_t fop  = (uint32_t)largs[1];
+                    uint32_t fcmd = fop & LINUX_FUTEX_OP_MASK;
+                    struct LinuxThreadGroup* fg = linux_group_of(cur);
+                    if (linux_futex_op_supported(fop) != 0) {
+                        kernel_serial_printf(
+                            "[E7] futex op=0x%lx refused: v1 serves only "
+                            "WAIT(0)/WAKE(1), private, relative timeout\n",
+                            (unsigned long)largs[1]);
+                        return (uint64_t)(int64_t)(-LINUX_ENOSYS);
+                    }
+                    if (!fg) {
+                        kernel_serial_printf(
+                            "[E7] futex refused: TID %u is in no thread "
+                            "group\n", cur->tid);
+                        return (uint64_t)(int64_t)(-LINUX_EINVAL);
+                    }
+                    if (fcmd == LINUX_FUTEX_OP_WAKE) {
+                        /* Linux does not dereference the word on a wake;
+                         * the key match alone is the operation. */
+                        return (uint64_t)linux_futex_wake_threads(
+                            fg->group_id, largs[0], (uint32_t)largs[2]);
+                    }
+                    /* FUTEX_WAIT: read the word, compare, park. */
+                    {
+                        uint8_t  wb[4];
+                        uint32_t word;
+                        uint64_t deadline = 0;
+                        int frc;
+
+                        if (!linux_fs_addr_is_user_canonical(largs[0]) ||
+                            linux_user_copy_out(wb, cur->cr3, largs[0],
+                                                4) != 0) {
+                            kernel_serial_printf(
+                                "[E7] futex wait at 0x%lx refused: bad user "
+                                "word (EFAULT)\n",
+                                (unsigned long)largs[0]);
+                            return (uint64_t)(int64_t)(-LINUX_EFAULT);
+                        }
+                        word = (uint32_t)wb[0] |
+                               ((uint32_t)wb[1] << 8) |
+                               ((uint32_t)wb[2] << 16) |
+                               ((uint32_t)wb[3] << 24);
+                        if (word != (uint32_t)largs[2])
+                            return (uint64_t)(int64_t)(-LINUX_EAGAIN);
+
+                        if (largs[3] != 0) {
+                            uint64_t tv[2];
+                            if (linux_user_copy_out((uint8_t*)tv, cur->cr3,
+                                                    largs[3],
+                                                    LINUX_TIMESPEC_BYTES) != 0)
+                                return (uint64_t)(int64_t)(-LINUX_EFAULT);
+                            if ((int64_t)tv[0] < 0 || (int64_t)tv[1] < 0)
+                                return (uint64_t)(int64_t)(-LINUX_EINVAL);
+                            /* A zero timespec is Linux's "do not block":
+                             * the value matched, so the answer is the
+                             * timeout itself, with no park. */
+                            if (tv[0] == 0 && tv[1] == 0)
+                                return (uint64_t)(int64_t)(-LINUX_ETIMEDOUT);
+                            frc = linux_futex_deadline(tv[0], tv[1],
+                                                       kernel_tick_counter,
+                                                       KERNEL_TICK_NS,
+                                                       &deadline);
+                            if (frc != 0) return (uint64_t)(int64_t)frc;
+                        }
+                        return (uint64_t)(int64_t)linux_futex_block(
+                            cur, fg->group_id, largs[0], deadline);
+                    }
+                }
+                /* E7 TG-1 I2: clone is the kernel-local thread class. It
+                 * never describes, posts or parks: the group already owns
+                 * the address space, cap table and sidecar row, so the only
+                 * work is a new descriptor in the same group. The child
+                 * starts at this trap's return RIP with rax=0. */
+                if (num == LINUX_CLONE) {
+                    struct LinuxClonePlan cplan;
+                    uint64_t parent_rip = 0;
+                    uint32_t child_tid = 0;
+                    int crc;
+                    if (!proc_read_linux_return_rip(&parent_rip)) {
+                        kernel_serial_printf(
+                            "[E7] clone refused: no syscall entry capture "
+                            "(kernel context)\n");
+                        return (uint64_t)(int64_t)(-LINUX_EINVAL);
+                    }
+                    crc = linux_clone_plan(largs[0], largs[1], largs[4],
+                                           largs[3], cur->fs_base, &cplan);
+                    if (crc != 0) {
+                        kernel_serial_printf(
+                            "[E7] clone flags=0x%lx stack=0x%lx tls=0x%lx "
+                            "refused before any table change: %s\n",
+                            (unsigned long)largs[0],
+                            (unsigned long)largs[1],
+                            (unsigned long)largs[4],
+                            crc == -LINUX_EAGAIN
+                                ? "group/process table full"
+                                : "not the Go thread shape or bad user "
+                                  "stack/TLS");
+                        return (uint64_t)(int64_t)crc;
+                    }
+                    crc = linux_clone_thread(cur, &cplan, parent_rip,
+                                             &child_tid);
+                    if (crc != 0) {
+                        kernel_serial_printf(
+                            "[E7] clone refused: %s\n",
+                            crc == -LINUX_EAGAIN
+                                ? "group cap or resources exhausted"
+                                : "invalid parent/group identity");
+                        return (uint64_t)(int64_t)crc;
+                    }
+                    /* TG-2a: the child is the one descriptor whose tid is the
+                     * clone result. Its group/index were assigned by
+                     * linux_group_join_thread(); stamp that identity into the
+                     * environment's record so a later capture can name the
+                     * thread. A record-less (boot census) group is a no-op. */
+                    for (int ci = 0; ci < PROC_MAX; ci++) {
+                        if (!proc_table[ci].active ||
+                            proc_table[ci].tid != child_tid) continue;
+                        (void)env_ckpt_linux_group_thread_stamp(
+                            cur->partition_id, cur->tgid,
+                            proc_table[ci].thread_index,
+                            proc_table[ci].name,
+                            proc_table[ci].user_rip);
+                        break;
+                    }
+                    return (uint64_t)child_tid;
+                }
 #if E7G_TOOTH
                 /* E7 increment 22 (tests/e7_gate_check.sh --teeth): the two
                  * forward-path teeth, armed on the descriptor the pour
@@ -631,6 +944,15 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                 cur->reply_stage_len2  = 0;
                 cur->reply_stage_va3   = 0;
                 cur->reply_stage_valid = 0;
+                /* E7 increment 34: a reveal probe's stage lives for exactly
+                 * one forward, so it is cleared here with the rest — a
+                 * stage from a forward that never reached a reply must not
+                 * commit its mask at a later 14. */
+                cur->linux_sig_mask_stage_valid = 0;
+                cur->linux_sig_mask_stage_probe = 0;
+                cur->linux_sig_mask_stage_old   = 0;
+                cur->linux_sig_mask_stage_new   = 0;
+                cur->linux_sig_mask_stage_dst   = 0;
                 /* E7 increment 5, plan half: BEFORE the describe (the
                  * clamp must be IN the description) and before the
                  * channel lookup (a refusal the first trap can produce
@@ -747,6 +1069,194 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                     }
                     rplan = rp;
                 }
+                /* E7 increment 33: rt_sigprocmask INSIDE a trap-delivered
+                 * handler. The #PF delivery moved this kernel's mask to the
+                 * handler's set, but the sidecar entered nothing and was
+                 * told nothing (a trap has no round trip to ride), so its
+                 * copy still holds the pre-delivery one: forwarding would
+                 * report the narrower set on a query and compute BLOCK /
+                 * UNBLOCK on the wrong base. For exactly this window the
+                 * kernel is the mask's authority — it answers 14 here, from
+                 * pd->linux_sig_mask, with the sidecar's own arithmetic, and
+                 * posts nothing (nothing is half-answered). It sits AFTER
+                 * every first-trap refusal above (sigsetsize, the set's
+                 * span, the oldset's span), so those keep their answers.
+                 *
+                 * The tkill path is untouched: reply_apply entered that
+                 * handler AND moved the sidecar's mask before answering, so
+                 * it clears linux_sig_fault_active — which is what
+                 * linux_sig_mask_fault_owned asks beside sig_active. */
+                if (num == LINUX_RT_SIGPROCMASK) {
+                    /* E7 increment 35: a frame the handler LEFT instead of
+                     * returning from. Increments 32–34's window is founded on
+                     * the handler still being IN the frame its delivery built:
+                     * the delivery enters with rsp == the frame's address and
+                     * a handler only grows DOWN, so a handler still in its
+                     * frame makes this call with rsp <= frame_rsp. A 15
+                     * restores from that frame and closes the window
+                     * (linux_sig_return_apply). A handler that leaves by
+                     * longjmp never sends that 15 — siglongjmp restores the
+                     * mask through THIS number first (so a 14 does arrive) and
+                     * then pops rsp back to the setjmp caller, above the frame
+                     * — and without this check the kernel would go on
+                     * answering every 14 of that task's life out of a copy the
+                     * sidecar never saw: increment 33's split, made permanent
+                     * and unclosable.
+                     *
+                     * The mask both ends still agree on is the one the frame
+                     * RECORDS. uc_sigmask is the PRE-delivery set (the builder
+                     * copies spec->blocked), the sidecar's copy never moved
+                     * during the window, and every 14 outside it stages what it
+                     * moved to — so the frame's word IS the sidecar's.
+                     * Restoring it is a no-op for the sanctioned exit
+                     * (siglongjmp already restored that same set through this
+                     * very number) and the only honest answer for an
+                     * unsanctioned one: a handler's mask edits are dropped
+                     * rather than left where no other end can see them (§10.30
+                     * names that). The read is the validated walker, so a frame
+                     * the task unmapped leaves the copy alone — the next
+                     * consented 14's reply commit realigns it — and every path
+                     * still closes the window, so no later 15 can restore a
+                     * frame that is no longer the task's. */
+                    {
+                        uint64_t now = proc_read_user_rsp();
+                        if (cur->linux_sig_fault_active &&
+                            linux_sig_frame_abandoned(
+                                cur->linux_sig_frame_rsp, now)) {
+                            uint64_t at = cur->linux_sig_frame_rsp;
+                            uint64_t agreed = cur->linux_sig_mask;
+                            int read = linux_user_copy_out(
+                                           (uint8_t *)&agreed, cur->cr3,
+                                           at + LINUX_SIGFRAME_SIGMASK,
+                                           LINUX_SIGSET_BYTES) == 0;
+                            cur->linux_sig_mask         = agreed;
+                            cur->linux_sig_active       = 0;
+                            cur->linux_sig_fault_active = 0;
+                            cur->linux_sig_frame_rsp    = 0;
+                            kernel_serial_printf(
+                                "[E7] fault handler abandoned the frame at "
+                                "%lx (rsp %lx): mask window closed at %lx%s\n",
+                                (unsigned long)at, (unsigned long)now,
+                                (unsigned long)agreed,
+                                read ? "" : ", frame unreadable");
+                        }
+                    }
+                    /* E7 increment 34: whose mask answers, whether the call
+                     * owes a REVEAL, and — the prerequisite both rest on —
+                     * the kernel's own copy of the thread's blocked set,
+                     * which this forward is about to change. Until now that
+                     * copy moved only at DELIVERIES, so a guest that blocked
+                     * a signal (or unblocked one) between two signals was
+                     * invisible to the fault path: its frame would carry the
+                     * wrong mask, and a trap handler could not free a bit the
+                     * kernel never knew was blocked. Every 14 therefore
+                     * stages what it moved to, and the reply hook commits it
+                     * only on a consent — the sidecar still answers every
+                     * unblock it answered before, unchanged. */
+                    int owned = linux_sig_mask_fault_owned(
+                                    cur->linux_sig_active,
+                                    cur->linux_sig_fault_active);
+                    uint64_t old = cur->linux_sig_mask;
+                    uint64_t new_mask = old;
+                    int probe = 0;
+                    int planned = 0;
+
+                    if (largs[1] != 0) {
+                        uint64_t set = 0;
+                        if (linux_user_copy_out((uint8_t *)&set, cur->cr3,
+                                                largs[1],
+                                                LINUX_SIGSET_BYTES) != 0)
+                            return (uint64_t)(int64_t)(-LINUX_EFAULT);
+                        planned = linux_sig_mask_fault_plan(old, largs[0], set,
+                                                           &new_mask, &probe);
+                        if (!planned) {
+                            /* A `how` Linux does not have. The trap window
+                             * answers for itself (increment 33's EINVAL);
+                             * outside it the sidecar's own arm answers,
+                             * exactly as before — and nothing is staged,
+                             * because a refusal moves nothing. */
+                            if (owned) {
+                                kernel_serial_printf(
+                                    "[E7] rt_sigprocmask inside a fault "
+                                    "handler refused: how=%lu is not "
+                                    "BLOCK/UNBLOCK/SETMASK\n",
+                                    (unsigned long)largs[0]);
+                                return (uint64_t)(int64_t)(-LINUX_EINVAL);
+                            }
+                        }
+                    }
+                    if (owned && !probe) {
+                        /* E7 increment 33's answer, unchanged: nothing went
+                         * from BLOCKED to UNBLOCKED, so nothing can be
+                         * revealed and the arithmetic IS the whole call. The
+                         * oldset is written through the validated copy and
+                         * the mask committed only after it lands, so a bad
+                         * pointer is -EFAULT with nothing moved. */
+                        if (largs[2] != 0 &&
+                            linux_user_copy_in((const uint8_t *)&old, cur->cr3,
+                                               largs[2],
+                                               LINUX_SIGSET_BYTES) != 0)
+                            return (uint64_t)(int64_t)(-LINUX_EFAULT);
+                        cur->linux_sig_mask = new_mask;
+                        kernel_serial_printf(
+                            "[E7] rt_sigprocmask in a fault handler: oldset "
+                            "%lx -> %lx (the kernel is the mask's authority "
+                            "here)\n",
+                            (unsigned long)old, (unsigned long)new_mask);
+                        return 0;
+                    }
+                    /* E7 increment 34: this call frees a blocked bit, so it
+                     * may REVEAL a pending signal — and `pending` and the
+                     * dispositions that decide what a reveal means are the
+                     * sidecar's, not the kernel's. The kernel still owns the
+                     * mask for the window, so the forward is a tagged
+                     * CONTROL request rather than the child's call: SETMASK
+                     * (a shape the 14 arm already parses), no set and no
+                     * oldset pointers, no payload, the mask it computed in
+                     * args[4] and the tag in args[5]. The sidecar runs its
+                     * own reveal ladder and leaves ITS mask alone; a consent
+                     * commits ours at the reply (kernel/chan.c) and a refusal
+                     * moves nothing at all — so the two copies still agree
+                     * after the return, and a tkill-delivered handler's
+                     * unblock is untouched (the whole window is gated on the
+                     * trap flag above). */
+                    if (!planned) {
+                        /* A query moves nothing: no stage, and the forward
+                         * below is the child's own call. */
+                    } else {
+                    cur->linux_sig_mask_stage_valid = 1;
+                    cur->linux_sig_mask_stage_probe = owned ? 1 : 0;
+                    cur->linux_sig_mask_stage_old   = old;
+                    cur->linux_sig_mask_stage_new   = new_mask;
+                    cur->linux_sig_mask_stage_dst   = owned ? largs[2] : 0;
+                    if (!owned) {
+                        /* The sidecar answers this one — a tkill-delivered
+                         * handler's unblock, or an ordinary task's call.
+                         * Nothing about that changed: the stage only lets the
+                         * reply hook keep the KERNEL's copy in step, which
+                         * the fault window and the fault delivery's blocked
+                         * check both read. */
+                        kernel_serial_printf(
+                            "[E7] rt_sigprocmask: mask %lx staged for the reply\n",
+                            (unsigned long)new_mask);
+                    } else {
+                    plan.src  = 0;
+                    plan.len  = 0;
+                    rplan.dst = 0;
+                    rplan.len = 0;
+                    rplan.aux = 0;
+                    rplan.kind = LINUX_STAGE_NONE;
+                    largs[0] = 2;   /* the arm's SETMASK shape          */
+                    largs[1] = 0;   /* no set, no oldset, no payload    */
+                    largs[2] = 0;
+                    largs[4] = new_mask;
+                    largs[5] = LINUX_SIG_REVEAL_TAG;
+                    kernel_serial_printf(
+                        "[E7] fault handler unmask: forwarding the reveal, mask %lx\n",
+                        (unsigned long)new_mask);
+                    }
+                    }
+                }
                 /* E7 increment 6 (the mem class, §5.4), stage half: a
                  * brk's requested break is captured HERE — before the
                  * describe and before the post — because the reply can
@@ -797,7 +1307,8 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                     mreq.prot  = largs[2];
                     mreq.flags = largs[3];
                     mref = linux_mem_mmap_refusal(&mreq,
-                            cur->linux_heap_base, cur->linux_heap_limit);
+                            linux_group_heap_base(cur),
+                            linux_group_heap_limit(cur));
                     if (mref) {
                         kernel_serial_printf(
                             "[E7] linux mmap addr=0x%lx len=%lu prot=%lu "
@@ -837,8 +1348,9 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                     mreq.addr = largs[0];
                     mreq.len  = largs[1];
                     mref = linux_mem_munmap_refusal(&mreq,
-                            cur->linux_heap_base, cur->linux_heap_limit,
-                            cur->linux_brk_cur);
+                            linux_group_heap_base(cur),
+                            linux_group_heap_limit(cur),
+                            linux_group_brk(cur));
                     if (mref) {
                         kernel_serial_printf(
                             "[E7] linux munmap addr=0x%lx len=%lu "
@@ -855,13 +1367,49 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                     cur->mem_stage_num   = num;
                     cur->mem_stage_a0    = largs[0];
                     cur->mem_stage_a1    = largs[1];
-                } else if (num == LINUX_MPROTECT &&
-                           linux_mprotect_refuses_wx(largs[2])) {
-                    kernel_serial_printf(
-                        "[E7] linux mprotect prot=0x%lx refused before "
-                        "post: write+execute is refused by the shim "
-                        "(§5.4)\n", (unsigned long)largs[2]);
-                    return (uint64_t)(int64_t)(-LINUX_EPERM);
+                } else if (num == LINUX_MPROTECT) {
+                    /* E7 §10.15: the first trap of a real permission
+                     * change. The words are validated against this
+                     * task's OWN image, stack and heap windows; the
+                     * sidecar's 10 arm answers the non-W|X policy, and
+                     * the reply apply walks the page table because a
+                     * window can contain a hole. A refusal here posts
+                     * nothing, exactly like the mmap ladder. */
+                    struct LinuxMprotectReq mreq;
+                    uint64_t stack_lo = cur->linux_stack_base;
+                    uint64_t stack_hi = stack_lo +
+                        (uint64_t)cur->linux_stack_pages * 4096ull;
+                    int mref;
+
+                    mreq.addr = largs[0];
+                    mreq.len  = largs[1];
+                    mreq.prot = largs[2];
+                    mref = linux_mem_mprotect_refusal(&mreq,
+                            linux_group_image_lo(cur),
+                            linux_group_image_hi(cur),
+                            stack_lo, stack_hi,
+                            linux_group_heap_base(cur),
+                            linux_group_heap_limit(cur));
+                    if (mref) {
+                        kernel_serial_printf(
+                            "[E7] linux mprotect addr=0x%lx len=%lu "
+                            "prot=0x%lx refused before post: %s\n",
+                            (unsigned long)largs[0],
+                            (unsigned long)largs[1],
+                            (unsigned long)largs[2],
+                            mref == -LINUX_EPERM
+                                ? "write+execute is refused (§5.4)"
+                                : mref == -LINUX_EINVAL
+                                ? "malformed request word"
+                                : "outside the image/stack/heap window");
+                        return (uint64_t)(int64_t)mref;
+                    }
+                    cur->mem_stage_valid = 1;
+                    cur->mem_stage_num   = num;
+                    cur->mem_stage_a0    = largs[0];
+                    cur->mem_stage_a1    = largs[1];
+                    cur->mem_stage_a2    = largs[2];
+                    cur->mem_stage_a3    = 0;
                 }
                 /* E7 step 4 (the file class): the getdents64 cursor
                  * rides IN the description — args[5], a word the child's
@@ -873,9 +1421,9 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                  * would share this cursor), and a reused slot resets it
                  * beside every other piece of per-task state. */
                 if (num == LINUX_OPEN)
-                    cur->linux_dir_pos = 0;
+                    linux_group_set_dir_pos(cur, 0);
                 if (num == LINUX_GETDENTS64)
-                    largs[5] = cur->linux_dir_pos;
+                    largs[5] = linux_group_dir_pos(cur);
                 /* E7 increment 21: remember that the forward about to be
                  * armed is the gate workload's read(fd 3), so the resume
                  * sentinel can count the bytes its reply actually returns and
@@ -992,6 +1540,31 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                         (struct SLSLinuxSyscallRequest *)(void *)fwd;
                     *fwd_req = req;
                 }
+                /* E7 TG-1 I4: the group's forward lease. The sidecar's
+                 * channel pair is per GROUP (every thread resolves to the
+                 * leader's table), so two forwards in flight at once would
+                 * race for one reply. Acquire HERE — after every first-trap
+                 * refusal, before the stage or post — and never park owning
+                 * it: a busy sibling records its slot and parks without
+                 * posting, and the owner's release restarts it at its
+                 * `syscall` (rip -= 2), so this block runs again with the
+                 * same registers and now owns the lease. A refusal below or
+                 * the delivered reply releases it. */
+                {
+                    struct LinuxThreadGroup* lg = linux_group_of(cur);
+                    int lrc;
+                    if (!lg) return (uint64_t)(int64_t)(-LINUX_EINVAL);
+                    lrc = linux_group_fwd_acquire(lg, cur->tid);
+                    if (lrc < 0) return (uint64_t)(int64_t)(-LINUX_EINVAL);
+                    if (lrc > 0)
+                        return (uint64_t)(int64_t)linux_forward_lease_wait(
+                            cur, (uint32_t)num);
+                    if (cur->tid != lg->leader_pid)
+                        kernel_serial_printf(
+                            "[E7] forward lease: TID %u group %u acquired for "
+                            "syscall %lu\n",
+                            cur->tid, lg->group_id, (unsigned long)num);
+                }
                 /* E7 increment 12: stage the reply payload's destination
                  * HERE — after every first-trap refusal has had its say
                  * (no channel, bad attach, W|X, bad poll span — each
@@ -1022,6 +1595,7 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                  * construction. Un-arm, then map the refusal into the
                  * units this task speaks (both CAP families, one table). */
                 cur->park_syscall = 0;
+                linux_forward_lease_release(cur);   /* post refused: free */
                 cur->gate_read_pending = 0;   /* no park: no reply is owed */
                 kernel_serial_printf(
                     "[E7] linux syscall %lu (class=%s) not delivered: "

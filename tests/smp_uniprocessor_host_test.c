@@ -39,6 +39,7 @@
  *   /tmp/smp_uniprocessor_host_test
  */
 #include "kernel/smp.h"
+#include "arch/x86/gdt.h"
 #include <stdio.h>
 #include <stdint.h>
 
@@ -84,7 +85,7 @@ void cap_irq_drain_pending(void)         { irq_drain_calls++;     }
  * the trampoline bounds so the pointer arithmetic in smp.c stays defined. */
 uint8_t  trampoline_start[16];
 uint8_t  trampoline_end[1];
-uint64_t gdt_ptr = 0;
+struct GDTPointer gdt_ptr;
 void* allocate_physical_ram_frame(void) { return NULL; }
 void  init_local_apic_registers(void) { }
 /* ap_kernel_main() calls this first -- an AP must load the IDT before

@@ -39,3 +39,10 @@ e7_slow_boot = []
 # `make x86-iso-e3 ... M1_NET_PROBE=1` for the QEMU gate run. A default
 # build compiles neither the module nor the spawn call.
 m1_net_probe = []
+# E7 TG-1's live Go acceptance gate: compile the real static Go fixture and
+# spawn it from the system POSIX sidecar. Never a shipped profile; selected
+# only by `make x86-iso ...,E7_GO_GATE=1` and the live gate check.
+e7_go_gate = []
+# TG-2d's live two-thread checkpoint arm: compile the freestanding group
+# workload and spawn it from the gate tenant. Never a shipped profile.
+e7_group_ckpt = []

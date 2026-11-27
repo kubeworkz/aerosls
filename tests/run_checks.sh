@@ -56,6 +56,13 @@
 # a build host, a release gate, deploy.sh -- to turn every skip into a
 # failure. There, "I could not check" and "it is fine" must not look alike.
 #
+# REQUIRE_RUNTIME names runtime guards (space-separated script basenames)
+# whose prerequisite is a BUILD ARTIFACT rather than a live cluster. On a job
+# that built that artifact, an abort must fail instead of being reported as an
+# owed live-cluster skip; CI sets it for e3_multi_env_boot_check.sh after
+# building the E3 ISO. Leave it unset at the deploy gate, where the runtime
+# skips are about a cluster that a build cannot conjure.
+#
 # ─── Why a guard can never be allowed to hang the run ─────────────────────
 # Each guard's output is captured with a command substitution
 # (out="$(bash "$g" 2>&1)") and only printed when the guard EXITS — so a
@@ -81,6 +88,7 @@ set -u
 cd "$(dirname "$0")/.."   # repo root, so each guard's own relative paths resolve
 
 REQUIRE_ALL="${REQUIRE_ALL:-0}"
+REQUIRE_RUNTIME="${REQUIRE_RUNTIME:-}"
 for arg in "$@"; do
     case "$arg" in
         --require-all) REQUIRE_ALL=1 ;;
@@ -123,6 +131,15 @@ if [ "${#guards[@]}" -eq 0 ]; then
     exit 2
 fi
 
+# A name in REQUIRE_RUNTIME that matches no guard would otherwise be a silent
+# no-op -- exactly the rot this runner exists to stop.
+for req in $REQUIRE_RUNTIME; do
+    if [ ! -f "tests/$req" ]; then
+        echo "ABORT: REQUIRE_RUNTIME names tests/$req, but no such guard exists." >&2
+        exit 2
+    fi
+done
+
 for g in "${guards[@]}"; do
     name="$(basename "$g")"
     # Print the name BEFORE running so a hung guard is never silent: the
@@ -160,10 +177,21 @@ for g in "${guards[@]}"; do
             # build, and the only way out is --no-verify, which switches off the
             # guards that were doing real work.
             if grep -q '^# GUARD-KIND: runtime' "$g" 2>/dev/null; then
-                echo "SKIP  $name (runtime guard -- needs a live cluster, not a build)"
-                echo "      $reason"
-                runtime_skipped="$runtime_skipped $name"
-                skip=$((skip + 1))
+                case " $REQUIRE_RUNTIME " in
+                    *" $name "*)
+                        echo "FAIL  $name (runtime guard aborted, and REQUIRE_RUNTIME names it)"
+                        echo "      $reason"
+                        echo "      Its prerequisite is a built artifact, so an abort is a"
+                        echo "      broken job setup, not an owed live cluster."
+                        fail=$((fail + 1))
+                        ;;
+                    *)
+                        echo "SKIP  $name (runtime guard -- needs a live cluster, not a build)"
+                        echo "      $reason"
+                        runtime_skipped="$runtime_skipped $name"
+                        skip=$((skip + 1))
+                        ;;
+                esac
             elif [ "$REQUIRE_ALL" = "1" ]; then
                 echo "FAIL  $name (prerequisite missing, and --require-all is set)"
                 echo "      $reason"

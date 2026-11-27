@@ -13,6 +13,7 @@
 #include "kernel_io.h"      /* kernel_serial_print/printf */
 #include "process.h"        /* proc_table, PROC_BLOCKED, ProcessDescriptor */
 #include "boot_params.h"     /* E1: boot_params_unified_mode() */
+#include "../arch/x86/gdt.h"        /* tss_set_rsp0 */
 #include "../arch/x86/multiboot2.h"
 #include "../arch/x86/user_paging.h"   /* per_cpu_data */
 #include <stdint.h>
@@ -656,6 +657,7 @@ void launch_init_sidecar(void) {
      *    timer preemption schedule_ring3 finds init as "current". */
     child->state = PROC_RUNNING;
     per_cpu_data[0].kernel_rsp = child->syscall_stack_top;
+    tss_set_rsp0(child->syscall_stack_top);
     kernel_enter_sidecar(&child->kernel_rsp, &child->kernel_cr3,
                          child->cr3, child->user_rip, child->user_rsp,
                          ((uint64_t*)&child->ring3_ctx)[9]);  /* rdi = BIB */

@@ -51,16 +51,29 @@
 #include "process.h"   /* E7 increment 12: the reply payload's staged
                         * destination lives on the descriptor (the
                         * copy-in aims where the FIRST trap said) */
+#include "linux_thread.h"  /* E7 TG-1 I1: the getdents64 cursor is group-owned */
 #include "linux_abi.h"   /* E7 increment 3: SYS_LINUX_TRAP_RESUME, the request
-                          * struct, linux_syscall_apply_reply, errno map */
+                          * struct, linux_syscall_apply_reply, errno map;
+                          * increment 29b: linux_sig_return_reply_ok, the
+                          * return trip's gate */
 #include "kernel_io.h"
 #include "timer.h"   /* Phase 5 deadlines: kernel_tick_counter, KERNEL_TICK_NS */
 #include <stddef.h>
 
 /* ─── Slot → channel resolution ───────────────────────────────────────────── */
 /* Table index for pid, mirroring cap.c's cap_table_index lookup via .pid
- * (cap_table_index itself is static in cap.c). -1 = no table. */
+ * (cap_table_index itself is static in cap.c). -1 = no table.
+ *
+ * E7 TG-1 I4: resolve a GROUP MEMBER to its leader first, exactly as
+ * cap_table_index does. A cloned sibling's own pid has no bound table, so
+ * the bare search returned -1 and callers fell back to the kernel table —
+ * where slots 0/1 are console channels. The live openat probe caught it:
+ * the child's openat posted to chan 5 (console) instead of the group's
+ * probe channel, so its park was on a channel the sidecar's reply could
+ * never wake. The group's slots are the same numbers (0/1); only the table
+ * they name was wrong. */
 static int chan_table_for_pid(uint32_t pid) {
+    pid = proc_group_cap_owner(pid);
     for (int i = 0; i < CAP_TABLE_MAX; i++)
         if (cap_tables[i].pid == pid) return i;
     return -1;
@@ -978,8 +991,92 @@ uint64_t k_linux_deliver(uint32_t pid, uint16_t ch_r, uint64_t expect_num) {
                             CAP_ERR_PROTO);
                 }
                 linux_syscall_describe(&req, expect_num, NULL);
-                return linux_syscall_apply_reply(&req, rbuf,
-                                                 (uint64_t)out.len);
+                {
+                    uint64_t rax = linux_syscall_apply_reply(
+                        &req, rbuf, (uint64_t)out.len);
+                    /* E7 increment 29b: rt_sigreturn's answer is not a
+                     * return value — the task resumes in the INTERRUPTED
+                     * context, which only the kernel can rebuild (the frame
+                     * is in the task's own pages). But the sidecar's 15 arm
+                     * owns the MASK, so the gate is ITS answer, not "the rax
+                     * is not -EPROTO": status 0 says it put `saved_mask` back
+                     * and nonzero says it refused (no handler was entered),
+                     * and restoring a frame under a refusal would return the
+                     * task into a context whose mask was never unwound while
+                     * silently discarding the errno the sidecar meant it to
+                     * hear. linux_sig_return_reply_ok names that single
+                     * condition, so the refusal falls through to `return rax`
+                     * — which IS that errno — with the frame untouched. */
+                    /* E7 increment 34: the tagged reveal probe's answer.
+                     * The kernel answered the MASK of a trap handler's 14
+                     * itself (increment 33); what it forwarded was only the
+                     * half the sidecar owns — the pending set and the
+                     * dispositions that decide what unblocking a pending
+                     * signal means — so this reply is a verdict, not a
+                     * value: status 0 is "the reveal ran", and the task's
+                     * answer is the mask and the oldset the kernel holds.
+                     * Anything else (E_NOSYS for a reveal this v1 cannot
+                     * perform, or -EPROTO from a malformed answer) is the
+                     * refusal the task hears, with NOTHING moved — not the
+                     * oldset, not the mask. Only on consent are they
+                     * written, oldset first, so a bad pointer is -EFAULT
+                     * with the mask where it was. */
+                    if (expect_num == LINUX_RT_SIGPROCMASK && pd &&
+                        pd->linux_sig_mask_stage_valid) {
+                        uint64_t old = pd->linux_sig_mask_stage_old;
+                        uint64_t nm  = pd->linux_sig_mask_stage_new;
+                        uint64_t dst = pd->linux_sig_mask_stage_dst;
+                        int was_probe = pd->linux_sig_mask_stage_probe;
+                        pd->linux_sig_mask_stage_valid = 0;
+                        pd->linux_sig_mask_stage_probe = 0;
+                        pd->linux_sig_mask_stage_old   = 0;
+                        pd->linux_sig_mask_stage_new   = 0;
+                        pd->linux_sig_mask_stage_dst   = 0;
+                        if (rax != 0) return rax;
+                        if (dst != 0 &&
+                            linux_user_copy_in((const uint8_t *)&old,
+                                               pd->cr3, dst,
+                                               LINUX_SIGSET_BYTES) != 0)
+                            return (uint64_t)(int64_t)(-LINUX_EFAULT);
+                        pd->linux_sig_mask = nm;
+                        kernel_serial_printf(
+                            "[E7] rt_sigprocmask: committed mask %lx\n",
+                            (unsigned long)nm);
+                        if (was_probe)
+                            kernel_serial_printf(
+                                "[E7] fault handler unmask: mask %lx, the reveal ran inside the handler\n",
+                                (unsigned long)nm);
+                        return 0;
+                    }
+                    if (expect_num == LINUX_RT_SIGRETURN) {
+                        /* E7 increment 32: a FAULT-delivered handler's
+                         * return has no sidecar delivery behind it — the
+                         * trap entered that handler — so the sidecar's 15
+                         * arm answers EINVAL, truthfully for its own model
+                         * and uselessly here. The kernel holds the frame and
+                         * moved no sidecar mask, so it is the authority for
+                         * this one return; linux_sig_fault_return_ok names
+                         * exactly that case (a trap frame plus exactly that
+                         * refusal), and every other answer falls through to
+                         * the gate below unchanged. */
+                        if (pd &&
+                            linux_sig_fault_return_ok(
+                                pd->linux_sig_active,
+                                pd->linux_sig_fault_active, rax,
+                                req.status))
+                            return (uint64_t)(int64_t)
+                                linux_sig_return_apply(pd);
+                        if (!linux_sig_return_reply_ok(expect_num, rax,
+                                                       req.status))
+                            return rax;   /* the sidecar refused: its errno */
+                        if (!pd)
+                            return (uint64_t)(int64_t)linux_errno_from_cap(
+                                CAP_ERR_TARGET);
+                        return (uint64_t)(int64_t)
+                            linux_sig_return_apply(pd);
+                    }
+                    return rax;
+                }
             }
 
             /* Shape 2 (and the arms that make shape 3): 72 + n. Every
@@ -1078,6 +1175,24 @@ uint64_t k_linux_deliver(uint32_t pid, uint16_t ch_r, uint64_t expect_num) {
                         return (uint64_t)(int64_t)(-LINUX_EFAULT);
                     return rax;
                 }
+                /* E7 increment 28 (P1-C's wire-up): the payload is not owed
+                 * to a pointer — it is the sidecar's instruction to RUN a
+                 * handler. No byte is copied to the task here: the arm
+                 * below builds the frame, writes it through the validated
+                 * copy against the task's own cr3, installs the entry
+                 * context into the park and resumes DELIVERING (or returns
+                 * a refusal with the task's memory untouched). A null pd
+                 * means the task died between the post and the reply: the
+                 * same -ESRCH a closed endpoint answers with. */
+                if (skind == LINUX_STAGE_SIGFRAME) {
+                    if (n != LINUX_SIGDELIVER_BYTES)
+                        return (uint64_t)(int64_t)(-LINUX_EPROTO);
+                    if (!pd)
+                        return (uint64_t)(int64_t)linux_errno_from_cap(
+                            CAP_ERR_TARGET);
+                    return (uint64_t)(int64_t)
+                        linux_sig_reply_apply(pd, pay, n);
+                }
                 if (skind == LINUX_STAGE_STAT) {
                     uint8_t sbuf[LINUX_STAT_BYTES];
                     if (n != LINUX_STAT_PAYLOAD_BYTES)
@@ -1092,7 +1207,7 @@ uint64_t k_linux_deliver(uint32_t pid, uint16_t ch_r, uint64_t expect_num) {
                     uint8_t dbuf[LINUX_DIRENT_USER_CAP];
                     uint32_t fitted = 0;
                     int packed = linux_dirent_pack(pay, n, saux,
-                                                   pd->linux_dir_pos,
+                                                   linux_group_dir_pos(pd),
                                                    dbuf, &fitted);
                     if (packed < 0)
                         return (uint64_t)(int64_t)(-LINUX_EPROTO);
@@ -1100,7 +1215,7 @@ uint64_t k_linux_deliver(uint32_t pid, uint16_t ch_r, uint64_t expect_num) {
                         linux_user_copy_in(dbuf, pd->cr3, sva,
                                            (uint32_t)packed) != 0)
                         return (uint64_t)(int64_t)(-LINUX_EFAULT);
-                    pd->linux_dir_pos += fitted;
+                    linux_group_add_dir_pos(pd, fitted);
                     return (uint64_t)(uint32_t)packed;
                 }
                 if (linux_user_copy_in(pay, pd->cr3, sva, n) != 0) {
@@ -1112,6 +1227,22 @@ uint64_t k_linux_deliver(uint32_t pid, uint16_t ch_r, uint64_t expect_num) {
                      * refusal rather than the success the reply claimed
                      * for bytes that never landed. */
                     return (uint64_t)(int64_t)(-LINUX_EFAULT);
+                }
+                /* E7 increment 34: this shape is a 14 that carried its
+                 * oldset back, so the kernel's copy of the mask follows the
+                 * call it just answered — on a consent only. The stage is
+                 * consumed either way: a refusal (rax != 0) leaves the copy
+                 * where it was, and a stale stage must never answer a later
+                 * 14. */
+                if (expect_num == LINUX_RT_SIGPROCMASK && pd &&
+                    pd->linux_sig_mask_stage_valid) {
+                    uint64_t nm = pd->linux_sig_mask_stage_new;
+                    pd->linux_sig_mask_stage_valid = 0;
+                    pd->linux_sig_mask_stage_probe = 0;
+                    pd->linux_sig_mask_stage_old   = 0;
+                    pd->linux_sig_mask_stage_new   = 0;
+                    pd->linux_sig_mask_stage_dst   = 0;
+                    if (rax == 0) pd->linux_sig_mask = nm;
                 }
                 return rax;
             }

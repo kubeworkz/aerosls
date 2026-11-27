@@ -76,6 +76,20 @@
  *       The successful unmap writes "E7MEM-MUNMAP-OK\n" (16 bytes)
  *       through increment 5's seam; any wrong outcome issues MARKER 404,
  *       asserted ABSENT with the map block's.
+ *   10 (mprotect, the soft half of §10.15) — after the map block has
+ *       proved its own pages, mprotect(base+0x1000, 0x1000, PROT_NONE)
+ *       must return 0: the kernel keeps the second brk page's frame and
+ *       installs a present, supervisor-only soft leaf. The positive marker
+ *       "E7MEM-SOFT-OK\n" (14 bytes) is written through the fd seam —
+ *       proof the transition completed before the page is touched — then a
+ *       READ of that page must take a Ring-3 #PF (error=0x5, a user access
+ *       to a present supervisor page). The task's death IS the observation:
+ *       this shim has no signal frames, so there is no handler to return to.
+ *       A refused mprotect issues MARKER 405; a read that succeeds issues
+ *       MARKER 406 (the U/S clear or SOFT_NONE was lost) — both asserted
+ *       ABSENT. The page is the SECOND brk page because 5m's PROT_NONE
+ *       MAP_FIXED replaced the first with a reservation that has no frame
+ *       for mprotect to protect.
  *   231 (exit_group) — the sidecar reaps; no reply is owed and this task
  *       never runs again (the hang below is unreachable by design).
  *
@@ -378,7 +392,52 @@ _start:
     syscall
     cmp     $-12, %rax
     jne     .Lmmap_budget_bad
-    jmp     .Lmem_done           /* the whole seam held: the exit path  */
+    jmp     .Lsoft               /* the whole seam held: the soft case   */
+
+    /* 5p. mprotect(base+0x1000, 0x1000, PROT_NONE) — §10.15's live
+     *    soft transition. This is the second brk page: 5m replaced the
+     *    first with a PROT_NONE reservation that has no frame to protect,
+     *    while this one is still a present, writable user leaf. The
+     *    kernel's apply prewalks the leaf, preserves its frame, clears
+     *    U/S and W, sets SOFT_NONE and invlpg's it. The marker write from
+     *    .text through increment 5's fd seam proves the syscall returned
+     *    0 before the access; the read then MUST fault. A successful read
+     *    means the soft bit or the U/S clear did not take effect. */
+.Lsoft:
+    lea     0x1000(%r12), %r13
+    mov     %r13, %rdi
+    mov     $0x1000, %esi
+    xor     %edx, %edx          /* PROT_NONE                          */
+    mov     $10, %eax
+    syscall
+    test    %rax, %rax
+    jne     .Lsoft_bad
+    /* The page is soft-PROT_NONE. Its PROOF — the marker write followed by
+     * a read that must #PF — is the LAST thing this program does, and it is
+     * now reached from the SIGNAL HANDLER (increment 28's live half): the
+     * delivery below is terminal for this probe, because a handler that
+     * cannot yet return (no rt_sigreturn row) either exits or dies, and
+     * dying on the soft page is the proof this file already owed. So the
+     * order is: arm the soft page here, deliver the signal, and let the
+     * handler finish the case. */
+    jmp     .Lsig_try
+
+.Lsoft_tail:
+    lea     .Lsoft_msg(%rip), %rsi
+    mov     $1, %edi
+    mov     $14, %edx
+    mov     $1, %eax
+    syscall
+    cmp     $14, %rax
+    jne     .Lsoft_bad
+    mov     (%r13), %rax        /* must #PF; reading is the negative  */
+    mov     $406, %eax          /* MARKER: PROT_NONE did not fault    */
+    syscall
+    jmp     .Lmem_done
+.Lsoft_bad:
+    mov     $405, %eax          /* MARKER: the soft transition lied   */
+    syscall
+    jmp     .Lmem_done
 
 .Lmmap_bad:
     mov     $399, %eax           /* MARKER: the arena grant lied       */
@@ -423,11 +482,150 @@ _start:
 .Lhang:
     jmp     .Lhang
 
+    /* 6. THE SIGNAL DELIVERY (E7 increment 28's live half). The three ends
+     *    being wired means nothing unless a real ring-3 task is actually
+     *    entered at a handler, so this is the flow the boot measures:
+     *
+     *      rt_sigaction(10, act, NULL, 8)  install SIGUSR1 -> .Lhandler
+     *      tkill(0x1DECAF, 10)            the tid 218 echoed above, so the
+     *                                     sidecar's own tid match passes
+     *
+     *    A delivery REPLACES this syscall's return: control resumes at
+     *    .Lhandler with rsp on the kernel's frame and rdi = 10. The
+     *    fall-through below is therefore the NEGATIVE proof — it is
+     *    reached only if the reply came back as an errno, and it issues
+     *    MARKER 409 so the boot can say which half was missing.
+     *
+     *    The handler does NOT return: rt_sigreturn has no table row yet
+     *    (awaiting a real census trace), so returning would forward 15 and
+     *    come back -ENOSYS. It writes its marker and exits with a code of
+     *    its own instead — which is also the cleanest observable that the
+     *    code that ran was the HANDLER's, not the probe's. */
+.Lsig_try:
+    /* 6a. THE REFUSAL (E7 increment 29c): rt_sigreturn(15) with NO handler
+     *    entered. Nothing has delivered a frame to this task, so the
+     *    sidecar's 15 arm refuses by name (E_INVAL, nothing mutated) and the
+     *    kernel's gate must NOT restore — there is no frame to restore and no
+     *    mask a handler ever unwound. The one thing this call owes the task is
+     *    the errno Linux gives: exactly -22 (-EINVAL). Anything else issues
+     *    MARKER 412, which the boot check asserts ABSENT.
+     *
+     *    It runs BEFORE rt_sigaction(13) below, which is what makes "no
+     *    handler entered" a property of the program's order rather than a
+     *    claim: the install is later in this same flow, so a restore here
+     *    would be restoring a frame nobody built. "SIGRET-NOHAND-OK\n"
+     *    (17 bytes) through increment 5's fd seam is the POSITIVE marker — it
+     *    reaches the log iff the refusal came back as an errno AND this task
+     *    kept running (a restore would have resumed it somewhere else and the
+     *    write would never happen). */
+    mov     $15, %eax
+    syscall
+    cmp     $-22, %rax          /* -EINVAL, and only -EINVAL */
+    je      .Lsig_nohand_ok
+    mov     $412, %eax          /* MARKER: the refusal was not -EINVAL */
+    syscall
+    jmp     .Lexit
+.Lsig_nohand_ok:
+    lea     .Lnohand_msg(%rip), %rsi
+    mov     $1, %edi            /* fd 1: the task's console     */
+    mov     $.Lnohand_end-.Lnohand_msg, %edx
+    mov     $1, %eax
+    syscall
+    sub     $64, %rsp
+    lea     .Lhandler(%rip), %rax
+    mov     %rax, 0(%rsp)       /* sa_handler                        */
+    movq    $0, 8(%rsp)         /* sa_flags: no SA_SIGINFO needed    */
+    movq    $0, 16(%rsp)        /* sa_mask                           */
+    lea     .Lrestorer(%rip), %rax
+    mov     %rax, 24(%rsp)      /* sa_restorer: NONZERO — the kernel
+                                 * refuses a delivery it cannot return
+                                 * from, so a zero here would be a
+                                 * refusal, not a delivery            */
+    mov     %rsp, %rsi
+    mov     $10, %edi           /* SIGUSR1                           */
+    xor     %edx, %edx          /* oldact = NULL                     */
+    mov     $8, %r10d           /* sigsetsize (the twin of 14's)      */
+    mov     $13, %eax
+    syscall
+    test    %rax, %rax
+    jne     .Lsig_install_bad
+
+    mov     $0x1DECAF, %rdi     /* the tid 218 echoed                 */
+    mov     $10, %esi
+    mov     $200, %eax
+    syscall
+    /* REACHED BY THE HANDLER'S RETURN (increment 29): the delivery replaced
+     * this syscall's return with an entry into .Lhandler, the handler ended
+     * in its restorer's rt_sigreturn, and the kernel restored THIS context
+     * and resumed here. The marker is therefore written after a full
+     * out-and-back trip through ring 3 and two kernel returns — and, because
+     * the same instruction is also reachable if the tkill simply returned,
+     * SIGHAND-OK above is what tells the two apart in the log. */
+    lea     .Lsigret_msg(%rip), %rsi
+    mov     $1, %edi
+    mov     $10, %edx           /* "SIGRET-OK\n" (9 + newline)         */
+    mov     $1, %eax
+    syscall
+    cmp     $10, %rax
+    jne     .Lsig_install_bad
+    jmp     .Lsoft_tail
+
+.Lsig_install_bad:
+    mov     $410, %eax          /* MARKER: rt_sigaction refused       */
+    syscall
+    jmp     .Lexit
+
+    /* THE HANDLER. Entered in ring 3 by the kernel's own return path —
+     * not called by this file — with rdi = 10 and rsp at the frame the
+     * builder wrote (which is never read here: the exit is deliberate). */
+.Lhandler:
+    lea     .Lsig_msg(%rip), %rsi
+    mov     $1, %edi            /* fd 1: the task's console           */
+    mov     $11, %edx           /* "SIGHAND-OK\n"                     */
+    mov     $1, %eax
+    syscall
+    /* …and RETURN through the frame: the restorer issues rt_sigreturn, the
+     * kernel restores the interrupted context from the frame it built, and
+     * control resumes after the tkill above. Before increment 29 this jump
+     * was replaced by a death on the soft page, because a handler could not
+     * return at all. */
+    jmp     .Lrestorer
+
+    /* The frame's pretcode. Never reached while a handler exits without
+     * returning; its only job is to be a real, nonzero address so the
+     * delivery is one the kernel will build. */
+.Lrestorer:
+    /* The frame's pretcode: what the handler "returns" to. It issues
+     * rt_sigreturn (15), whose restore is the kernel's. */
+    mov     $15, %eax
+    syscall
+    mov     $411, %eax          /* MARKER: the return trip refused */
+    syscall
+.Lexit:
+    /* exit_group(42): the sidecar reaps this task. */
+    mov     $42, %edi
+    mov     $231, %eax
+    syscall
+    jmp     .Lhang
+
     /* The fd class's positive marker: printed on the console only if the
      * whole seam performed it (build_probe.sh keeps this in .text — one
      * section, _start at offset 0). */
 .Lmunmap_msg:
     .ascii  "E7MEM-MUNMAP-OK\n"
+
+.Lsoft_msg:
+    .ascii  "E7MEM-SOFT-OK\n"
+
+.Lsig_msg:
+    .ascii  "SIGHAND-OK\n"
+
+.Lsigret_msg:
+    .ascii  "SIGRET-OK\n"
+
+.Lnohand_msg:
+    .ascii  "SIGRET-NOHAND-OK\n"
+.Lnohand_end:
 
 .Lmsg:
     .ascii  "E7FD-WRITE-OK\n"

@@ -46,16 +46,20 @@
 //!     create), so a growth inside the span is granted and echoed as the
 //!     new break, and everything else answers the UNCHANGED current
 //!     break — Linux's own brk failure shape, never an errno;
-//!   - `mprotect` (10, §5.4's W^X refusal): write+execute together is
-//!     refused EPERM — the refusal H2's Node exclusion IS, and the twin
-//!     of the kernel's first-trap refusal (both ends exist so neither
-//!     alone is load-bearing);
+//!   - `mprotect` (10, §5.4 and §10.15): a real page-protection change.
+//!     This side owns the prot shape and the W^X refusal (EPERM — the
+//!     refusal H2's Node exclusion IS), while the kernel owns the page
+//!     walk and the soft leaf; both ends answer the same ladder so
+//!     neither alone is load-bearing;
 //!   - `rt_sigaction` (13) / `rt_sigprocmask` (14) / `tkill` (200) — the
 //!     signal seam (§10.13's step 2): the act/set bytes arrive ATTACHED
 //!     (the kernel copied them out of the child; this side never reads
-//!     the child's memory), dispositions record DFL/IGN only — a handler
-//!     install is ENOSYS by name BEFORE any mutation (no signal frames in
-//!     v1), the mask records BLOCK/UNBLOCK/SETMASK exactly, and delivery
+//!     the child's memory), the WHOLE 32-byte sigaction is RECORDED per
+//!     signal — handler address included, and returned verbatim by a
+//!     later oldact query — but a handler is never INVOKED (v1 has no
+//!     signal frame and no rt_sigreturn): a delivery to a handler
+//!     disposition is ENOSYS by name, the mask records
+//!     BLOCK/UNBLOCK/SETMASK exactly, and delivery
 //!     is REAL: a tkill to the task's own tid whose signal is unblocked
 //!     with a default-terminate action kills the task through exit_group's
 //!     own reap path (no reply — it never runs again), while a blocked
@@ -88,9 +92,7 @@
 //!     partition, and neither cursor moves (a freed range is never
 //!     re-handed in v1);
 //!   - everything else — `open`/`close`/`lseek` and the rest of the fd
-//!     class (Phase 2 §3-§4), any mprotect whose prot is not
-//!     W|X (real permission changes are not landed), `clock_gettime`
-//!     (needs the clock plus
+//!     class (Phase 2 §3-§4), `clock_gettime` (needs the clock plus
 //!     a child-buffer write) and any number outside the census —
 //!     is answered `ENOSYS` with its number logged, §11 Q5's recommended
 //!     policy: visible and cheap, never a silent success.
@@ -175,7 +177,20 @@ const E_TARGET: i32 = 7; /* CAP_ERR_TARGET -> -ESRCH (§5.7) */
 /// and the kernel's plan derives the SAME attach length from these
 /// same words: num and args[1] != 0).
 const LINUX_RT_SIGACTION: u64 = 13;
+/// E7 increment 29: rt_sigreturn. Classified from
+/// tools/linux_rt_sigreturn_census.txt (a handler that returns), and the
+/// only number in the sig class whose job is to UNDO a delivery.
+const LINUX_RT_SIGRETURN: u64 = 15;
 const LINUX_RT_SIGPROCMASK: u64 = 14;
+/// sigaltstack (131) — the census's third signal row. Rust std's
+/// stack-overflow setup queries this before it allocates its guard
+/// page; an ENOSYS answer makes std skip the mmap+mprotect pair
+/// silently. The arm below answers the query with SS_DISABLE and
+/// accepts an install without recording a stack this v1 never
+/// delivers on.
+const LINUX_SIGALTSTACK: u64 = 131;
+const STACK_T_BYTES: usize = 24; /* ss_sp u64, ss_flags i32 + pad, ss_size u64 */
+const SS_DISABLE: u16 = 2;       /* stack_t.ss_flags: no alternative stack */
 const LINUX_TKILL: u64 = 200;
 /// mmap(9) — armed since E7 increment 16 (§5.4's anonymous-map half):
 /// the 9 arm below answers the measured allocator's shapes from the
@@ -199,20 +214,33 @@ const TIMESPEC_BYTES: usize = 16;
 /// what makes the run's file name reproducible.
 const GATE_EPOCH_SECS: u64 = 1_767_744_000;
 const SIGACT_BYTES: usize = 32; /* kernel-ABI struct sigaction: four u64s */
+const SIGACT_WORDS: usize = SIGACT_BYTES / 8;
 const SIGSET_BYTES: u64 = 8;    /* the sigset this seam crosses            */
+/// E7 increment 34: the word in args[5] that makes a forwarded rt_sigprocmask
+/// a REVEAL PROBE rather than a call: the kernel owns the mask for a
+/// trap-delivered handler (it moved it, it answers the arithmetic), but the
+/// pending set and the dispositions that decide what unblocking a pending
+/// signal means are this side's — so the kernel forwards a control request
+/// carrying the mask it computed in args[4], and this arm runs the reveal
+/// ladder while leaving `sig.mask` alone. The kernel's
+/// `LINUX_SIG_REVEAL_TAG` is the same number (guard clause AD holds the two).
+const SIG_MASK_REVEAL_TAG: u64 = 0x5347_5256;   /* "SGRV" */
 
 /// How far a signal number may run: Linux x86-64 signals are 1..=64
 /// (1..31 standard, 32..64 real-time; 0 is tkill's existence probe and
 /// rt_sigaction's EINVAL case, never an index).
 const SIG_MAX: usize = 64;
 
-/// Dispositions this v1 can honestly hold: SIG_DFL and SIG_IGN. A handler
-/// address is never stored — installation is refused before any mutation
-/// (no signal frames exist to invoke it with, so recording it would make
-/// every later delivery a coin flip between a silent kill and a silent
-/// nothing).
+/// How a recorded `sa_handler` word classifies for DELIVERY — the only
+/// decision the recorded bytes feed. SIG_DFL (0) and SIG_IGN (1) are
+/// Linux's two reserved handler words; any other word is a handler
+/// address, which this shim RECORDS (so oldact returns exactly what was
+/// installed) and never invokes: there is no signal frame and no
+/// rt_sigreturn, so a handler-disposed delivery is refused by name rather
+/// than performed as a default action the caller did not install.
 const DISPO_DFL: u8 = 0;
 const DISPO_IGN: u8 = 1;
+const DISPO_HANDLER: u8 = 2;
 
 /// A signal's DEFAULT action as POSIX defines it per signal number. The
 /// three v1 outcomes are each honest: IGNORE — the default has no
@@ -250,6 +278,12 @@ const FD_PAYLOAD_CAP: usize = 1024;
 /// through this module now, where the fd table lives.
 const LINUX_READ: u64 = 0;
 const LINUX_OPEN: u64 = 2;
+/// openat (257), E7 TG-1 I4: the gate's measured path open. The pathname
+/// is args[1] (args[0] is the dirfd), so the SAME path payload the kernel's
+/// plan attaches serves both open shapes; v1 resolves AT_FDCWD only and
+/// refuses any other dirfd by name rather than pretending to walk it.
+const LINUX_OPENAT: u64 = 257;
+const LINUX_AT_FDCWD: i64 = -100;
 const LINUX_CLOSE: u64 = 3;
 const LINUX_STAT: u64 = 4;
 const LINUX_LSTAT: u64 = 6;
@@ -290,6 +324,25 @@ const AF_INET: u16 = 2;
 const SOCK_STREAM: u16 = 1;
 const O_RDWR: u32 = 2;
 const O_NONBLOCK: u32 = 0x800;
+
+/// The Go gate's netpoll startup (TG-0, measured in
+/// tools/go_thread_gate_census.txt): epoll_ctl (233), epoll_pwait (281),
+/// eventfd2 (290) and epoll_create1 (291) — every one a
+/// required-by-runtime row (ENOSYS is fatal before main), which is why
+/// the shim records them rather than refusing them. The bits they carry
+/// are the kernel's own: EPOLL_CLOEXEC and EFD_CLOEXEC are O_CLOEXEC
+/// (0x80000), EFD_NONBLOCK is O_NONBLOCK (0x800), and the three epoll
+/// ops are 1/2/3 (uapi/linux/eventpoll.h).
+const LINUX_EPOLL_CTL: u64 = 233;
+const LINUX_EPOLL_PWAIT: u64 = 281;
+const LINUX_EVENTFD2: u64 = 290;
+const LINUX_EPOLL_CREATE1: u64 = 291;
+const EPOLL_CLOEXEC: u64 = 0x80000;
+const EPOLL_CTL_ADD: u64 = 1;
+const EPOLL_CTL_DEL: u64 = 2;
+const EPOLL_CTL_MOD: u64 = 3;
+const EFD_CLOEXEC: u64 = 0x80000;
+const EFD_NONBLOCK: u64 = 0x800;
 
 /// poll (7) — E7 increment 24: the array's shape is the kernel's too
 /// (kernel/linux_abi.h's LINUX_POLL_MAX_FDS / LINUX_POLLFD_BYTES). The
@@ -408,6 +461,11 @@ const E_AGAIN: i32 = -3;      /* CAP_EAGAIN  -> -EAGAIN (a read with
                                * nothing buffered; console reads park
                                * since increment 24)                   */
 const E_NOSPC: i32 = -8;      /* CAP_ENOSPC  -> -ENOSPC                   */
+const E_INTR: i32 = -33;     /* CAP_EINTR -> -EINTR (E7 increment 27): a
+                              * parked forward was interrupted by a signal
+                              * whose handler runs without SA_RESTART. Its
+                              * own code, never EAGAIN's: a caller retries
+                              * an EINTR and must not retry a would-block. */
 const E_TABLEFULL: i32 = -4;  /* CAP_ETABLEFULL -> -ENFILE                */
 
 /// The reply wire format: `kernel/linux_abi.h`'s SLSLinuxSyscallRequest,
@@ -477,6 +535,13 @@ enum Answer {
     /// 14): the kill line prints `sig=<N>`, so WHICH signal killed the task
     /// is read off the line rather than reconstructed from which arms ran.
     SignalKill(u64),
+    /// E7 increment 28 (P1-C's wire-up): the disposition is a HANDLER and it
+    /// can run — the reply carries the 80-byte delivery request (the second
+    /// element is the signo, for the log line). `service` sends it with
+    /// `reply_bytes`, so the kernel sees 72 + 80 with a zero status and an
+    /// echoing num: the shape chan.c's LINUX_STAGE_SIGFRAME arm validates
+    /// before it builds a single byte of frame.
+    SignalFrame([u8; SIGDELIVER_BYTES], u64),
 }
 
 /// One Linux task's §5.4 heap ledger: the budget span the create stamped
@@ -514,9 +579,26 @@ struct MemBrk {
 #[derive(Clone, Copy)]
 struct SigState {
     tid: u64,
-    mask: u64,                /* blocked signals, bit (sig - 1), signals 1..=64 */
-    pending: u64,             /* blocked signals that have arrived              */
-    dispo: [u8; SIG_MAX + 1], /* indexed by signal number: DFL / IGN only       */
+    mask: u64,    /* blocked signals, bit (sig - 1), signals 1..=64 */
+    /// E7 increment 29: the mask a handler's RETURN restores — the thread's
+    /// blocked set as it was before the delivery. Kept here because this
+    /// state is the authority for both 14 and 200, and rt_sigreturn's arm
+    /// must undo exactly what the delivery did.
+    saved_mask: u64,
+    /// Whether a handler is currently entered (a 200 arm raised it and no
+    /// 15 has returned from it yet). rt_sigreturn without one is refused by
+    /// name: there is no frame to restore, and pretending otherwise would
+    /// unblock signals a delivery never blocked.
+    handler_active: bool,
+    pending: u64, /* blocked signals that have arrived              */
+    /// The RECORDED kernel-ABI `struct sigaction` per signal number —
+    /// sa_handler, sa_flags, sa_mask, sa_restorer (four u64 words: the
+    /// 32 bytes rt_sigaction installs and oldact returns). Record-only:
+    /// the bytes exist so a later query gets exactly what was installed;
+    /// nothing reads them to invoke a handler, because no signal frame
+    /// or rt_sigreturn exists to build one with. A fresh entry is all
+    /// zeroes — SIG_DFL, Linux's default.
+    act: [[u64; SIGACT_WORDS]; SIG_MAX + 1],
 }
 
 impl SigState {
@@ -524,26 +606,145 @@ impl SigState {
         SigState {
             tid: 0,
             mask: 0,
+            saved_mask: 0,
+            handler_active: false,
             pending: 0,
-            dispo: [DISPO_DFL; SIG_MAX + 1],
+            act: [[0u64; SIGACT_WORDS]; SIG_MAX + 1],
         }
     }
 }
 
+/// Classify a recorded handler word for the DELIVERY branches: SIG_DFL,
+/// SIG_IGN, or a handler address this shim records but cannot invoke.
+/// `no` is range-checked by every caller (the 13/14/200 arms all test
+/// 1..=SIG_MAX first), so the index is total over its callers.
+fn dispo(sig: &SigState, no: u64) -> u8 {
+    match sig.act[no as usize][0] {
+        0 => DISPO_DFL,
+        1 => DISPO_IGN,
+        _ => DISPO_HANDLER,
+    }
+}
+
+/// E7 increment 34: the REVEAL ladder, one decision in one place. What does
+/// unblocking down to `new_mask` do to the signals still pending? An IGN
+/// disposition (or an ignore-by-default signal) is DISCARDED — that IS its
+/// delivery; a default-terminate signal kills the task inside this very call;
+/// a handler this v1 cannot invoke, and a default-stop signal, refuse the
+/// call before anything moves. Returns (0 proceed, 1 kill, 2 refuse) and,
+/// for a kill, WHICH signal earns it.
+///
+/// Called by the ordinary 14 arm (whose text this is verbatim) and by the
+/// kernel's tagged probe, so a trap-delivered handler's unmask cannot mean
+/// something a tkill-delivered handler's does not. It reads `sig` only: the
+/// caller owns the mutation, so a refusal leaves the pending set and the
+/// mask exactly as they were.
+fn reveal_verdict(sig: &SigState, new_mask: u64) -> (u8, u64) {
+    let mut revealed = sig.pending & !new_mask;
+    while revealed != 0 {
+        let bit = revealed.trailing_zeros();
+        revealed &= !(1u64 << bit);
+        let sig_no = bit + 1;
+        if dispo(sig, sig_no as u64) == DISPO_IGN
+            || default_action(sig_no as u64) == ACT_IGNORE
+        {
+            continue; /* discard — its delivery is a no-op */
+        } else if dispo(sig, sig_no as u64) == DISPO_HANDLER {
+            /* A handler this shim recorded but cannot invoke (no signal
+             * frame, no rt_sigreturn). Refuse the CALL before the mask
+             * moves — running the default action instead would be a signal
+             * the caller never asked for. */
+            return (2, 0);
+        } else if default_action(sig_no as u64) == ACT_TERMINATE {
+            return (1, sig_no as u64);
+        } else {
+            return (2, 0);
+        }
+    }
+    (0, 0)
+}
+
+/// Linux's `SA_RESTART` (x86-64 UAPI): the handler runs, and the syscall
+/// it interrupted is restarted rather than answered.
+const SIG_SA_RESTART: u64 = 0x1000_0000;
+/// SA_NODEFER / SA_SIGINFO and the sigaltstack disabled flag, x86-64 UAPI.
+const SIG_SA_NODEFER: u64 = 0x4000_0000;
+const SIG_SA_SIGINFO: u64 = 0x4;
+const SIG_SS_DISABLE: u32 = 2;
+
+/// E7 increment 28 (P1-C's wire-up): the 80-byte delivery request the
+/// kernel's `struct LinuxSigDeliverReq` decodes — signo, si_code, si_addr,
+/// handler, restorer, act flags, act mask, the thread's blocked mask, the
+/// altstack, and the SA_SIGINFO bit. Field order and widths are the
+/// kernel's, and the kernel refuses any other length, so a mistake here is
+/// a refusal rather than a handler entered with a made-up address. The
+/// altstack is the disabled one (v1 does not track ss_sp/ss_size — the
+/// same limit increment 26's header names).
+const SIGDELIVER_BYTES: usize = 80;
+fn sig_frame_bytes(signo: u64, handler: u64, restorer: u64, flags: u64,
+                   sa_mask: u64, blocked: u64) -> [u8; SIGDELIVER_BYTES] {
+    let mut b = [0u8; SIGDELIVER_BYTES];
+    b[0..4].copy_from_slice(&(signo as u32).to_le_bytes());
+    b[4..8].copy_from_slice(&0u32.to_le_bytes());          /* si_code = SI_USER */
+    b[8..16].copy_from_slice(&0u64.to_le_bytes());         /* si_addr          */
+    b[16..24].copy_from_slice(&handler.to_le_bytes());
+    b[24..32].copy_from_slice(&restorer.to_le_bytes());
+    b[32..40].copy_from_slice(&flags.to_le_bytes());
+    b[40..48].copy_from_slice(&sa_mask.to_le_bytes());
+    b[48..56].copy_from_slice(&blocked.to_le_bytes());
+    b[56..64].copy_from_slice(&0u64.to_le_bytes());        /* alt_sp  = none  */
+    b[64..72].copy_from_slice(&0u64.to_le_bytes());        /* alt_size        */
+    b[72..76].copy_from_slice(&SIG_SS_DISABLE.to_le_bytes());
+    b[76..80].copy_from_slice(
+        &(if flags & SIG_SA_SIGINFO != 0 { 1u32 } else { 0u32 }).to_le_bytes());
+    b
+}
+
+/// E7 increment 27 (P1-C, "the delivery") — THE PARK'S WAKE, as one rule.
+/// A forward parked on a console read or a poll is answered -EINTR when a
+/// signal has arrived that Linux would run a handler for and that handler
+/// did not ask for a restart:
+///
+///   arrived and not blocked  (pending & !mask)
+///   a HANDLER, not SIG_DFL/SIG_IGN  (a scalar has no frame to run in and a
+///                                    default action has already been
+///                                    reduced to a kill by the tkill arm)
+///   no SA_RESTART            (with it, Linux restarts the syscall instead:
+///                             still parked, and the signal waits for the
+///                             next return to user space)
+///
+/// This is the sidecar's twin of the kernel's `linux_sig_park_is_eintr` —
+/// two languages, one rule, and the guard's clause P5 holds them to the
+/// same table. Returns the signal NUMBER so the log names which one woke
+/// the park (an attribution that a bare -EINTR would lose).
+fn park_interrupt(sig: &SigState) -> Option<u64> {
+    let deliverable = sig.pending & !sig.mask;
+    let mut no: u64 = 1;
+    while no <= SIG_MAX as u64 {
+        if deliverable & (1u64 << (no - 1)) != 0
+            && dispo(sig, no) == DISPO_HANDLER
+            && sig.act[no as usize][1] & SIG_SA_RESTART == 0
+        {
+            return Some(no);
+        }
+        no += 1;
+    }
+    None
+}
+
 /// The bytes an oldact reply payload carries (E7 increment 12, §10.13's
-/// step 3) — the kernel-ABI struct sigaction as THIS state records it:
-/// the handler word at offset 0 (SIG_DFL 0 / SIG_IGN 1 — the only two
-/// dispositions v1 stores; `no` is range-checked by every caller), and
-/// every other field ZERO — sa_flags, sa_restorer and sa_mask were never
-/// stored (a handler install is refused before mutation, so nothing may
-/// depend on bytes this side declined to keep), and zero IS the honest
-/// answer rather than a default invented for the reply. Twin of the
-/// kernel's staged clamp (32 bytes — LINUX_SIGACT_BYTES), which the
-/// deliver bounds the copy against.
+/// step 3; widened to the full record by the Go gate) — the kernel-ABI
+/// struct sigaction exactly as this state recorded it: sa_handler,
+/// sa_flags, sa_mask and sa_restorer, all four words returned verbatim,
+/// so a caller that saves and restores an action sees the bytes it
+/// installed. `no` is range-checked by every caller. Twin of the kernel's
+/// staged clamp (32 bytes — LINUX_SIGACT_BYTES), which the deliver bounds
+/// the copy against.
 fn old_act_bytes(sig: &SigState, no: u64) -> [u8; FD_PAYLOAD_CAP] {
     let mut b = [0u8; FD_PAYLOAD_CAP];
-    let handler: u64 = if sig.dispo[no as usize] == DISPO_IGN { 1 } else { 0 };
-    b[0..8].copy_from_slice(&handler.to_le_bytes());
+    for (i, w) in sig.act[no as usize].iter().enumerate() {
+        b[i * 8..i * 8 + 8].copy_from_slice(&w.to_le_bytes());
+    }
     b
 }
 
@@ -604,9 +805,12 @@ fn answer(
         }
         /* clock_gettime (228, LSC_LOCAL — E7 increment 19): the seam has
          * no vDSO to backstop it, so the sidecar answers the call itself.
-         * CLOCK_REALTIME is the pinned gate epoch; CLOCK_MONOTONIC starts
-         * at zero (the workload only needs a readable clock, not an
-         * advancing one). Other clock ids are EINVAL, Linux's own answer
+         * CLOCK_REALTIME is the pinned gate epoch; CLOCK_MONOTONIC is a
+         * fixed NONZERO second. Go 1.25.1's runtime throws "nanotime
+         * returning zero" when its monotonic read is zero, before the gate
+         * can print G1.1. The workload needs a readable clock, not an
+         * advancing one, so a fixed value is honest; it must never be 0.
+         * Other clock ids are EINVAL, Linux's own answer
          * for a clock this shim does not carry. The kernel stages the
          * 16-byte destination and refuses a NULL/foreign span before any
          * post; args[1] == 0 here is unreachable, but answering EINVAL
@@ -617,7 +821,7 @@ fn answer(
             }
             let (sec, nsec): (u64, u64) = match args[0] {
                 0 => (GATE_EPOCH_SECS, 0), /* CLOCK_REALTIME  */
-                1 => (0, 0),               /* CLOCK_MONOTONIC */
+                1 => (1, 0),               /* CLOCK_MONOTONIC: nonzero for Go */
                 _ => return Answer::Reply(0, E_INVAL),
             };
             let mut b = [0u8; FD_PAYLOAD_CAP];
@@ -776,12 +980,35 @@ fn answer(
                     Answer::Reply(addr, STATUS_OK)
                 }
             } else {
-                match brk.mtop.checked_sub(len_r) {
-                    Some(top) if top >= brk.cur => {
-                        brk.mtop = top;
-                        Answer::Reply(top, STATUS_OK)
+                /* A non-fixed addr is a HINT, as on Linux: when the caller
+                 * names a page-aligned range that is still free at the top
+                 * of the span, the kernel returns exactly that range. Go's
+                 * runtime depends on this for its arena hints: it asks for
+                 * a 64 MiB arena at each hint, and treats a different
+                 * address as "hint rejected", unmaps it, and tries the
+                 * next hint until the probe loop exhausts the span. The
+                 * measured Go 1.25.1 startup therefore needs the hint
+                 * honored, not a fresh cursor pick. addr == 0 and hints
+                 * that do not fit keep the descending-cursor behavior. */
+                let hint = addr & !0xFFFu64;
+                if addr != 0 && addr == hint
+                   && hint >= brk.cur && hint <= brk.mtop
+                   && len_r <= brk.mtop - hint {
+                    /* A hint is NOT the allocation cursor: Linux places
+                     * later NULL maps elsewhere, and Go relies on that —
+                     * after its 64 MiB arena hint it asks for its 32 MiB
+                     * heap and small runtime maps with addr == 0. Keeping
+                     * mtop here leaves those a free range; lowering it to
+                     * the hint would exhaust the span. */
+                    Answer::Reply(hint, STATUS_OK)
+                } else {
+                    match brk.mtop.checked_sub(len_r) {
+                        Some(top) if top >= brk.cur => {
+                            brk.mtop = top;
+                            Answer::Reply(top, STATUS_OK)
+                        }
+                        _ => Answer::Reply(0, E_NOMEM),
                     }
-                    _ => Answer::Reply(0, E_NOMEM),
                 }
             }
         }
@@ -812,21 +1039,27 @@ fn answer(
                 Answer::Reply(0, STATUS_OK)
             }
         }
-        /* mprotect (10, LSC_MEM — §5.4's W^X): only the refusal exists
-         * in v1 — simultaneous write+execute (prot & 0x2 & 0x4) is
-         * refused EPERM, the twin of linux_mprotect_refuses_wx (the
-         * kernel refuses it first-trap, before any post; both ends
-         * exist so neither alone is the load-bearing refusal — guard
-         * clause N3 pins both). Any other prot is ENOSYS with the
-         * number logged: real permission changes are not landed. (The
-         * mem class's last seam, munmap (11), sits beside this arm at
-         * increment 25; a fake grant here would still be a page the
-         * kernel never mapped.) */
+        /* mprotect (10, LSC_MEM — E7 §10.15): the policy half of a real
+         * permission change. This side answers the shape and the W|X
+         * rule; it does not choose an address, allocate a frame, or move
+         * either MemBrk cursor. The kernel re-runs the same shape ladder
+         * and then prewalks the task's page table, because a window can
+         * contain a hole and only the kernel knows which leaves exist.
+         * `PROT_NONE` is a valid transition here; the kernel represents
+         * it as a present, supervisor-only soft leaf. */
         10 => {
-            if args[2] & 0x2 != 0 && args[2] & 0x4 != 0 {
+            let prot = args[2];
+            let len = args[1];
+            let addr = args[0];
+            if prot & !0x7u64 != 0 {
+                Answer::Reply(0, E_INVAL)
+            } else if prot & 0x2 != 0 && prot & 0x4 != 0 {
                 Answer::Reply(0, E_PERM)
+            } else if len == 0 || addr & 0xFFF != 0 ||
+                      len.checked_add(0xFFF).is_none() {
+                Answer::Reply(0, E_INVAL)
             } else {
-                Answer::Reply(0, E_NOSYS)
+                Answer::Reply(0, STATUS_OK)
             }
         }
         /* exit_group (231, LSC_EXIT): the sidecar reaps, the frames return
@@ -842,18 +1075,18 @@ fn answer(
          * oldact is the no-op both Linux and this seam answer 0.
          *
          * The OUT-POINTER (increment 12): when oldact was passed, a
-         * successful answer carries the OLD disposition back as this
-         * reply's payload — captured BEFORE any mutation below (oldact is
-         * the disposition as it WAS, and a refusal arm returns with the
-         * plain reply, no bytes: the deliver only copies on success). The
-         * DISPOSITION records DFL/IGN only: a handler address is ENOSYS by
-         * name BEFORE any mutation — v1 has no signal frames, so
-         * installing a handler this shim can never invoke would make every
-         * later delivery a coin flip; sa_flags and sa_mask are
-         * deliberately NOT stored (they can only ride with a handler
-         * install, which was just refused — nothing may depend on bytes
-         * this side declined to keep — and zero in the oldact payload IS
-         * that truth). */
+         * successful answer carries the OLD action back as this reply's
+         * payload — captured BEFORE any mutation below (oldact is the
+         * action as it WAS, and a refusal arm returns with the plain
+         * reply, no bytes: the deliver only copies on success). RECORD-
+         * ONLY (the Go gate): the whole 32-byte struct is stored per
+         * signal — handler address, sa_flags, sa_mask, sa_restorer — so a
+         * save/restore caller gets its exact bytes back. The handler is
+         * never INVOKED: the 200/14 delivery arms refuse a handler
+         * disposition by name, because v1 has no signal frame and no
+         * rt_sigreturn. Nothing validates the handler's canonicality here
+         * either — Linux accepts any word at install and faults only if
+         * it ever calls it, and this shim never does. */
         LINUX_RT_SIGACTION => {
             if args[3] != SIGSET_BYTES {
                 Answer::Reply(0, E_INVAL)
@@ -880,19 +1113,16 @@ fn answer(
                 Answer::Reply(0, E_NOSYS) /* service's length check refuses these too */
             } else {
                 /* oldact captured BEFORE the record moves: the caller must
-                 * see the disposition as it was at entry. */
+                 * see the action as it was at entry, then the 32 installed
+                 * bytes replace the record wholesale — handler address and
+                 * the flags/mask/restorer that ride with it. */
                 let old = old_act_bytes(sig, args[0]);
-                match read_u64(payload, 0) {
-                    0 => {
-                        sig.dispo[args[0] as usize] = DISPO_DFL;
-                        sig_ok(args, old)
-                    }
-                    1 => {
-                        sig.dispo[args[0] as usize] = DISPO_IGN;
-                        sig_ok(args, old)
-                    }
-                    _ => Answer::Reply(0, E_NOSYS), /* handler install not landed */
+                let mut act = [0u64; SIGACT_WORDS];
+                for (i, w) in act.iter_mut().enumerate() {
+                    *w = read_u64(payload, i * 8);
                 }
+                sig.act[args[0] as usize] = act;
+                sig_ok(args, old)
             }
         }
         /* rt_sigprocmask (14, LSC_SIG — the seam's other recorded half):
@@ -907,11 +1137,35 @@ fn answer(
          * runs the kill arm RIGHT HERE with no reply, which is exactly
          * where musl's raise() dies on real Linux (block → tkill pends →
          * restore unmasks → the default action runs inside this syscall);
-         * a default-stop signal refuses the call by name BEFORE any
-         * mutation — nothing moved, not even the mask. */
+         * a default-stop signal — and a handler-disposed one, which this
+         * shim records but cannot invoke — refuses the call by name BEFORE
+         * any mutation: nothing moved, not even the mask. */
         LINUX_RT_SIGPROCMASK => {
             if args[3] != SIGSET_BYTES {
                 Answer::Reply(0, E_INVAL)
+            } else if args[5] == SIG_MASK_REVEAL_TAG {
+                /* E7 increment 34: the KERNEL's tagged probe. A handler the
+                 * #PF entered runs under a mask the kernel moved and keeps,
+                 * so only the PENDING half of its unmask is this side's:
+                 * args[4] is the mask the task moved to, and the ladder runs
+                 * exactly as the arm below runs it. `sig.mask` is left
+                 * ALONE — the kernel owns it for the window and restores the
+                 * frame's at the return, so moving it here would recreate
+                 * the divergence increment 33 closed. Status 0 means the
+                 * reveal ran (nothing rides back: the kernel writes the
+                 * oldset it holds), the kill variant is a default action
+                 * dying inside this call, and E_NOSYS is a reveal this v1
+                 * cannot perform, with the pending set untouched. */
+                let new_mask = args[4];
+                let (verdict, kill_sig) = reveal_verdict(sig, new_mask);
+                match verdict {
+                    1 => Answer::SignalKill(kill_sig),
+                    2 => Answer::Reply(0, E_NOSYS),
+                    _ => {
+                        sig.pending &= new_mask;
+                        Answer::Reply(0, STATUS_OK)
+                    }
+                }
             } else if args[1] == 0 && args[2] == 0 {
                 Answer::Reply(0, STATUS_OK) /* nothing in, nothing back */
             } else if args[1] == 0 {
@@ -936,34 +1190,14 @@ fn answer(
                             1 => old & !set, /* SIG_UNBLOCK  */
                             _ => set,        /* SIG_SETMASK  */
                         };
-                        /* Pass 1: what does the new mask REVEAL? Discards
-                         * (an IGN disposition, or an ignore-by-default
-                         * signal) are invisible either way; a
-                         * default-terminate signal KILLS right here — no
-                         * reply, this syscall never returns to its caller;
-                         * a default-stop signal refuses the CALL before
-                         * anything moves (not even the mask). */
-                        let mut revealed = sig.pending & !new_mask;
-                        let mut verdict = 0u8; /* 0 proceed, 1 kill, 2 refuse */
-                        let mut kill_sig = 0u64; /* WHICH revealed signal earns
-                                                  * the kill — carried on the
-                                                  * Answer so the line names it
-                                                  * (increment 14) */
-                        while revealed != 0 && verdict == 0 {
-                            let bit = revealed.trailing_zeros();
-                            revealed &= !(1u64 << bit);
-                            let sig_no = bit + 1;
-                            if sig.dispo[sig_no as usize] == DISPO_IGN
-                                || default_action(sig_no as u64) == ACT_IGNORE
-                            {
-                                continue; /* discard — its delivery is a no-op */
-                            } else if default_action(sig_no as u64) == ACT_TERMINATE {
-                                verdict = 1;
-                                kill_sig = sig_no as u64;
-                            } else {
-                                verdict = 2;
-                            }
-                        }
+                        /* Pass 1: what does the new mask REVEAL? The ladder
+                         * is one decision in one place (reveal_verdict), so
+                         * the kernel's tagged probe runs exactly the rule
+                         * this arm has always run — an IGN discard, a
+                         * default-terminate KILL right here (no reply, this
+                         * syscall never returns to its caller), or a refusal
+                         * that leaves the mask and the pending set alone. */
+                        let (verdict, kill_sig) = reveal_verdict(sig, new_mask);
                         match verdict {
                             1 => Answer::SignalKill(kill_sig),
                             2 => Answer::Reply(0, E_NOSYS),
@@ -990,6 +1224,29 @@ fn answer(
                 }
             }
         }
+        /* sigaltstack (131 — the census's third signal row): Rust std's
+         * stack-overflow setup first QUERIES the old stack. Answering
+         * ENOSYS there makes std return before its own guard-page
+         * mmap+mprotect, so the real firstuser's measured guard call
+         * never reached the seam. The query returns one stack_t with
+         * SS_DISABLE and no sp/size — the honest state, because no
+         * alternative stack exists yet. An install is accepted as a
+         * no-op: v1 has no signal frames and never delivers on an
+         * alternative stack, but returning success is what lets the
+         * caller continue into the guard-page setup this increment
+         * observes. The old-pointer case still answers the OLD state
+         * (disabled), captured before the install would change it. */
+        LINUX_SIGALTSTACK => {
+            if args[1] != 0 {
+                /* ReplyBytes owns the fd-class general buffer; only the
+                 * first STACK_T_BYTES cross (payload_bound says 24). */
+                let mut old = [0u8; FD_PAYLOAD_CAP];
+                old[8..10].copy_from_slice(&SS_DISABLE.to_le_bytes());
+                Answer::ReplyBytes(0, STACK_T_BYTES, old)
+            } else {
+                Answer::Reply(0, STATUS_OK)
+            }
+        }
         /* tkill (200 — the seam's DELIVERY): the tid must be the one this
          * task's own set_tid_address answer declared, compared at u32
          * width (musl stores that echo into pt->tid as an int32 and tkill
@@ -1009,17 +1266,58 @@ fn answer(
                 Answer::Reply(0, STATUS_OK) /* existence probe */
             } else if args[1] > SIG_MAX as u64 {
                 Answer::Reply(0, E_INVAL)
-            } else if sig.dispo[args[1] as usize] == DISPO_IGN {
+            } else if dispo(sig, args[1]) == DISPO_IGN {
                 Answer::Reply(0, STATUS_OK) /* ignored: 0 IS the delivery */
             } else if sig.mask & (1u64 << (args[1] - 1)) != 0 {
                 sig.pending |= 1u64 << (args[1] - 1);
                 Answer::Reply(0, STATUS_OK) /* blocked: arrives as pending */
+            } else if dispo(sig, args[1]) == DISPO_HANDLER {
+                /* E7 increment 28 (P1-C's wire-up): the handler RUNS. The
+                 * answer is the 80-byte delivery request — act words the
+                 * kernel re-checks and a frame it builds — instead of the
+                 * old record-only E_NOSYS. Deliverable means: installed
+                 * (dispo's HANDLER), not blocked (the arm above caught
+                 * that), so the mask moves HERE, before the reply, to
+                 * exactly what the frame's sigset will carry: the
+                 * thread's mask | sa_mask | the signal itself. The kernel
+                 * installs the same number on its side (clause P9 holds
+                 * the two to one decision) — and the pending bit is NOT
+                 * set: this delivery consumed it. */
+                let no = args[1] as usize;
+                let bit = 1u64 << (args[1] - 1);
+                let before = sig.mask;             /* the frame's `blocked` */
+                let flags = sig.act[no][1];
+                let mut frame_mask = before | sig.act[no][2] | bit;
+                if flags & SIG_SA_NODEFER != 0 {
+                    frame_mask &= !bit;
+                }
+                sig.saved_mask = before;          /* what a return restores */
+                sig.handler_active = true;
+                sig.mask = frame_mask;            /* the handler runs under it */
+                Answer::SignalFrame(
+                    sig_frame_bytes(args[1], sig.act[no][0], sig.act[no][3],
+                                    flags, sig.act[no][2], before),
+                    args[1])
             } else {
                 match default_action(args[1]) {
                     ACT_TERMINATE => Answer::SignalKill(args[1]),
                     ACT_IGNORE => Answer::Reply(0, STATUS_OK),
                     _ => Answer::Reply(0, E_NOSYS), /* stop-default: not landed */
                 }
+            }
+        }
+        /* rt_sigreturn (15): the handler's restorer issues it, and the only
+         * thing this side owes the return trip is its own MASK — the frame
+         * itself is the kernel's (it reads it through the validated copy and
+         * resumes there). No active handler means there is no frame to
+         * return from: refused by name, with nothing mutated. */
+        LINUX_RT_SIGRETURN => {
+            if !sig.handler_active {
+                Answer::Reply(0, E_INVAL)
+            } else {
+                sig.mask = sig.saved_mask;
+                sig.handler_active = false;
+                Answer::Reply(0, STATUS_OK)
             }
         }
         /* Everything else, named in the module header: ENOSYS + a logged
@@ -1049,11 +1347,27 @@ struct FdSlot {
     /// increment, justified by the census's three measured opens, all
     /// carrying O_CLOEXEC and one carrying O_DIRECTORY).
     flags: u32,
+    /// EPOLL-kind slots only: which descriptors are registered in this
+    /// epoll instance, bit `fd` (16 slots fit a u16). epoll_ctl's
+    /// ADD/DEL/MOD answers come from these bits — a duplicate ADD is
+    /// EEXIST, a DEL/MOD of a non-member ENOENT — and close() clears the
+    /// bit so a reused fd number never inherits a membership.
+    members: u16,
+    /// G1.5 evidence: the running CRC-32 (internal, un-finalized) of the
+    /// bytes this file slot has actually written, and their count. The
+    /// copy destination closes with the fixture's 64 KiB, so its close
+    /// line carries the checksum of what crossed the file class rather
+    /// than only the fixture's own byte count. Console/epoll slots keep
+    /// the initial state and are never logged.
+    sum: u32,
+    sum_len: u64,
 }
 
 const FD_KIND_CONSOLE: u8 = 0;
 const FD_KIND_FILE: u8 = 1;
-const FD_KIND_SOCKET: u8 = 2;
+const FD_KIND_EVENTFD: u8 = 2;
+const FD_KIND_EPOLL: u8 = 3;
+const FD_KIND_SOCKET: u8 = 4;
 const LINUX_MAX_FDS: usize = 16;
 
 /// Linux's own open-flag numbers as x86-64 musl hands them (measured by
@@ -1067,14 +1381,16 @@ const LINUX_MAX_FDS: usize = 16;
 const LO_LARGEFILE: u32 = 0x8000;
 const LO_DIRECTORY: u32 = 0x10000;
 const LO_CLOEXEC: u32 = 0x80000;
+const LO_NONBLOCK: u32 = 0x800;
 const LO_KNOWN: u32 = 0x3 | 0x40 | 0x80 | 0x200 | 0x400
     | LO_LARGEFILE | LO_DIRECTORY | LO_CLOEXEC;
 
 /// fcntl's four answered commands (the census's fcntl rows are all
 /// F_SETFD(1); F_GETFD/F_GETFL round out the four the design names).
-/// Every other command — F_DUPFD included — is ENOSYS by name: a
-/// fabricated answer to a command nobody measured is the placeholder
-/// failure in a new shape.
+/// F_SETFL moves only O_NONBLOCK: regular-file reads/writes are already
+/// non-blocking, and every other flag change stays ENOSYS by name
+/// (F_DUPFD included) — a fabricated answer to a command nobody
+/// measured is the placeholder failure in a new shape.
 const F_SETFD: u64 = 2;
 const F_GETFD: u64 = 1;
 const F_GETFL: u64 = 3;
@@ -1102,7 +1418,8 @@ fn fd_slot(fds: &[FdSlot], fd: u64) -> Option<&FdSlot> {
 fn alloc_fd(fds: &mut [FdSlot], kind: u8, vfs_fd: u32, flags: u32) -> Result<u64, i32> {
     for (i, s) in fds.iter_mut().enumerate() {
         if !s.used {
-            *s = FdSlot { used: true, kind, vfs_fd, flags };
+            *s = FdSlot { used: true, kind, vfs_fd, flags, members: 0,
+                          sum: 0xFFFF_FFFF, sum_len: 0 };
             return Ok(i as u64);
         }
     }
@@ -1149,8 +1466,8 @@ fn expected_req_len(num: u64, args: &[u64; 6]) -> usize {
 fn expected_req_range(num: u64, args: &[u64; 6]) -> (usize, usize) {
     const H: usize = LINUX_SYSCALL_REQ_BYTES;
     match num {
-        LINUX_OPEN | LINUX_STAT | LINUX_LSTAT | LINUX_UNLINK | LINUX_MKDIR =>
-            (H + 1, H + LINUX_PATH_CAP + 1),
+        LINUX_OPEN | LINUX_OPENAT | LINUX_STAT | LINUX_LSTAT | LINUX_UNLINK |
+        LINUX_MKDIR => (H + 1, H + LINUX_PATH_CAP + 1),
         LINUX_RENAME => (H + 2, H + RECV_ATTACH_CAP),
         _ => (expected_req_len(num, args), expected_req_len(num, args)),
     }
@@ -1169,6 +1486,12 @@ fn payload_bound(num: u64, args: &[u64; 6], len: usize) -> bool {
     match num {
         LINUX_RT_SIGACTION => args[2] != 0 && len == SIGACT_BYTES,
         LINUX_RT_SIGPROCMASK => args[2] != 0 && len == SIGSET_BYTES as usize,
+        /* An install with no old-stack pointer is the other Linux shape:
+         * Go's runtime calls sigaltstack(&new, nil) after its query. The
+         * arm already answers it with STATUS_OK; the length gate must not
+         * turn that legal no-out-pointer call into EINVAL. */
+        LINUX_SIGALTSTACK => if args[1] == 0 { len == 0 }
+                             else { len == STACK_T_BYTES },
         LINUX_STAT | LINUX_LSTAT => args[1] != 0 && len == STAT_PAYLOAD_BYTES,
         LINUX_READ => args[1] != 0 && len <= args[2] as usize
             && len <= FD_PAYLOAD_CAP,
@@ -1190,6 +1513,126 @@ fn payload_bound(num: u64, args: &[u64; 6], len: usize) -> bool {
         LINUX_POLL => args[1] != 0 && args[1] <= LINUX_POLL_MAX_FDS as u64
             && len == args[1] as usize * LINUX_POLLFD_BYTES,
         _ => false,
+    }
+}
+
+/// The event substrate's four measured numbers (TG-0) — pure over the
+/// task's fd table, the way answer() is pure over the signal state. The
+/// shape is Go's netpoll startup exactly: epoll_create1(EPOLL_CLOEXEC),
+/// eventfd2(0, EFD_CLOEXEC|EFD_NONBLOCK), epoll_ctl(epfd, ADD, efd), then
+/// epoll_pwait(epfd, ..., timeout 0) twice. Nothing here reports an
+/// event: this shim has no readiness source behind either descriptor, so
+/// the zero-timeout wait answers 0 (the census's measured answer) and a
+/// wait that would BLOCK is refused by name — answering 0 to a blocking
+/// wait would spin the caller on a lie, and parking it needs an event
+/// source that does not exist.
+fn answer_event(num: u64, args: &[u64; 6], fds: &mut [FdSlot]) -> Answer {
+    fn slot(fds: &[FdSlot], fd: u64) -> Result<FdSlot, i32> {
+        fd_slot(fds, fd).copied().ok_or(E_BADF)
+    }
+    match num {
+        LINUX_EPOLL_CREATE1 => {
+            if args[0] & !EPOLL_CLOEXEC != 0 {
+                Answer::Reply(0, E_INVAL) /* Linux's own unknown-flag answer */
+            } else {
+                match alloc_fd(fds, FD_KIND_EPOLL, 0,
+                               (args[0] as u32) & LO_CLOEXEC) {
+                    Ok(fd) => Answer::Reply(fd, STATUS_OK),
+                    Err(x) => Answer::Reply(0, x),
+                }
+            }
+        }
+        LINUX_EVENTFD2 => {
+            if args[1] & !(EFD_CLOEXEC | EFD_NONBLOCK) != 0 {
+                Answer::Reply(0, E_INVAL)
+            } else {
+                match alloc_fd(fds, FD_KIND_EVENTFD, 0, args[1] as u32) {
+                    Ok(fd) => Answer::Reply(fd, STATUS_OK),
+                    Err(x) => Answer::Reply(0, x),
+                }
+            }
+        }
+        LINUX_EPOLL_CTL => {
+            let ep = match slot(fds, args[0]) {
+                Ok(s) => s,
+                Err(x) => return Answer::Reply(0, x),
+            };
+            if ep.kind != FD_KIND_EPOLL {
+                return Answer::Reply(0, E_INVAL); /* not an epoll instance */
+            }
+            if args[2] >= LINUX_MAX_FDS as u64 {
+                return Answer::Reply(0, E_BADF);
+            }
+            if args[2] == args[0] {
+                return Answer::Reply(0, E_INVAL); /* an epoll cannot watch itself */
+            }
+            let target = match slot(fds, args[2]) {
+                Ok(s) => s,
+                Err(x) => return Answer::Reply(0, x),
+            };
+            let bit = 1u16 << (args[2] as u16);
+            let member = ep.members & bit != 0;
+            let pollable = target.kind == FD_KIND_EVENTFD
+                || target.kind == FD_KIND_EPOLL;
+            match args[1] {
+                EPOLL_CTL_ADD => {
+                    if member {
+                        Answer::Reply(0, cap_of(Errno::EExist))
+                    } else if pollable {
+                        fds[args[0] as usize].members |= bit;
+                        Answer::Reply(0, STATUS_OK)
+                    } else {
+                        /* A regular file (the census's EPERM line: fd 4
+                         * there is the copy's file) — Linux's own answer. */
+                        Answer::Reply(0, E_PERM)
+                    }
+                }
+                EPOLL_CTL_DEL => {
+                    if member {
+                        fds[args[0] as usize].members &= !bit;
+                        Answer::Reply(0, STATUS_OK)
+                    } else {
+                        Answer::Reply(0, cap_of(Errno::ENoent))
+                    }
+                }
+                EPOLL_CTL_MOD => {
+                    if !member {
+                        Answer::Reply(0, cap_of(Errno::ENoent))
+                    } else if pollable {
+                        Answer::Reply(0, STATUS_OK)
+                    } else {
+                        Answer::Reply(0, E_PERM)
+                    }
+                }
+                _ => Answer::Reply(0, E_INVAL),
+            }
+        }
+        LINUX_EPOLL_PWAIT => {
+            let ep = match slot(fds, args[0]) {
+                Ok(s) => s,
+                Err(x) => return Answer::Reply(0, x),
+            };
+            if ep.kind != FD_KIND_EPOLL {
+                Answer::Reply(0, E_INVAL)
+            } else if args[2] == 0 || args[2] > i32::MAX as u64 {
+                Answer::Reply(0, E_INVAL) /* maxevents must be positive */
+            } else if args[4] != 0 {
+                /* A sigmask would need its own copy-IN and semantics this
+                 * substrate does not carry; the census passes NULL. */
+                Answer::Reply(0, E_NOSYS)
+            } else if args[3] as i32 != 0 {
+                /* A timeout that would BLOCK (or wait ms): with no event
+                 * source nothing can ever wake it, so answering 0 would
+                 * make the caller spin and parking would wait forever.
+                 * Refused by name; both measured calls are timeout 0. */
+                Answer::Reply(0, E_NOSYS)
+            } else {
+                /* The zero-timeout probe: no events ready is the whole
+                 * measured truth (two calls, each answered 0). */
+                Answer::Reply(0, STATUS_OK)
+            }
+        }
+        _ => Answer::Reply(0, E_NOSYS),
     }
 }
 
@@ -1256,8 +1699,19 @@ fn answer_file<K: Kernel, A: BufferAlloc>(
         LINUX_WRITE => match slot_of(fds, args[0]) {
             Ok(s) if s.kind == FD_KIND_CONSOLE => Answer::Write(args[2] as usize),
             Ok(s) if s.kind == FD_KIND_FILE => {
-                match vfs.write(vt, s.vfs_fd, payload) {
-                    Ok(n) => Answer::Reply(n as u64, STATUS_OK),
+                let i = args[0] as usize;
+                let vfd = s.vfs_fd;
+                match vfs.write(vt, vfd, payload) {
+                    Ok(n) => {
+                        #[cfg(feature = "e7_go_gate")]
+                        if n > 0 {
+                            let got = n.min(payload.len());
+                            fds[i].sum =
+                                gate_crc32_update(fds[i].sum, &payload[..got]);
+                            fds[i].sum_len += n as u64;
+                        }
+                        Answer::Reply(n as u64, STATUS_OK)
+                    }
                     Err(e) => Answer::Reply(0, cap_of(e)),
                 }
             }
@@ -1303,7 +1757,7 @@ fn answer_file<K: Kernel, A: BufferAlloc>(
                     None => Answer::Reply(0, E_NOSYS),
                 }
             }
-            Ok(s) => {
+            Ok(s) if s.kind == FD_KIND_FILE => {
                 let want = (args[2] as usize).min(FD_PAYLOAD_CAP);
                 /* E7 increment 21: the continuation's evidence. The offset
                  * the VFS is about to hand back IS src_off, and the gate
@@ -1325,6 +1779,11 @@ fn answer_file<K: Kernel, A: BufferAlloc>(
                     Err(e) => Answer::Reply(0, cap_of(e)),
                 }
             }
+            /* The event substrate records no readable bytes this shim can
+             * produce (no event source, no counter state): ENOSYS by name
+             * rather than a VFS read through a zero vfs_fd — which would
+             * read an unrelated file's fd 0. */
+            Ok(_) => Answer::Reply(0, E_NOSYS),
             Err(x) => Answer::Reply(0, x),
         },
         /* open (2): the measured flag contract (§5.6 — qemu -strace on
@@ -1335,13 +1794,23 @@ fn answer_file<K: Kernel, A: BufferAlloc>(
          * bit outside the measured set is refused by NAME (ENOSYS) —
          * never silently dropped — and the mode rides to the VFS
          * untouched (create_file's own umask-less semantics). */
-        LINUX_OPEN => {
+        LINUX_OPEN | LINUX_OPENAT => {
+            /* openat shares open's VFS arm exactly: args[0] is the dirfd
+             * (AT_FDCWD only in v1 — any other dirfd is refused by name,
+             * never resolved against a guess), so flags are args[2] and
+             * mode args[3]. The path payload is identical because the
+             * kernel's plan reads openat's pathname from args[1]. */
+            let at = num == LINUX_OPENAT;
+            if at && args[0] as i64 != LINUX_AT_FDCWD {
+                return Answer::Reply(0, E_NOSYS);
+            }
+            let base = if at { 1 } else { 0 };
             let Some(path) = path_arg(payload, 0) else {
                 return Answer::Reply(0, E_NOSYS); /* unterminated: service's
                                                    * range let it through;
                                                    * the NUL rule refuses */
             };
-            let flags = args[1] as u32;
+            let flags = args[base + 1] as u32;
             let (vf, cloexec, want_dir) = match translate_open_flags(flags) {
                 Ok(t) => t,
                 Err(x) => return Answer::Reply(0, x),
@@ -1353,7 +1822,7 @@ fn answer_file<K: Kernel, A: BufferAlloc>(
             let opened = if want_dir {
                 vfs.open_dir(vt, path)
             } else {
-                vfs.open(vt, path, vf, args[2] as u16)
+                vfs.open(vt, path, vf, args[base + 2] as u16)
             };
             match opened {
                 Ok(vfd) => {
@@ -1384,6 +1853,18 @@ fn answer_file<K: Kernel, A: BufferAlloc>(
                 if let Err(e) = vfs.close(vt, s.vfs_fd) {
                     return Answer::Reply(0, cap_of(e));
                 }
+                /* G1.5 evidence at the destination's own close: the
+                 * running CRC-32 covers exactly the bytes this file slot
+                 * accepted, so the line names the copied data, not a
+                 * re-read or a fixture assertion. Input closes with zero
+                 * writes and stays silent. Compile-time gate-profile only:
+                 * ordinary Linux file I/O pays no per-write checksum and
+                 * its close log is unchanged. */
+                #[cfg(feature = "e7_go_gate")]
+                if fds[i].sum_len > 0 {
+                    gate_copy_sum_log(fds[i].sum_len,
+                                      fds[i].sum ^ 0xFFFF_FFFF);
+                }
             } else if s.kind == FD_KIND_SOCKET {
                 /* M1: the descriptor's two halves close together — the
                  * Linux slot here, the P2 driver's socket on the other
@@ -1392,6 +1873,14 @@ fn answer_file<K: Kernel, A: BufferAlloc>(
                     if let Err(e) = n.close_socket(s.vfs_fd) {
                         return Answer::Reply(0, net_status(e));
                     }
+                }
+            }
+            /* An epoll member that closes leaves every set: a later fd
+             * number must not inherit a membership it never registered
+             * (a stale bit would make ADD answer EEXIST). */
+            for s in fds.iter_mut() {
+                if s.kind == FD_KIND_EPOLL {
+                    s.members &= !(1u16 << i);
                 }
             }
             fds[i].used = false;
@@ -1435,10 +1924,10 @@ fn answer_file<K: Kernel, A: BufferAlloc>(
          * over the slot's own cloexec bit (the VFS's u16 flag word
          * cannot hold O_CLOEXEC; the bit lives HERE, which is the
          * widening the design's flag table demanded), F_GETFL echoing
-         * the open flags, F_SETFL accepted only as the no-change ask
-         * (a changed flag is ENOSYS by name: the VFS mints flags at
-         * open and has no setter — a fabricated 0 would claim a
-         * semantics nothing performs). Everything else — F_DUPFD
+         * the open flags, F_SETFL mutating only O_NONBLOCK (the one
+         * mutable flag this VFS fd can honestly echo; a changed
+         * O_APPEND is ENOSYS by name because the VFS mints flags at
+         * open and has no setter). Everything else — F_DUPFD
          * included — ENOSYS by name. */
         LINUX_FCNTL => match slot_of(fds, args[0]) {
             Ok(s) => match args[1] {
@@ -1461,12 +1950,21 @@ fn answer_file<K: Kernel, A: BufferAlloc>(
                 F_GETFL => Answer::Reply(
                     (s.flags & !LO_CLOEXEC) as u64, STATUS_OK),
                 F_SETFL => {
-                    if (args[2] as u32) & !LO_CLOEXEC
-                        == (s.flags & !LO_CLOEXEC)
+                    /* Linux ignores the immutable open flags here and
+                     * mutates O_APPEND/O_NONBLOCK. This VFS fd has no
+                     * append setter, so only O_NONBLOCK may move; the
+                     * stored bit is what a later F_GETFL echoes, and
+                     * dst/console writes already never park on it. */
+                    let req = args[2] as u32;
+                    let i = args[0] as usize;
+                    if req & !(LO_KNOWN | LO_NONBLOCK) != 0
+                        || (req ^ s.flags) & 0x400 != 0
                     {
-                        Answer::Reply(0, STATUS_OK) /* the no-change ask */
-                    } else {
                         Answer::Reply(0, E_NOSYS)
+                    } else {
+                        fds[i].flags =
+                            (s.flags & !LO_NONBLOCK) | (req & LO_NONBLOCK);
+                        Answer::Reply(0, STATUS_OK)
                     }
                 }
                 _ => Answer::Reply(0, E_NOSYS),
@@ -1567,8 +2065,14 @@ fn answer_file<K: Kernel, A: BufferAlloc>(
             Ok(_) => Answer::Reply(0, E_NOTDIR),
             Err(x) => Answer::Reply(0, x),
         },
-        /* Unreachable: service routes exactly the thirteen numbers
-         * here. ENOSYS keeps the no-silent-success rule total. */
+        /* The Go gate's event substrate (TG-0): four measured numbers,
+         * answered pure over the fd table — create the epoll instance and
+         * the eventfd, register the eventfd, and answer the zero-timeout
+         * probe with 0 events. See answer_event. */
+        LINUX_EPOLL_CTL | LINUX_EPOLL_PWAIT | LINUX_EVENTFD2
+        | LINUX_EPOLL_CREATE1 => answer_event(num, args, fds),
+        /* Unreachable: service routes only the numbers above here.
+         * ENOSYS keeps the no-silent-success rule total. */
         _ => Answer::Reply(0, E_NOSYS),
     }
 }
@@ -1905,6 +2409,12 @@ where
                         None => POLLNVAL,
                     }
                 }
+                /* The event substrate carries no readiness this shim can
+                 * observe: report nothing (never POLLNVAL — the slot IS
+                 * valid, and never the VFS's answer for an unrelated
+                 * vfs_fd 0). */
+                Some(s) if s.kind == FD_KIND_EVENTFD
+                        || s.kind == FD_KIND_EPOLL => 0,
                 Some(s) => match file_revents(s.vfs_fd, events) {
                     Some(r) => r,
                     None => POLLNVAL,
@@ -2136,7 +2646,9 @@ fn tasks() -> &'static mut [LinuxTask; MAX_LINUX_TASKS] {
         name_len: 0,
         partition: 0,
         vfs_task: 0,
-        fds: [FdSlot { used: false, kind: 0, vfs_fd: 0, flags: 0 }; LINUX_MAX_FDS],
+        fds: [FdSlot { used: false, kind: 0, vfs_fd: 0, flags: 0,
+                       members: 0, sum: 0xFFFF_FFFF, sum_len: 0 };
+              LINUX_MAX_FDS],
         brk_base: 0,
         brk_limit: 0,
         brk_cur: 0,
@@ -2222,7 +2734,9 @@ pub fn track(
          * accept writes (a tty is bidirectional; write(0) is not EBADF
          * on Linux), and the slots are what later increments grow by
          * open()'s hand. */
-        t.fds = [FdSlot { used: false, kind: 0, vfs_fd: 0, flags: 0 }; LINUX_MAX_FDS];
+        t.fds = [FdSlot { used: false, kind: 0, vfs_fd: 0, flags: 0,
+                          members: 0, sum: 0xFFFF_FFFF, sum_len: 0 };
+                  LINUX_MAX_FDS];
         for slot in t.fds.iter_mut().take(3) {
             slot.used = true;
             slot.kind = FD_KIND_CONSOLE;
@@ -2393,6 +2907,42 @@ fn fmt_sig_line(buf: &mut [u8], prefix: &[u8], sig_no: u64, suffix: &[u8]) -> us
     push_bytes(buf, off, suffix)
 }
 
+/// The granted anonymous-map line: ` ok mmap -> 0x<16 hex> len=<len>
+/// prot=<prot>` plus a newline. The address is hex because an address is
+/// unreadable in decimal; the request's length and protection stay decimal,
+/// the same words the refusal lines carry and the firstuser guard checker
+/// parses.
+fn fmt_mmap_grant_line(buf: &mut [u8], addr: u64, len: u64, prot: u64) -> usize {
+    let mut off = push_bytes(buf, 0, b" ok mmap -> 0x");
+    off = hex_into(buf, off, addr);
+    off = push_bytes(buf, off, b" len=");
+    off = dec_into(buf, off, len);
+    off = push_bytes(buf, off, b" prot=");
+    off = dec_into(buf, off, prot);
+    push_bytes(buf, off, b"\n")
+}
+
+/// The mmap refusal line: ` -> <errno> mmap(len=<len>, prot=<prot>,
+/// flags=<flags>)`. The request's words are decimal, and the prefix names
+/// whether the ENOSYS arm or the errno ladder refused the shape. The
+/// returned buffer is the `extra` tail `enosys_log` writes; no trailing
+/// newline is added here, matching the two callers' previous composition.
+fn fmt_mmap_refusal_line(buf: &mut [u8], status: i32, len: u64, prot: u64,
+                         flags: u64) -> usize {
+    let mut off = push_bytes(buf, 0, b" -> ");
+    off = push_bytes(buf, off,
+        if status == E_NOSYS { b"ENOSYS mmap(len=" }
+        else if status == E_PERM { b"EPERM mmap(len=" }
+        else if status == E_INVAL { b"EINVAL mmap(len=" }
+        else { b"ENOMEM mmap(len=" });
+    off = dec_into(buf, off, len);
+    off = push_bytes(buf, off, b", prot=");
+    off = dec_into(buf, off, prot);
+    off = push_bytes(buf, off, b", flags=");
+    off = dec_into(buf, off, flags);
+    push_bytes(buf, off, b")")
+}
+
 /// Increment 21: the gate tenant's file-class read offset, in hex (klog's
 /// own encoding). Target builds only — the host fakes have no serial path,
 /// exactly like enosys_log.
@@ -2404,6 +2954,43 @@ fn gate_read_log(off: u64) {
     #[cfg(not(feature = "target"))]
     {
         let _ = off;
+    }
+}
+
+/// CRC-32 (IEEE 802.3, reflected, poly 0xEDB88320), carried as the
+/// UN-FINALIZED state so successive file writes chain without a buffer.
+/// The close line finalizes it with the same `^ 0xFFFF_FFFF` the proto
+/// manifest CRC uses, so a host `zlib.crc32` over the fixture's 64 KiB of
+/// 0x5A reproduces the published number exactly.
+#[cfg(any(feature = "e7_go_gate", test))]
+fn gate_crc32_update(mut crc: u32, data: &[u8]) -> u32 {
+    for &b in data {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    crc
+}
+
+/// G1.5's explicit checksum evidence: the destination file's close names
+/// the byte count it accepted and the CRC-32 of exactly those bytes.
+#[cfg(feature = "e7_go_gate")]
+fn gate_copy_sum_log(bytes: u64, crc: u32) {
+    #[cfg(feature = "target")]
+    {
+        let mut extra = [0u8; 32];
+        let mut off = push_bytes(&mut extra, 0, b"crc32=0x");
+        off = hex_into(&mut extra, off, crc as u64);
+        crate::entry::klog(b"[GTG] copy bytes", bytes as u32, &extra[..off]);
+    }
+    #[cfg(not(feature = "target"))]
+    {
+        let _ = (bytes, crc);
     }
 }
 
@@ -2490,6 +3077,31 @@ pub fn service<K: Kernel, A: BufferAlloc>(
          * the recv. Still not resolvable: stay parked (a finite poll's
          * wake comes from the entry loop's next_wait_ns deadline; a
          * blocking read's from console input on the channel set). */
+        /* E7 increment 27: a signal can end a park. Checked BEFORE readiness
+         * — a readable console and an interrupting signal in the same pass is
+         * a race with no wrong answer here, and answering the read would hide
+         * the signal for as long as the caller keeps reading. The pending bit
+         * is cleared because the wake consumes it: Linux delivers the signal,
+         * it does not leave it queued for the next park as well. */
+        if tasks()[i].pending != PENDING_NONE {
+            if let Some(no) = park_interrupt(&tasks()[i].sig) {
+                let tag = tasks()[i].pending_tag;
+                let num = if tasks()[i].pending == PENDING_READ {
+                    LINUX_READ
+                } else {
+                    LINUX_POLL
+                };
+                tasks()[i].sig.pending &= !(1u64 << (no - 1));
+                tasks()[i].pending = PENDING_NONE;
+                let mut ex = [0u8; 64];
+                let n = fmt_sig_line(&mut ex, b" sig=", no,
+                                     b" -> -EINTR on a parked forward\n");
+                enosys_log(num as u32, &name_buf[..nlen], &ex[..n]);
+                reply(k, ch_w, tag, num, 0, E_INTR);
+                continue;
+            }
+        }
+
         match tasks()[i].pending {
             PENDING_READ => {
                 let tag = tasks()[i].pending_tag;
@@ -2659,10 +3271,12 @@ pub fn service<K: Kernel, A: BufferAlloc>(
             LINUX_SOCKET | LINUX_CONNECT | LINUX_ACCEPT | LINUX_SENDTO
             | LINUX_RECVFROM | LINUX_SHUTDOWN | LINUX_BIND | LINUX_LISTEN =>
                 answer_net(&mut net, num, &args, &mut fds, payload),
-            LINUX_READ | LINUX_WRITE | LINUX_OPEN | LINUX_CLOSE | LINUX_STAT
+            LINUX_READ | LINUX_WRITE | LINUX_OPEN | LINUX_OPENAT | LINUX_CLOSE
+            | LINUX_STAT
             | LINUX_LSTAT | LINUX_LSEEK | LINUX_FCNTL | LINUX_FSYNC
             | LINUX_FTRUNCATE | LINUX_RENAME | LINUX_MKDIR | LINUX_UNLINK
-            | LINUX_GETDENTS64 | LINUX_POLL =>
+            |            LINUX_GETDENTS64 | LINUX_POLL | LINUX_EPOLL_CTL
+            | LINUX_EPOLL_PWAIT | LINUX_EVENTFD2 | LINUX_EPOLL_CREATE1 =>
                 answer_file(num, &args, &mut fds, tasks()[i].vfs_task, vfs,
                             &mut net, payload, console, now_ns, tasks()[i].gate),
             _ => answer(num, &args, &fds, &mut mem, &mut sigstate, payload),
@@ -2695,15 +3309,9 @@ pub fn service<K: Kernel, A: BufferAlloc>(
                          * wanted len=X prot=P flags=F and this shim cannot
                          * service it" is a line, not a reconstruction. */
                         let mut ex = [0u8; 56];
-                        let mut off =
-                            push_bytes(&mut ex, 0, b" -> ENOSYS mmap(len=");
-                        off = dec_into(&mut ex, off, args[1]);
-                        off = push_bytes(&mut ex, off, b", prot=");
-                        off = dec_into(&mut ex, off, args[2]);
-                        off = push_bytes(&mut ex, off, b", flags=");
-                        off = dec_into(&mut ex, off, args[3]);
-                        off = push_bytes(&mut ex, off, b")");
-                        enosys_log(num as u32, &name_buf[..nlen], &ex[..off]);
+                        let n = fmt_mmap_refusal_line(
+                            &mut ex, E_NOSYS, args[1], args[2], args[3]);
+                        enosys_log(num as u32, &name_buf[..nlen], &ex[..n]);
                     } else {
                         enosys_log(num as u32, &name_buf[..nlen], b" -> ENOSYS\n");
                     }
@@ -2716,29 +3324,18 @@ pub fn service<K: Kernel, A: BufferAlloc>(
                      * line: the kernel's first trap refused it with the
                      * address on ITS line, before any post.) */
                     let mut ex = [0u8; 56];
-                    let mut off = push_bytes(&mut ex, 0, b" -> ");
-                    off = push_bytes(&mut ex, off,
-                        if status == E_PERM   { b"EPERM mmap(len=" }
-                        else if status == E_INVAL { b"EINVAL mmap(len=" }
-                        else                  { b"ENOMEM mmap(len=" });
-                    off = dec_into(&mut ex, off, args[1]);
-                    off = push_bytes(&mut ex, off, b", prot=");
-                    off = dec_into(&mut ex, off, args[2]);
-                    off = push_bytes(&mut ex, off, b", flags=");
-                    off = dec_into(&mut ex, off, args[3]);
-                    off = push_bytes(&mut ex, off, b")");
-                    enosys_log(num as u32, &name_buf[..nlen], &ex[..off]);
+                    let n = fmt_mmap_refusal_line(
+                        &mut ex, status, args[1], args[2], args[3]);
+                    enosys_log(num as u32, &name_buf[..nlen], &ex[..n]);
                 } else if num == LINUX_MMAP {
                     /* A GRANTED map shows the address the ledger gave
-                     * (increment 16) — in hex, because an address is
-                     * unreadable in decimal on a serial log, and this
-                     * line is the run's proof that the allocator's arena
-                     * landed inside its span. */
-                    let mut ex = [0u8; 40];
-                    let mut off = push_bytes(&mut ex, 0, b" ok mmap -> 0x");
-                    off = hex_into(&mut ex, off, ret);
-                    off = push_bytes(&mut ex, off, b"\n");
-                    enosys_log(num as u32, &name_buf[..nlen], &ex[..off]);
+                     * (increment 16) and the request's own length and
+                     * protection — hex for the address, decimal for the
+                     * request words — so the guard's three-page RW shape
+                     * is read off the line before the one-page carve-out. */
+                    let mut ex = [0u8; 96];
+                    let n = fmt_mmap_grant_line(&mut ex, ret, args[1], args[2]);
+                    enosys_log(num as u32, &name_buf[..nlen], &ex[..n]);
                 } else if num == LINUX_MUNMAP && status != STATUS_OK {
                     /* Munmap's refusal family (increment 25): EINVAL is
                      * the only arm a well-formed request reaches — the
@@ -2931,7 +3528,31 @@ pub fn service<K: Kernel, A: BufferAlloc>(
                     k.proc_kill(pid);
                     let _ = vfs.exit_task(tasks()[i].vfs_task);
                     tasks()[i].used = false;
+                    /* G1.7 evidence: the row close is now a named
+                     * observable event, not something inferred from the
+                     * exit_group status line. Exactly one per reaped
+                     * task; the gate's one exit_group is the only one.
+                     * Gate profile only — ordinary logs stay unchanged. */
+                    #[cfg(feature = "e7_go_gate")]
+                    enosys_log(num as u32, &name_buf[..nlen],
+                               b" exit_group row closed\n");
                 }
+            }
+            Answer::SignalFrame(frame, signo) => {
+                /* E7 increment 28 (P1-C's wire-up): the frame is the
+                 * KERNEL's to build and write; this side names the handler
+                 * and the act words, and the kernel re-checks every one of
+                 * them. Logged BEFORE the reply so the boot's attribution
+                 * reads `sig=<N> handler -> frame` — the line that tells
+                 * "the handler was installed" from "the task happened to
+                 * keep running". A failed send is reply()'s own case: the
+                 * child's end died mid-call, and the kernel's close arm
+                 * answers the parked task with -ESRCH. */
+                let mut ex = [0u8; 64];
+                let n = fmt_sig_line(&mut ex, b" sig=", signo,
+                                     b" handler -> frame\n");
+                enosys_log(num as u32, &name_buf[..nlen], &ex[..n]);
+                reply_bytes(k, ch_w, rr.tag, num, 0, &frame);
             }
             Answer::SignalKill(kill_sig) => {
                 /* E7 increment 10 (§10.13's step 2): a signal's default
@@ -3145,7 +3766,64 @@ mod tests {
     }
 
     fn fds() -> [FdSlot; LINUX_MAX_FDS] {
-        [FdSlot { used: false, kind: 0, vfs_fd: 0, flags: 0 }; LINUX_MAX_FDS]
+                [FdSlot { used: false, kind: 0, vfs_fd: 0, flags: 0, members: 0,
+                  sum: 0xFFFF_FFFF, sum_len: 0 }; LINUX_MAX_FDS]
+    }
+
+    /* E7 increment 27 (P1-C): the park's wake. Six cases, one per branch of
+     * Linux's rule — the boot can only ever show the happy one (a handler
+     * without SA_RESTART), and the other five are exactly the mistakes that
+     * would turn a restartable read into a spurious EINTR, or an EINTR into
+     * silence. */
+    #[test]
+    fn a_parked_forward_is_woken_only_by_a_handler_without_sa_restart() {
+        let mut sig = SigState::new();
+        sig.act[2][0] = 0x401000;            /* SIGINT -> a real handler */
+        sig.pending = 1u64 << 1;             /* it arrived while parked  */
+
+        assert_eq!(park_interrupt(&sig), Some(2),
+                   "an installed handler with no SA_RESTART ends the park");
+
+        sig.act[2][1] = SIG_SA_RESTART;
+        assert_eq!(park_interrupt(&sig), None,
+                   "SA_RESTART keeps the read parked: Linux restarts the syscall, and the signal waits for the next return to user space — answering -EINTR here would be a read() that fails where Linux's succeeds");
+
+        sig.act[2][1] = 0;
+        sig.mask = 1u64 << 1;
+        assert_eq!(park_interrupt(&sig), None,
+                   "a blocked signal is not deliverable, so it cannot end the park — it stays pending until the mask moves");
+
+        sig.mask = 0;
+        sig.act[2][0] = 1;                   /* SIG_IGN */
+        assert_eq!(park_interrupt(&sig), None,
+                   "SIG_IGN has no frame to run: the park is untouched");
+
+        sig.act[2][0] = 0;                   /* SIG_DFL */
+        assert_eq!(park_interrupt(&sig), None,
+                   "and SIG_DFL never reaches this function in service() (the tkill arm already answered it with a kill), but the rule refuses it on its own terms too");
+
+        sig.act[2][0] = 0x401000;
+        sig.pending = 0;
+        assert_eq!(park_interrupt(&sig), None,
+                   "nothing arrived, nothing interrupts — the common case must cost a zero test, not a wake");
+
+        /* The lowest signal wins, so the log names a deterministic one
+         * when two arrive in the same pass (Linux would deliver 2 first). */
+        sig.pending = (1u64 << 1) | (1u64 << 9);
+        sig.act[10][0] = 0x402000;
+        assert_eq!(park_interrupt(&sig), Some(2),
+                   "the lowest-numbered deliverable signal is the one named");
+    }
+
+    #[test]
+    fn gate_copy_crc_matches_the_fixture_input() {
+        let chunk = [0x5Au8; 4096];
+        let mut crc = 0xFFFF_FFFFu32;
+        for _ in 0..16 {
+            crc = gate_crc32_update(crc, &chunk);
+        }
+        assert_eq!(crc ^ 0xFFFF_FFFF, 0xF489_848E,
+                   "64 KiB of 0x5A has the zlib CRC-32 the close line publishes");
     }
     /* E7 increment 23: the three console descriptors every task is born
      * with (track() registers them), for the poll/read waiting tests. */
@@ -3193,7 +3871,7 @@ mod tests {
     }
 
     #[test]
-    fn clock_gettime_answers_the_pinned_epoch_and_zero_monotonic() {
+    fn clock_gettime_answers_the_pinned_epoch_and_nonzero_monotonic() {
         let mut brk = ledger();
         let mut sig = SigState::new();
         let a = answer(228, &[0, 0x5000, 0, 0, 0, 0], &fds(), &mut brk,
@@ -3213,7 +3891,8 @@ mod tests {
             Answer::ReplyBytes(ret, len, bytes) => {
                 assert_eq!(ret, 0);
                 assert_eq!(len, TIMESPEC_BYTES);
-                assert_eq!(read_u64(&bytes, 0), 0);
+                assert_eq!(read_u64(&bytes, 0), 1,
+                           "Go's nanotime throws on a zero monotonic read");
                 assert_eq!(read_u64(&bytes, 8), 0);
             }
             _ => panic!("CLOCK_MONOTONIC did not answer a timespec: {:?}", a),
@@ -3297,7 +3976,7 @@ mod tests {
         let a = answer(13, &[6, 0x4000, 0, 8, 0, 0], &fds(), &mut ledger(),
                        &mut sig, &act_payload(1));
         assert!(matches!(a, Answer::Reply(0, STATUS_OK)), "IGN: {:?}", a);
-        assert_eq!(sig.dispo[6], DISPO_IGN);
+        assert_eq!(dispo(&sig, 6), DISPO_IGN);
         let a = answer(13, &[6, 0x4000, 0x5000, 8, 0, 0], &fds(),
                        &mut ledger(), &mut sig, &act_payload(0));
         match a {
@@ -3308,16 +3987,22 @@ mod tests {
             }
             other => panic!("oldact on success: {:?}", other),
         }
-        assert_eq!(sig.dispo[6], DISPO_DFL, "and the new one landed");
-        /* a REFUSAL with oldact requested: the plain reply, no bytes —
-         * an errno owes no payload, and a mutation-free refusal leaves
-         * the out-pointer to the kernel's shape-1 path (which accepts an
-         * errno reply without copying). */
+        assert_eq!(dispo(&sig, 6), DISPO_DFL, "and the new one landed");
+        /* a HANDLER with oldact requested (TG-0): the install is RECORDED
+         * — record-only, never invoked — and oldact carries the action as
+         * it was, so a save/restore caller round-trips its own bytes. */
         let a = answer(13, &[6, 0x4000, 0x5000, 8, 0, 0], &fds(), &mut ledger(),
                        &mut sig, &act_payload(0x800abcd));
-        assert!(matches!(a, Answer::Reply(0, E_NOSYS)),
-                "handler refusal carries no payload: {:?}", a);
-        assert_eq!(sig.dispo[6], DISPO_DFL, "nothing moved");
+        match a {
+            Answer::ReplyBytes(ret, len, bytes) => {
+                assert_eq!((ret, len), (0, SIGACT_BYTES));
+                assert_eq!(read_u64(&bytes, 0), 0,
+                           "oldact is the DFL action installed above");
+            }
+            other => panic!("handler install's oldact: {:?}", other),
+        }
+        assert_eq!(dispo(&sig, 6), DISPO_HANDLER, "the handler is recorded");
+        assert_eq!(sig.act[6][0], 0x800abcd, "verbatim");
         /* act NULL with no oldact: the no-op both sides answer 0 */
         let a = answer(13, &[6, 0, 0, 8, 0, 0], &fds(), &mut ledger(),
                        &mut sig, &[]);
@@ -3325,25 +4010,40 @@ mod tests {
     }
 
     #[test]
-    fn sigaction_records_dfl_and_ign_but_refuses_handlers_before_mutation() {
+    fn sigaction_records_the_whole_action_but_never_invokes_a_handler() {
         let mut sig = fresh();
         /* SIG_DFL recorded */
         let a = answer(13, &[6, 0x4000, 0, 8, 0, 0], &fds(), &mut ledger(),
                        &mut sig, &act_payload(0));
         assert!(matches!(a, Answer::Reply(0, STATUS_OK)), "DFL: {:?}", a);
-        assert_eq!(sig.dispo[6], DISPO_DFL);
+        assert_eq!(dispo(&sig, 6), DISPO_DFL);
         /* SIG_IGN recorded */
         let a = answer(13, &[6, 0x4000, 0, 8, 0, 0], &fds(), &mut ledger(),
                        &mut sig, &act_payload(1));
         assert!(matches!(a, Answer::Reply(0, STATUS_OK)), "IGN: {:?}", a);
-        assert_eq!(sig.dispo[6], DISPO_IGN);
-        /* a handler address: ENOSYS, and the disposition UNCHANGED —
-         * refusal-before-mutation, the property that keeps a later
-         * delivery honest instead of half-recorded. */
+        assert_eq!(dispo(&sig, 6), DISPO_IGN);
+        /* A handler address is RECORDED — record-only, never invoked —
+         * together with the sa_flags/sa_mask/sa_restorer that ride with
+         * it, so a query returns the caller's action byte for byte. */
+        let mut act = [0u8; SIGACT_BYTES];
+        act[..8].copy_from_slice(&0x800abcdefu64.to_le_bytes());
+        act[8..16].copy_from_slice(&0x0400_0004u64.to_le_bytes()); /* SA_SIGINFO|SA_RESTORER */
+        act[16..24].copy_from_slice(&(1u64 << 4).to_le_bytes());   /* sa_mask */
+        act[24..32].copy_from_slice(&0x8001234u64.to_le_bytes());  /* restorer */
         let a = answer(13, &[6, 0x4000, 0, 8, 0, 0], &fds(), &mut ledger(),
-                       &mut sig, &act_payload(0x800abcd));
-        assert!(matches!(a, Answer::Reply(0, E_NOSYS)), "handler: {:?}", a);
-        assert_eq!(sig.dispo[6], DISPO_IGN, "the handler install must not land");
+                       &mut sig, &act);
+        assert!(matches!(a, Answer::Reply(0, STATUS_OK)), "handler: {:?}", a);
+        assert_eq!(dispo(&sig, 6), DISPO_HANDLER);
+        let q = answer(13, &[6, 0, 0x5000, 8, 0, 0], &fds(), &mut ledger(),
+                       &mut sig, &[]);
+        match q {
+            Answer::ReplyBytes(ret, len, bytes) => {
+                assert_eq!((ret, len), (0, SIGACT_BYTES));
+                assert_eq!(&bytes[..SIGACT_BYTES], &act[..],
+                           "oldact returns the recorded bytes verbatim");
+            }
+            other => panic!("handler query: {:?}", other),
+        }
         /* signal-number rules Linux itself owns: 0 and >64 are EINVAL,
          * and SIGKILL/SIGSTOP refuse any change however benign. */
         for s in [0u64, 65, 9, 20] {
@@ -3514,6 +4214,100 @@ mod tests {
     }
 
     #[test]
+    fn a_handler_disposition_answers_with_the_delivery_request() {
+        /* E7 increment 28: the old contract (a recorded handler is never
+         * invoked, so its tkill is refused E_NOSYS) is RETIRED — the frame
+         * exists, so the answer is the 80-byte request, with the act words
+         * the kernel re-checks and the mask the handler will run under. */
+        let mut sig = fresh();
+        let a = answer(13, &[10, 0x4000, 0, 8, 0, 0], &fds(), &mut ledger(),
+                       &mut sig, &act_payload(0x800abcd));
+        assert!(matches!(a, Answer::Reply(0, STATUS_OK)), "install: {:?}", a);
+        let a = answer(200, &[TID, 10, 0, 0, 0, 0], &fds(), &mut ledger(),
+                       &mut sig, &[]);
+        match a {
+            Answer::SignalFrame(f, signo) => {
+                assert_eq!(signo, 10);
+                assert_eq!(u32::from_le_bytes([f[0], f[1], f[2], f[3]]), 10);
+                assert_eq!(read_u64(&f, 16), 0x800abcd,
+                           "the handler word the kernel will jump to");
+                assert_eq!(read_u64(&f, 48), 0, "blocked was empty");
+                assert_eq!(read_u64(&f, 40), 0, "sa_mask was empty");
+                assert_eq!(u32::from_le_bytes([f[72], f[73], f[74], f[75]]),
+                           SIG_SS_DISABLE, "v1 delivers on the user stack");
+            }
+            other => panic!("handler tkill must emit a delivery: {:?}", other),
+        }
+        assert_eq!(sig.pending, 0, "the delivery consumed any pending bit");
+        assert_ne!(sig.mask & (1 << 9), 0,
+                   "and the handler runs with its own signal blocked");
+
+        /* Blocked: the signal PENDS (Linux's own answer) and no frame is
+         * built yet; the unblock that would reveal it refuses the CALL —
+         * the reveal path's delivery is not wired (named limit). */
+        let mut sig = fresh();
+        answer(13, &[10, 0x4000, 0, 8, 0, 0], &fds(), &mut ledger(),
+               &mut sig, &act_payload(0x800abcd));
+        answer(14, &[2, 0x4000, 0, 8, 0, 0], &fds(), &mut ledger(),
+               &mut sig, &set_payload(1 << 9));
+        let a = answer(200, &[TID, 10, 0, 0, 0, 0], &fds(), &mut ledger(),
+                       &mut sig, &[]);
+        assert!(matches!(a, Answer::Reply(0, STATUS_OK)), "blocked: {:?}", a);
+        assert_ne!(sig.pending & (1 << 9), 0);
+        let before = sig.mask;
+        let a = answer(14, &[1, 0x4000, 0, 8, 0, 0], &fds(), &mut ledger(),
+                       &mut sig, &set_payload(1 << 9));
+        assert!(matches!(a, Answer::Reply(0, E_NOSYS)), "unblock: {:?}", a);
+        assert_eq!(sig.mask, before, "the refusal moved no mask");
+        assert_ne!(sig.pending & (1 << 9), 0, "and no pending bit vanished");
+    }
+
+    #[test]
+    fn rt_sigreturn_restores_the_mask_a_delivery_changed() {
+        /* E7 increment 29: the return trip's half of the mask rule. The
+         * delivery saved `before`; 15 must put it back and clear the flag,
+         * and 15 with no handler must not touch a bit. */
+        let mut sig = fresh();
+        assert!(matches!(answer(15, &[0; 6], &fds(), &mut ledger(), &mut sig,
+                                 &[]),
+                         Answer::Reply(0, E_INVAL)),
+                "no handler entered: nothing to return from");
+        assert_eq!(sig.mask, 0, "and the refusal moved no mask");
+
+        answer(13, &[10, 0x4000, 0, 8, 0, 0], &fds(), &mut ledger(),
+               &mut sig, &act_payload(0x800abcd));
+        answer(14, &[2, 0x4000, 0, 8, 0, 0], &fds(), &mut ledger(),
+               &mut sig, &set_payload(1 << 4));      /* block SIGILL  */
+        let before = sig.mask;
+        assert!(matches!(answer(200, &[TID, 10, 0, 0, 0, 0], &fds(),
+                                 &mut ledger(), &mut sig, &[]),
+                         Answer::SignalFrame(_, 10)));
+        assert!(sig.handler_active, "the delivery entered a handler");
+        assert_ne!(sig.mask, before, "and moved the mask it runs under");
+
+        let a = answer(15, &[0; 6], &fds(), &mut ledger(), &mut sig, &[]);
+        assert!(matches!(a, Answer::Reply(0, STATUS_OK)),
+                "rt_sigreturn with a handler answers 0: {:?}", a);
+        assert_eq!(sig.mask, before,
+                   "and the PRE-handler mask is back — SIGILL still blocked, SIGUSR1 free again, which is what a second raise depends on");
+        assert!(!sig.handler_active, "the handler is no longer entered");
+    }
+
+    #[test]
+    fn a_handler_never_falls_back_to_its_default_action() {
+        /* The retired test's other half, kept: a HANDLER disposition must
+         * never become the default action's kill, whatever the default
+         * for that number is (SIGUSR1's would be a terminate). */
+        let mut sig = fresh();
+        answer(13, &[10, 0x4000, 0, 8, 0, 0], &fds(), &mut ledger(),
+               &mut sig, &act_payload(0x800abcd));
+        let a = answer(200, &[TID, 10, 0, 0, 0, 0], &fds(), &mut ledger(),
+                       &mut sig, &[]);
+        assert!(!matches!(a, Answer::SignalKill(_)),
+                "a handler disposition killed its task: {:?}", a);
+    }
+
+    #[test]
     fn unblock_discards_a_pending_default_ignore_signal() {
         let mut sig = fresh();
         answer(14, &[2, 0x4000, 0, 8, 0, 0], &fds(), &mut ledger(),
@@ -3613,7 +4407,8 @@ mod tests {
          * slots never consult it. */
         let mut file_fds = console_fds();
         file_fds[3] = FdSlot { used: true, kind: FD_KIND_FILE, vfs_fd: 7,
-                               flags: 0 };
+                               sum: 0xFFFF_FFFF, sum_len: 0,
+                               flags: 0, members: 0 };
         payload[..8].copy_from_slice(&pollfd(3, POLLIN));
         match poll_answer(&file_fds, &mut None, &console, &payload[..8], &timed, 0,
                           |vfd, ev| {
@@ -3644,6 +4439,77 @@ mod tests {
         assert!(!poll_expired(0, u64::MAX));
         assert_eq!(poll_deadline(10, -1), 0);
         assert_eq!(poll_deadline(10, 2), 10 + 2_000_000);
+    }
+
+    #[test]
+    fn eventfd_and_epoll_answer_the_go_netpoll_startup() {
+        let mut f = console_fds();
+        /* epoll_create1(EPOLL_CLOEXEC) — the census's first netpoll call:
+         * minted at the lowest free fd with the cloexec bit recorded. */
+        let a = answer_event(LINUX_EPOLL_CREATE1,
+                             &[EPOLL_CLOEXEC, 0, 0, 0, 0, 0], &mut f);
+        assert!(matches!(a, Answer::Reply(3, STATUS_OK)), "epoll: {:?}", a);
+        assert_eq!(f[3].kind, FD_KIND_EPOLL);
+        assert_eq!(f[3].flags & LO_CLOEXEC, LO_CLOEXEC);
+        /* eventfd2(0, EFD_CLOEXEC|EFD_NONBLOCK), the measured pair. */
+        let a = answer_event(LINUX_EVENTFD2,
+                             &[0, EFD_CLOEXEC | EFD_NONBLOCK, 0, 0, 0, 0], &mut f);
+        assert!(matches!(a, Answer::Reply(4, STATUS_OK)), "eventfd: {:?}", a);
+        assert_eq!(f[4].kind, FD_KIND_EVENTFD);
+        assert_eq!(f[4].flags & LO_CLOEXEC, LO_CLOEXEC,
+                   "EFD_CLOEXEC is the bit F_GETFD reads");
+        /* epoll_ctl(5, ADD, 6, EPOLLIN) in the trace: the eventfd becomes
+         * a member, and the membership is what a duplicate ADD sees. */
+        let a = answer_event(LINUX_EPOLL_CTL,
+                             &[3, EPOLL_CTL_ADD, 4, 1, 0, 0], &mut f);
+        assert!(matches!(a, Answer::Reply(0, STATUS_OK)), "add: {:?}", a);
+        assert_eq!(f[3].members & (1 << 4), 1 << 4);
+        let a = answer_event(LINUX_EPOLL_CTL,
+                             &[3, EPOLL_CTL_ADD, 4, 1, 0, 0], &mut f);
+        assert!(matches!(a, Answer::Reply(0, x)
+                         if x == cap_of(Errno::EExist)),
+                "duplicate add: {:?}", a);
+        /* the census's EPERM line: adding a regular file */
+        f[5] = FdSlot { used: true, kind: FD_KIND_FILE, vfs_fd: 7,
+                        sum: 0xFFFF_FFFF, sum_len: 0,
+                        flags: 0, members: 0 };
+        let a = answer_event(LINUX_EPOLL_CTL,
+                             &[3, EPOLL_CTL_ADD, 5, 1, 0, 0], &mut f);
+        assert!(matches!(a, Answer::Reply(0, E_PERM)), "file add: {:?}", a);
+        /* epoll_pwait(5, [], 128, 0, NULL, 0) = 0, twice — the measured
+         * startup pair. A blocking wait is refused BY NAME, never
+         * answered 0 (that would spin the caller on a lie). */
+        for _ in 0..2 {
+            let a = answer_event(LINUX_EPOLL_PWAIT,
+                                 &[3, 0x9000, 128, 0, 0, 0], &mut f);
+            assert!(matches!(a, Answer::Reply(0, STATUS_OK)), "pwait: {:?}", a);
+        }
+        let a = answer_event(LINUX_EPOLL_PWAIT,
+                             &[3, 0x9000, 128, u64::MAX, 0, 0], &mut f);
+        assert!(matches!(a, Answer::Reply(0, E_NOSYS)), "blocking: {:?}", a);
+        let a = answer_event(LINUX_EPOLL_PWAIT,
+                             &[3, 0x9000, 128, 0, 0x5000, 8], &mut f);
+        assert!(matches!(a, Answer::Reply(0, E_NOSYS)), "sigmask: {:?}", a);
+        /* DEL twice: 0 then ENOENT — membership, not a blind success. */
+        let a = answer_event(LINUX_EPOLL_CTL,
+                             &[3, EPOLL_CTL_DEL, 4, 0, 0, 0], &mut f);
+        assert!(matches!(a, Answer::Reply(0, STATUS_OK)), "del: {:?}", a);
+        let a = answer_event(LINUX_EPOLL_CTL,
+                             &[3, EPOLL_CTL_DEL, 4, 0, 0, 0], &mut f);
+        assert!(matches!(a, Answer::Reply(0, x)
+                         if x == cap_of(Errno::ENoent)),
+                "second del: {:?}", a);
+        /* shape refusals: an unknown create flag, a non-epoll epfd, a
+         * descriptor with no slot, an unknown op. */
+        let a = answer_event(LINUX_EPOLL_CREATE1, &[0x2, 0, 0, 0, 0, 0], &mut f);
+        assert!(matches!(a, Answer::Reply(0, E_INVAL)), "create flag: {:?}", a);
+        let a = answer_event(LINUX_EPOLL_CTL,
+                             &[0, EPOLL_CTL_ADD, 4, 1, 0, 0], &mut f);
+        assert!(matches!(a, Answer::Reply(0, E_INVAL)), "console epfd: {:?}", a);
+        let a = answer_event(LINUX_EPOLL_PWAIT, &[15, 0x9000, 128, 0, 0, 0], &mut f);
+        assert!(matches!(a, Answer::Reply(0, E_BADF)), "no slot: {:?}", a);
+        let a = answer_event(LINUX_EPOLL_CTL, &[3, 9, 4, 0, 0, 0], &mut f);
+        assert!(matches!(a, Answer::Reply(0, E_INVAL)), "op: {:?}", a);
     }
 
     #[test]
@@ -3854,6 +4720,42 @@ mod tests {
     }
 
     #[test]
+    fn mprotect_validates_shape_and_refuses_wx_without_moving_cursors() {
+        let mut b = span();
+        b.cur = SPAN_BASE + 0x2000;
+        let before = (b.cur, b.mtop);
+        /* shape ladder: unaligned, zero, overflow, unknown prot */
+        for args in [
+            [SPAN_BASE + 1, 0x1000, 0, 0, 0, 0],
+            [SPAN_BASE, 0, 0, 0, 0, 0],
+            [SPAN_BASE, u64::MAX, 0, 0, 0, 0],
+            [SPAN_BASE, 0x1000, 8, 0, 0, 0],
+        ] {
+            let a = answer(10, &args, &fds(), &mut b, &mut fresh(), &[]);
+            assert!(matches!(a, Answer::Reply(0, E_INVAL)),
+                    "malformed mprotect {:?}: {:?}", args, a);
+        }
+        /* W|X is the policy half this side owns; the kernel's first trap
+         * answers the same number before the request can be posted. */
+        for prot in [6u64, 7] {
+            let a = answer(10, &[SPAN_BASE, 0x1000, prot, 0, 0, 0],
+                           &fds(), &mut b, &mut fresh(), &[]);
+            assert!(matches!(a, Answer::Reply(0, E_PERM)),
+                    "W|X prot {}: {:?}", prot, a);
+        }
+        /* every legal protection word is a grant here; the kernel then
+         * decides whether the pages exist and applies the soft leaf. */
+        for prot in [0u64, 1, 2, 3, 4, 5] {
+            let a = answer(10, &[SPAN_BASE, 0x1000, prot, 0, 0, 0],
+                           &fds(), &mut b, &mut fresh(), &[]);
+            assert!(matches!(a, Answer::Reply(0, STATUS_OK)),
+                    "legal prot {}: {:?}", prot, a);
+        }
+        assert_eq!((b.cur, b.mtop), before,
+                   "mprotect moves neither the break nor the map cursor");
+    }
+
+    #[test]
     fn munmap_frees_only_the_span_above_the_break_without_rewinding_the_cursor() {
         let mut b = span();
         b.cur = SPAN_BASE + 0x2000;
@@ -3908,6 +4810,36 @@ mod tests {
         let mut buf = [0u8; 4];
         let n = hex_into(&mut buf, 0, 0xdeadbeefcafe);
         assert_eq!(n, 4, "clamped to the buffer like dec_into");
+    }
+
+    #[test]
+    fn mmap_grant_line_pins_len_and_prot() {
+        let mut buf = [0u8; 96];
+        let n = fmt_mmap_grant_line(&mut buf, 0x0000_4000_000e_8000, 12288, 3);
+        assert_eq!(&buf[..n],
+                   b" ok mmap -> 0x00004000000e8000 len=12288 prot=3\n",
+                   "the guard line carries the three-page RW request shape");
+
+        let mut buf = [0u8; 96];
+        let n = fmt_mmap_grant_line(&mut buf, 0x1234, 0x2000, 1);
+        assert_eq!(&buf[..n],
+                   b" ok mmap -> 0x0000000000001234 len=8192 prot=1\n",
+                   "len and prot are the request's words, not constants");
+    }
+
+    #[test]
+    fn mmap_refusal_line_pins_len_prot_and_flags() {
+        let mut buf = [0u8; 56];
+        let n = fmt_mmap_refusal_line(&mut buf, E_INVAL, 8192, 6, 0x22);
+        assert_eq!(&buf[..n],
+                   b" -> EINVAL mmap(len=8192, prot=6, flags=34)",
+                   "the refusal line carries the request's len, prot and flags");
+
+        let mut buf = [0u8; 56];
+        let n = fmt_mmap_refusal_line(&mut buf, E_NOSYS, 4096, 5, 0x62);
+        assert_eq!(&buf[..n],
+                   b" -> ENOSYS mmap(len=4096, prot=5, flags=98)",
+                   "the ENOSYS refusal carries the same request words");
     }
 
     /* ─── E7 step 4 (the file class): the pure half, measured ──────────
@@ -3980,6 +4912,32 @@ mod tests {
     }
 
     #[test]
+    fn sigaltstack_query_reports_disabled_and_install_is_a_noop() {
+        let mut b = span();
+        /* Query: SS_DISABLE at stack_t + 8, so Rust std's make_handler
+         * proceeds into its guard-page mmap+mprotect instead of returning
+         * on an empty/zero old stack. */
+        let a = answer(LINUX_SIGALTSTACK, &[0, 0x5000, 0, 0, 0, 0],
+                       &fds(), &mut b, &mut fresh(), &[]);
+        match a {
+            Answer::ReplyBytes(0, len, bytes) => {
+                assert_eq!(len, STACK_T_BYTES);
+                assert_eq!(u16::from_le_bytes([bytes[8], bytes[9]]),
+                           SS_DISABLE);
+                assert_eq!(&bytes[..8], &[0u8; 8]);
+                assert_eq!(&bytes[10..STACK_T_BYTES], &[0u8; 14]);
+            }
+            other => panic!("sigaltstack query: {:?}", other),
+        }
+        /* Install: accepted as a no-op (no signal frames exist), which is
+         * the answer that lets the caller continue. */
+        let a = answer(LINUX_SIGALTSTACK, &[0x7000, 0, 0, 0, 0, 0],
+                       &fds(), &mut b, &mut fresh(), &[]);
+        assert!(matches!(a, Answer::Reply(0, STATUS_OK)),
+                "sigaltstack install: {:?}", a);
+    }
+
+    #[test]
     fn payload_bound_derives_each_numbers_own_clamp() {
         /* The sig class: exactly its struct, and only when an
          * out-pointer was passed (the kernel's plan staged only then). */
@@ -4012,6 +4970,17 @@ mod tests {
         assert!(payload_bound(LINUX_POLL, &pa, 24));
         assert!(!payload_bound(LINUX_POLL, &pa, 23));
         assert!(!payload_bound(LINUX_POLL, &[0, 0, 5000, 0, 0, 0], 0));
+        /* sigaltstack's query owes exactly one stack_t. */
+        assert!(payload_bound(LINUX_SIGALTSTACK,
+                              &[0, 0x5000, 0, 0, 0, 0], STACK_T_BYTES));
+        assert!(!payload_bound(LINUX_SIGALTSTACK,
+                               &[0, 0x5000, 0, 0, 0, 0], STACK_T_BYTES - 1));
+        assert!(payload_bound(LINUX_SIGALTSTACK,
+                              &[0, 0, 0, 0, 0, 0], 0));
+        assert!(!payload_bound(LINUX_SIGALTSTACK,
+                               &[0, 0, 0, 0, 0, 0], 1));
+        assert!(!payload_bound(LINUX_SIGALTSTACK,
+                               &[0, 0, 0, 0, 0, 0], STACK_T_BYTES));
         /* a number that owes no payload is total-false. */
         assert!(!payload_bound(231, &[0, 0, 0, 0, 0, 0], 0));
     }

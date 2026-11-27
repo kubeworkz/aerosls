@@ -4,6 +4,10 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "scheduler.h"   /* struct TaskContext */
+#include "linux_abi.h"   /* E7 increment 31: struct LinuxFaultAct, the four
+                          * fault signals' acts the #PF path decides from.
+                          * linux_abi.h is stdint/stddef-only, so this adds
+                          * no dependency cycle. */
 
 /* Phase 5 wait park: the maximum number of channel endpoints one
  * k_chan_wait may poll/park on. cap.h defines the same constant, but it
@@ -126,7 +130,18 @@ struct CapParkCtx {
      * by the resume asm's 72(%1)…112(%1) reads and the cap_create host
      * test's offsetof checks. */
     uint64_t linux_args[6];
+    /* E7 increment 29: the value the resumed sysret leaves in RAX. A signal
+     * delivery enters a handler with 0 (nothing was returned); an
+     * rt_sigreturn restores the interrupted RAX from the frame, because
+     * the returning syscall must give its caller the value it had. */
+    uint64_t rax;
 };
+/* E7 increment 28: the bridge in linux_abi.c reads and installs exactly
+ * these 15 words; a field added above that moved one of them would be a
+ * handler entered with the wrong rsp, so the size is asserted where the
+ * layout is defined. */
+_Static_assert(sizeof(struct CapParkCtx) == 128u,
+               "CapParkCtx is the 15-word park context the signal bridge (linux_abi.c) reads by offset");
 
 struct ProcessDescriptor {
     uint32_t   pid;
@@ -154,50 +169,14 @@ struct ProcessDescriptor {
     uint8_t    fs_stage_valid;         // 1 between that forward's arming and its
                                        // reply (or refusal) — cleared here, at the
                                        // apply, and at every non-SET forward.
-    uint64_t   linux_heap_base;        // E7 increment 6 (§5.4): the budget span a
-                                       // LINUX task's brk bump pointer lives in —
-                                       // stamped inside the create from the
-                                       // manifest's BUDGET record (mem_bytes,
-                                       // page-rounded, directly above the child's
-                                       // stack), zeroed at slot reuse beside
-                                       // personality. The kernel maps granted
-                                       // pages into this span with partition-
-                                       // charged frames at the reply; the
-                                       // sidecar's ledger (user/sidecar/src/
-                                       // linux.rs's MemBrk) is the policy twin of
-                                       // these three numbers, and the probe's
-                                       // denial-echo check is what proves the two
-                                       // halves never drift.
-    uint64_t   linux_heap_limit;       // base + round_up_4k(mem_bytes)
-    uint64_t   linux_brk_cur;          // the break THIS side has mapped to — the
-                                       // mechanism's truth about which pages are
-                                       // backed, consulted by the verdict at
-                                       // every brk reply
-    uint64_t   linux_mmap_top;         // E7 increment 16 (§5.4): the anonymous-map
-                                       // cursor — born at the span's limit,
-                                       // descending by every granted non-FIXED
-                                       // mmap, stamped beside the heap numbers at
-                                       // the create and zeroed at slot reuse
-                                       // beside them. The MemBrk ledger's mtop is
-                                       // the policy twin; both ends re-check the
-                                       // other's grants (brk's ceiling is
-                                       // min(limit, mtop)) so a map can never
-                                       // overwrite a frame either side already
-                                       // handed out.
-    uint64_t   linux_image_lo;         // E7 increment 20: the ET_EXEC image's
-                                       // own page span, [lo, hi) — the PT_LOAD
-                                       // extent elf64_map_blob actually mapped
-                                       // (page-rounded outward), stamped at
-                                       // the create and zeroed at slot reuse.
-                                       // A linked static image sits at 0x400000
-                                       // inside the child's shared identity
-                                       // map, so the checkpoint's page walk
-                                       // cannot use the image window alone to
-                                       // say which pages carry the image; this
-                                       // is the range that can. A flat image
-                                       // leaves it 0 (its pages are the image
-                                       // window, which the walk knows).
-    uint64_t   linux_image_hi;
+    /* E7 TG-1 I1: a Linux task's shared span — heap base/limit, brk,
+     * mmap top, image range and getdents64 cursor — belongs to its
+     * LinuxThreadGroup, not to this descriptor (kernel/linux_thread.h). The
+     * create stamps the group and every read/write goes through
+     * linux_group_*(), so a second thread of the group cannot fork a cursor
+     * or an address space by being scheduled. The fields that remain here
+     * are the thread's IDENTITY: tid/tgid (below, beside personality),
+     * group_index, is_group_leader, and sysret_result. */
     // ── Q2: the gate stack's high-water measurement ──────────────────────
     // The gate profile poisons the unused span below the entry %rsp at
     // create and scans it at the stop and at teardown. These four fields
@@ -257,14 +236,6 @@ struct ProcessDescriptor {
                                        // addrlen, recvfrom's sockaddr_in
     uint32_t   reply_stage_len2;       // bytes for va2 (4 or 16; 0 = none)
     uint64_t   reply_stage_va3;        // M1: recvfrom's addrlen destination
-    uint64_t   linux_dir_pos;          // step 4's getdents64 cursor: the ENTRY
-                                       // INDEX the next call starts at, advanced
-                                       // by the deliver only by records actually
-                                       // packed (a short getdents is POSIX-legal;
-                                       // the caller loops). Reset when this task
-                                       // opens a new path (one listing at a time
-                                       // — named v1 boundary) and at slot reuse.
-                                       // SLS and non-Linux tasks never read it.
     uint64_t   user_rip;              // entry point in user space
     uint64_t   user_rsp;              // current user-space stack pointer
     uint64_t   user_stack_vaddr;      // vaddr base of the 8-page user stack
@@ -295,6 +266,21 @@ struct ProcessDescriptor {
                                        // (0 = spawned from kernel context).
     uint32_t   partition_id;          // Phase 9 (LPAR): partition_get_for_uid(owner_uid)
                                        // at spawn time — see partition.h
+    uint32_t   tid;                   // E7 TG-1 I1: gettid(), == pid. Stamped by
+                                       // linux_group_create() and cleared with
+                                       // the identity at teardown.
+    uint32_t   tgid;                  // getpid(): the group's leader pid
+    uint32_t   group_index;           // index into linux_group_table[], or
+                                       // LINUX_GROUP_NONE (0xFFFFFFFF) for an
+                                       // SLS task / a cleared slot
+    uint8_t    is_group_leader;       // 1 for the descriptor that created the group
+    uint16_t   thread_index;           // TG-2a: stable group-relative index; leader 0
+    uint8_t    _group_pad[5];
+    uint64_t   sysret_result;         // E7 TG-1 I3: the value a resume writes to
+                                       // rax (futex wake 0 / timeout -ETIMEDOUT);
+                                       // 0 for every other sysret. Declared here in
+                                       // I1 so every spawn/clear site owns it from
+                                       // the start.
     uint32_t   personality;           // E7 (Linux ABI Shim Design §3.3): what this
                                        // task's rax MEANS at the trap —
                                        // PROC_PERSONALITY_SLS (0, default) or
@@ -334,6 +320,62 @@ struct ProcessDescriptor {
     // its [gs:0x50..0x80) capture (E7 increment 13 — the register round
     // trip both resume paths re-stamp before the sysret).
     struct CapParkCtx park_ctx;
+    /* E7 increment 28: the signal state a delivery leaves behind. The mask
+     * the handler runs under (the kernel's copy of what the frame carries —
+     * the sidecar's SigState stays the authority and the two are written
+     * from one decision, clause P9), whether a handler is currently entered
+     * (so rt_sigreturn's row, when the census allows it, has something
+     * coherent to restore), and the fault address a SIGSEGV delivery names
+     * (0 until the page-fault path records it — the one gap this increment
+     * leaves open by name). */
+    uint64_t   linux_sig_mask;
+    uint8_t    linux_sig_active;
+    /* E7 increment 32: the rsp the CURRENT handler was entered with — which
+     * is the frame's own address, so rt_sigreturn knows where to read.
+     * The tkill path could get this back from park_ctx.user_rsp (its
+     * delivery installs the entry there), but a FAULT-delivered handler
+     * never passes through park_ctx: its frame address is only ever known
+     * at the trap, so it is recorded once, by whichever delivery built the
+     * frame, and read by the return. A return that guessed at park_ctx
+     * would read whatever the task's last park left there. */
+    uint64_t   linux_sig_frame_rsp;
+    /* 1 iff the ACTIVE frame was entered from the trap path. The sidecar
+     * never saw that delivery, so its own bookkeeping has no
+     * handler_active for it and its rt_sigreturn answers EINVAL by an
+     * honest rule that is wrong only here — the kernel, which holds the
+     * frame and never moved the sidecar's mask, is the authority for this
+     * one return. See linux_sig_fault_return_ok(). */
+    uint8_t    linux_sig_fault_active;
+    /* E7 increment 34: the mask a trap handler's unmask moved to, while the
+     * REVEAL half of that call is out on the wire. The kernel answers the
+     * arithmetic itself (increment 33) but the pending set and the
+     * dispositions are the sidecar's, so an unmask that frees a blocked bit
+     * forwards a tagged probe — and commits the mask only when the sidecar
+     * consents, exactly like every other staged forward. Cleared at the head
+     * of every forward beside the other stages, consumed (or dropped) at the
+     * reply, so no stage can outlive the call that armed it. */
+    uint8_t    linux_sig_mask_stage_valid;
+    uint8_t    linux_sig_mask_stage_probe;  /* 1 = the tagged reveal probe */
+    uint64_t   linux_sig_mask_stage_old;   /* the mask the oldset reports */
+    uint64_t   linux_sig_mask_stage_new;   /* what the call moves to       */
+    uint64_t   linux_sig_mask_stage_dst;   /* the child's oldset pointer   */
+    uint64_t   linux_cr2;
+    /* E7 increment 31: the KERNEL's own copy of the four fault signals'
+     * actions, recorded from the bytes the guest installs at rt_sigaction's
+     * first trap (syscall_dispatch). A ring-3 #PF has no syscall behind it,
+     * so the sidecar cannot be asked which handler to run; this is the copy
+     * the fault path decides from. Reset with the rest of the slot state, so
+     * a reused descriptor never delivers through its predecessor's handler. */
+    struct LinuxFaultAct linux_fault_act[LINUX_FAULT_SIG_COUNT];
+    /* E7 TG-1 I5: the thread-exit glue's two words, both per THREAD (Linux's
+     * clear_child_tid and robust_list are thread state, not group state).
+     * `linux_clear_tid` is set by clone's CLONE_CHILD_CLEARTID or by
+     * set_tid_address (218) and cleared by the exit glue; `linux_robust_list`
+     * is set_robust_list's (273) head and takes the same path. Both are
+     * re-stamped rather than inherited: proc_clear_resume_state() zeroes them
+     * so a reused slot never writes its predecessor's word or walks its list. */
+    uint64_t   linux_clear_tid;
+    uint64_t   linux_robust_list;
     uint64_t   park_req;              // the request pointer the resume re-runs
                                        // (SLSCapRecvRequest for a recv park,
                                        // SLSChanWaitRequest for a chan-wait park).
@@ -583,6 +625,23 @@ int  cap_wait_chans(const uint32_t* chan_ids, uint32_t n, void* req,
 void cap_wake_chan(uint32_t chan_id);
 void cap_recv_resume(struct ProcessDescriptor* pd);   /* noreturn */
 
+/* E7 increment 28 (P1-C's wire-up): the reply arm that runs a handler, and
+ * the resume that enters it. `linux_sig_reply_apply` returns 0 only by
+ * never returning — a successful delivery resumes the task INTO the handler
+ * (cap_resume_linux_sig), which is precisely why a handler's syscall never
+ * gives its caller a return value. A refusal (-EINVAL / -EFAULT) returns
+ * normally and mutates nothing. Declared here, after the descriptor is
+ * complete: a `struct ProcessDescriptor*` in a prototype seen before the
+ * struct exists is a prototype-scoped type, which is a conflicting-types
+ * error the moment the definition is read. */
+int  linux_sig_reply_apply(struct ProcessDescriptor* pd, const uint8_t* pay,
+                          uint32_t n);
+void cap_resume_linux_sig(struct ProcessDescriptor* pd);   /* noreturn */
+/* E7 increment 29: rt_sigreturn. Reads the frame at the handler's own rsp
+ * through the validated copy, restores the interrupted context and the
+ * pre-handler mask, and resumes there. Never returns on success. */
+int  linux_sig_return_apply(struct ProcessDescriptor* pd);
+
 // Seed Kernel Phase 1.5 (immediate wake): strong override of cap.c's weak
 // hook, called by cap_send() right after cap_wake_chan(). If the wake
 // parked-process is stashed in cur->handoff_target, the sender yields the
@@ -680,6 +739,47 @@ uint32_t program_spawn(const char* object_name, uint32_t owner_uid);
 // Kernel-side exit handler: restores kernel context saved by kernel_enter_ring3.
 void process_exit(uint32_t exit_code);
 
+/* E7 TG-1 I2: Linux exit(60) — release ONE thread. Frees only this thread's
+ * syscall stack and descriptor identity; the group's address space, cap table
+ * and sidecar row stay while siblings live. The last thread destroys the
+ * group once. Never returns: it switches to the next runnable descriptor (or
+ * halts when the table has none). */
+/* E7 TG-1 I5: the thread's own exit does what Linux's does before it
+ * disappears — clear its clear_child_tid word (and wake a joiner), then walk
+ * its robust list leaving FUTEX_OWNER_DIED|tid on every word it owns (and
+ * wake each one's waiter). Both halves go through the validated user copies,
+ * so a word the task unmapped is a line on the console, never a ring-0 fault.
+ * Called once, at the top of linux_thread_exit, while the group's page table
+ * is still alive. */
+void linux_thread_exit_glue(struct ProcessDescriptor* pd);
+
+__attribute__((noreturn)) void linux_thread_exit(struct ProcessDescriptor* pd,
+                                                 uint32_t exit_code);
+
+/* ─── E7 TG-1 I3: futex wait/wake ─────────────────────────────────────────
+ * The table itself is kernel/linux_futex.h (pure, host-tested). These are the
+ * descriptor-side halves: linux_futex_block parks the CALLING thread (never
+ * returns once it parks; returns -EAGAIN/-ENOMEM only when it did not),
+ * linux_futex_wake_threads resumes up to count waiters of one (group,
+ * address) key and answers how many actually resumed, and the deadline tick
+ * (timer ISR, BSP, before schedule_ring3) expires relative-timeout waiters
+ * with -ETIMEDOUT. */
+int  linux_futex_block(struct ProcessDescriptor* cur, uint32_t group_id,
+                       uint64_t uaddr, uint64_t deadline);
+int  linux_futex_wake_threads(uint32_t group_id, uint64_t uaddr,
+                              uint32_t count);
+void linux_futex_deadline_tick(void);
+
+/* ─── E7 TG-1 I4: the group forward lease ─────────────────────────────────
+ * A sibling that finds the group's one forward in flight parks here with its
+ * syscall number; it never posts, so nothing is owed. Returns -EAGAIN only
+ * when no park was possible (no runnable descriptor). The owner calls
+ * linux_forward_lease_release after its reply is applied (or its post is
+ * refused, or it exits); the release grants the lease to the lowest valid
+ * waiter and restarts that waiter's syscall at its `syscall` instruction. */
+int  linux_forward_lease_wait(struct ProcessDescriptor* cur, uint32_t num);
+void linux_forward_lease_release(struct ProcessDescriptor* cur);
+
 // Phase 7: find the Ring-3 process currently executing, for callers that
 // need to know "who is asking" (e.g. simi_runtime.c's authority-checked
 // RESOLVE). Mirrors schedule_ring3()'s own scan for the running process
@@ -714,6 +814,18 @@ int proc_gate_stop_at_sysret(uint64_t ret);
  * 1 if a capture was read, 0 if called from a context with no per-CPU
  * syscall scratch (pure kernel context). */
 int proc_read_linux_args(uint64_t out[6]);
+
+/* E7 TG-1 I2: the caller's user return RIP, from the syscall entry's rcx
+ * scratch ([gs:0x18]). clone's child starts at the instruction after the
+ * parent's syscall, so this is its first ring-3 rip. Returns 1 mid-syscall,
+ * 0 in pure kernel context. */
+int proc_read_linux_return_rip(uint64_t* out);
+
+/* E7 increment 35: the user RSP the current syscall was made with ([gs:0],
+ * stored at syscall entry). The abandoned-frame check needs it — where the
+ * task's stack is NOW is what says whether it is still inside the frame its
+ * handler was entered for. 0 in pure kernel context. */
+uint64_t proc_read_user_rsp(void);
 
 uint32_t sys_sls_getppid(void);
 uint32_t sys_sls_yield(void);   /* SYS_SLS_YIELD (300) — Phase 1.5 immediate-wake handback */

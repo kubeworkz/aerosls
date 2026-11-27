@@ -129,6 +129,8 @@ int main(void)
         {  12, LSC_MEM,   "brk" },
         {  13, LSC_SIG,   "rt_sigaction" },
         {  14, LSC_SIG,   "rt_sigprocmask" },
+        {  15, LSC_SIG,   "rt_sigreturn" },
+        {  39, LSC_TASK,  "getpid" },
         {  41, LSC_NET,   "socket" },
         {  42, LSC_NET,   "connect" },
         {  43, LSC_NET,   "accept" },
@@ -137,7 +139,9 @@ int main(void)
         {  48, LSC_NET,   "shutdown" },
         {  49, LSC_NET,   "bind" },
         {  50, LSC_NET,   "listen" },
+        {  56, LSC_THREAD,"clone" },
         {  59, LSC_SPAWN, "execve" },
+        {  60, LSC_TASK,  "exit" },
         {  72, LSC_FD,    "fcntl" },
         {  74, LSC_FD,    "fsync" },
         {  77, LSC_FD,    "ftruncate" },
@@ -146,10 +150,19 @@ int main(void)
         {  87, LSC_FD,    "unlink" },
         { 131, LSC_SIG,   "sigaltstack" },
         { 158, LSC_MSR,   "arch_prctl" },
+        { 186, LSC_TASK,  "gettid" },
+        { 202, LSC_FUTEX, "futex" },
         { 217, LSC_FD,    "getdents64" },
         { 218, LSC_LOCAL, "set_tid_address" },
         { 228, LSC_LOCAL, "clock_gettime" },
         { 231, LSC_EXIT,  "exit_group" },
+        /* The Go gate's netpoll startup rows (TG-0, tools/go_thread_gate_census.txt). */
+        { 233, LSC_FD,    "epoll_ctl" },
+        { 257, LSC_FD,    "openat" },
+        { 273, LSC_THREAD,"set_robust_list" },
+        { 281, LSC_FD,    "epoll_pwait" },
+        { 290, LSC_FD,    "eventfd2" },
+        { 291, LSC_FD,    "epoll_create1" },
     };
     size_t i;
     for (i = 0; i < sizeof(want) / sizeof(want[0]); i++) {
@@ -198,7 +211,7 @@ int main(void)
         CHECK(strcmp(linux_syscall_class_name(LSC_UNKNOWN), "unknown") == 0,
               "LSC_UNKNOWN's name is \"unknown\" (the refusal line's wording)");
         CHECK(linux_syscall_table_len == sizeof(want) / sizeof(want[0]),
-              "the table's length equals the census's 27 rows plus M1's eight network numbers");
+              "the table's length equals the checked rows (27 census numbers + the 4 Go-gate epoll/eventfd rows + clone + the three I2 task rows + I3's futex row + I4's openat row + increment 29's rt_sigreturn + I5's set_robust_list row + M1's eight network rows");
     }
 
     printf("linux_syscall_table_host_test: %d passed, %d failed\n",

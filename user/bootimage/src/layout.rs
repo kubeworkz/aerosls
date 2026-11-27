@@ -58,9 +58,11 @@ pub const INIT_HEAP_BYTES: u64 = 16 * 1024 * 1024;
 /// in `user/init/src/dm_manifest.rs`.
 pub const DM_HEAP_BYTES: u64 = 256 * 1024;
 
-/// The POSIX sidecar's budget heap — 4 MiB, enough for the VFS caches,
-/// process table, and applet scripts.
-pub const POSIX_HEAP_BYTES: u64 = 4 * 1024 * 1024;
+/// The POSIX sidecar's budget heap — 8 MiB. Four MiB covered the VFS caches,
+/// process table and applet scripts; the E7 live Go gate additionally stages
+/// its 2.3 MiB ELF at the budget tail, so the heap must leave that tail
+/// unclaimed (e7_go_gate subtracts GO_GATE_RESERVE from HEAP.init).
+pub const POSIX_HEAP_BYTES: u64 = 8 * 1024 * 1024;
 
 /// The ramdisk driver's budget heap — 256 KiB, same as the DM.
 pub const RAMDISK_HEAP_BYTES: u64 = 256 * 1024;

@@ -1,3 +1,4 @@
+#include "gdt.h"
 #include "idt.h"
 
 // ─── PIC remapping + masking ─────────────────────────────────────────────────
@@ -16,9 +17,14 @@ static void pic_remap_and_mask(void) {
 }
 
 // Define array space for all 256 interrupts
-__attribute__((aligned(0x10))) 
+__attribute__((aligned(0x1000)))
 static struct IDTEntry idt[256];
 static struct IDTPointer idt_ptr;
+
+void idt_page_info(uint64_t* phys, uint64_t* off) {
+    *phys = (uint64_t)&idt & ~0xFFFULL;
+    *off  = (uint64_t)&idt & 0xFFFULL;
+}
 
 // External reference to the assembly wrappers for the fault/IRQ handlers
 #include "isr_stubs.h"
@@ -35,7 +41,7 @@ void set_idt_gate(uint8_t vector, uint64_t isr_address, uint8_t attributes) {
 
 void init_idt(void) {
     idt_ptr.limit = (sizeof(struct IDTEntry) * 256) - 1;
-    idt_ptr.base  = (uint64_t)&idt;
+    idt_ptr.base  = kernel_tables_idt_va();
 
     // 0x8E: Present, Ring 0, 64-bit Interrupt Gate
     //

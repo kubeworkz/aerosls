@@ -546,7 +546,7 @@ int main(void) {
         feed_all(t, 0x60);
         env_replica_tick();
     }
-    CHECK(env_replica_count() == ENV_REPLICA_MAX, "D1: eight replicas fill the band");
+    CHECK(env_replica_count() == ENV_REPLICA_MAX, "D1: ENV_REPLICA_MAX replicas fill the directory");
     rec = mk_record(91, 0, 7, 800);
     CHECK(env_replica_recv_begin(((uint64_t)91 << 32) | 0, 91, 0, PAYLOAD_PAGES,
                                  &rec, sizeof rec, 2) ==

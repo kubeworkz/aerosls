@@ -430,11 +430,9 @@ source_clauses() {
     # correct code for exactly the reason its own comment above names:
     # the ceiling moves WITH the wiring, and here it moved late.
     #
-    # 329 = E7 increment 24's monotonic clock (SYS_SLS_NOW_NS): the define
-    # in syscall_dispatch.h and the case in syscall_dispatch.c are present
-    # (S10j-S10k assert the wiring, so this bump is not a decoration).
-    # Increment 24 landed 329 and left this ceiling at 328 — this guard then
-    # went red against correct code for exactly the reason above.
+    # 329 = E7 increment 24's monotonic clock (SYS_SLS_NOW_NS):
+    # syscall_dispatch.h's define, syscall_dispatch.c's case, and kabi's
+    # SYS_NOW_NS are present (S10j-S10l assert the wiring).
     local highest
     highest=$(grep -rhoE '#define SYS_SLS_[A-Z_]+ +[0-9]+' "$ROOT/kernel"/*.h "$ROOT/net"/*.h 2>/dev/null \
               | awk '{print $3}' | sort -n | tail -1)
@@ -457,9 +455,11 @@ source_clauses() {
     has "$ROOT/kernel/cap.c" "sys_sls_linux_spawn" || \
         bad "S10i. cap.c no longer implements sys_sls_linux_spawn — the dispatcher case above would route to nothing"
     has "$ROOT/kernel/syscall_dispatch.h" "#define SYS_SLS_NOW_NS 329" || \
-        bad "S10j. syscall_dispatch.h does not define SYS_SLS_NOW_NS as 329 — the ceiling above was raised for a number that is gone"
+        bad "S10j. syscall_dispatch.h does not define SYS_SLS_NOW_NS as 329 — the ceiling above names a number the kernel no longer publishes"
     has "$DISP" "case SYS_SLS_NOW_NS:" || \
-        bad "S10k. syscall_dispatch has no SYS_SLS_NOW_NS case — 329 would fall into default and the sidecar's timed poll would never see the clock (the ceiling's unwired-define drift)"
+        bad "S10k. syscall_dispatch has no SYS_SLS_NOW_NS case — 329 would fall into default and the sidecar's timed poll would have no clock"
+    has "$K" "const SYS_NOW_NS: u64 = 329;" || \
+        bad "S10l. kabi's SYS_NOW_NS is not 329 — the Rust side would call a different number than the kernel dispatches"
 
     # ── S11. the real kernel module, executed here ─────────────────────────
     local HT="$ROOT/tests/env_storage_host_test.c"

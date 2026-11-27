@@ -64,6 +64,17 @@ passed=0
 failed=0
 tooth() {   # tooth <name> <expected-clause> <dir>; the mutation has already run
     local name="$1" clause="$2" dir="$3" out rc
+    # VACUITY GUARD. A mutation whose pattern stopped matching would leave the
+    # copy pristine and this tooth would blame the guard for the miss. Prove
+    # the mutation landed before the guard is asked to react to it.
+    if [ ! -d "$W/_ref" ]; then
+        seed "$W/_ref" || { echo "ABORT: could not seed the reference tree" >&2; exit 2; }
+    fi
+    if diff -r "$W/_ref" "$dir" >/dev/null 2>&1; then
+        echo "FAIL: $name — mutation did not apply: the seeded copy is byte-identical to the reference, so the guard would run against pristine sources"
+        failed=$((failed + 1))
+        return
+    fi
     out="$(bash "$GUARD" "$dir" 2>&1)"; rc=$?
     if [ "$rc" -eq 1 ] && printf '%s\n' "$out" | grep -q "^FAIL: ${clause}\."; then
         echo "ok:   $name bites (guard exits 1 naming '$clause')"

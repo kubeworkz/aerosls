@@ -49,6 +49,7 @@
 
 #include "arch/x86/user_paging.h"
 #include "kernel/process.h"   /* PROC_MAX, struct ProcessDescriptor */
+#include "kernel/linux_thread.h"  /* E7 TG-1 I1: group substrate shims below */
 
 /* ─── Seed Kernel Phase 1.5: syscall-stack wiring ───────────────────────── */
 /* process.c writes per_cpu_data[0].kernel_rsp/user_rsp when it sets up a
@@ -71,6 +72,33 @@ __attribute__((weak)) int free_physical_ram_frame_for_partition(void* frame, uin
 __attribute__((weak)) uint32_t frame_pool_frame_owner(uint64_t frame_index) { (void)frame_index; return 0; }
 __attribute__((weak)) void cap_table_teardown(uint32_t pid) { (void)pid; }
 __attribute__((weak)) void user_destroy_page_table(uint64_t pml4_phys) { (void)pml4_phys; }
+
+/* ─── E7 TG-1 I1: the Linux group substrate ─────────────────────────────── */
+/* process.c and cap.c reference the group API, but a test that drives their
+ * non-Linux paths never creates a group. These shims keep those links whole
+ * and preserve the historical per-descriptor behavior: no group is ever
+ * found, so teardown takes the non-group branch. The kernel and the group
+ * host test link linux_thread.c's strong definitions. Weak, like every stub
+ * here, so a test may link the real substrate and override all of them. */
+__attribute__((weak)) void linux_groups_init(void) { }
+__attribute__((weak)) struct LinuxThreadGroup* linux_group_of(const struct ProcessDescriptor* pd) { (void)pd; return 0; }
+__attribute__((weak)) struct LinuxThreadGroup* linux_group_find(uint32_t id) { (void)id; return 0; }
+__attribute__((weak)) int linux_group_create(struct ProcessDescriptor* pd) { (void)pd; return 0; }
+__attribute__((weak)) void linux_group_stamp_memory(struct ProcessDescriptor* pd, uint64_t heap_base, uint64_t heap_limit, uint64_t image_lo, uint64_t image_hi) { (void)pd; (void)heap_base; (void)heap_limit; (void)image_lo; (void)image_hi; }
+__attribute__((weak)) int linux_group_add_thread(struct LinuxThreadGroup* g) { (void)g; return 0; }
+__attribute__((weak)) void linux_group_destroy(struct LinuxThreadGroup* g) { (void)g; }
+__attribute__((weak)) void linux_group_clear_identity(struct ProcessDescriptor* pd) { (void)pd; }
+__attribute__((weak)) uint64_t linux_group_heap_base(const struct ProcessDescriptor* pd) { (void)pd; return 0; }
+__attribute__((weak)) uint64_t linux_group_heap_limit(const struct ProcessDescriptor* pd) { (void)pd; return 0; }
+__attribute__((weak)) uint64_t linux_group_brk(const struct ProcessDescriptor* pd) { (void)pd; return 0; }
+__attribute__((weak)) void linux_group_set_brk(struct ProcessDescriptor* pd, uint64_t brk) { (void)pd; (void)brk; }
+__attribute__((weak)) uint64_t linux_group_mmap_top(const struct ProcessDescriptor* pd) { (void)pd; return 0; }
+__attribute__((weak)) void linux_group_set_mmap_top(struct ProcessDescriptor* pd, uint64_t top) { (void)pd; (void)top; }
+__attribute__((weak)) uint64_t linux_group_image_lo(const struct ProcessDescriptor* pd) { (void)pd; return 0; }
+__attribute__((weak)) uint64_t linux_group_image_hi(const struct ProcessDescriptor* pd) { (void)pd; return 0; }
+__attribute__((weak)) uint64_t linux_group_dir_pos(const struct ProcessDescriptor* pd) { (void)pd; return 0; }
+__attribute__((weak)) void linux_group_set_dir_pos(struct ProcessDescriptor* pd, uint64_t pos) { (void)pd; (void)pos; }
+__attribute__((weak)) void linux_group_add_dir_pos(struct ProcessDescriptor* pd, uint64_t add) { (void)pd; (void)add; }
 
 /* ─── POSIX-Environments E1: the unified-boot yield's asm half ──────────── */
 /* process.c references arch/x86/process_enter.asm's kernel_yield_switch() (the

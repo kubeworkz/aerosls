@@ -14,8 +14,8 @@
 # syscall, the partition-scoped sidecar registry (E2, so drv.ramdisk.1/.2
 # coexist with the system's drv.ramdisk.0), the tenant manifest profile (no
 # hardware/network caps), and the POSIX self-format path. A regression anywhere
-# there shows up as a missing/failed '[INIT] E3 ...' line or as the two tenants
-# colliding on one storage region. This smoke makes CI see it.
+# there shows up as a missing/failed '[E3-ENV] ...' serial line or as the two
+# tenants colliding on one storage region. This smoke makes CI see it.
 #
 # The core E3 property asserted here is ISOLATION BY CONSTRUCTION: the two
 # tenant environments are handed DISTINCT storage base addresses (independent
@@ -74,8 +74,11 @@ ISO="${E3_ISO:-sls_operating_system_e3.iso}"
 QEMU="${E3_QEMU:-qemu-system-x86_64}"   # overridable so the teeth can feed a
                                           # canned boot log without an ISO
 LOG=/tmp/aerosls_e3_multi_env.log
-WINDOW_S=120              # the tenant envs are spawned last (after the system
-                          # POSIX's network boot), so give the whole chain room
+WINDOW_S=300              # the tenant envs are spawned last (after the system
+                          # POSIX's network boot AND the E7 native probes that
+                          # now boot on this image), so give the whole chain
+                          # room; the poll below still exits as soon as the
+                          # gate opens, so a healthy boot pays nothing for it
 
 [ -f "$ISO" ] || { echo "ABORT: $ISO missing — build it with: make x86-iso-e3" >&2; exit 2; }
 command -v "${QEMU%% *}" >/dev/null 2>&1 || { echo "ABORT: ${QEMU%% *} not installed" >&2; exit 2; }
@@ -95,16 +98,16 @@ QPID=$!
 # '[POSIX] aero state=00000000' lines, i.e. the system POSIX plus BOTH tenants
 # have each brought up a live (formatted) rootfs.
 #
-# init's "tenant environments spawned" marker is REPORTED, not gating. It
-# travels init's sidecar-console path, which is the lossy one — the kernel
-# coalesces sidecar messages and demonstrably drops bytes (measured: that
-# marker is present in one boot and absent in the next, with every other line
-# of the same batch intact). Gating on it made the guard fail on a machine that
-# had reported the very property it asserts, and "the log does not show X" is
-# not evidence that X did not happen. The three live-rootfs lines are NOT
-# console-derived: each is a SYS_SLS_SERIAL_WRITE (165) straight to the UART,
-# per line, under the kernel TX lock, and kernel TX during a loopback window is
-# no longer discarded (deferred and replayed at release — kernel/kernel_io.c),
+# init's "tenant environments spawned" marker is REPORTED, not gating, and it
+# now rides the same drop-proof path as the storage evidence: init writes a
+# `[E3-ENV] done: ...` line with SYS_SLS_SERIAL_WRITE (165) beside the console
+# copy. The console copy is the lossy one — the kernel coalesces sidecar
+# messages and demonstrably drops bytes — so the check reads only the serial
+# marker. Gating on a console marker made the guard fail on a machine that had
+# reported the very property it asserts, and "the log does not show X" is not
+# evidence that X did not happen. The three live-rootfs lines are also
+# serial-derived, under the kernel TX lock; kernel TX during a loopback window
+# is no longer discarded (deferred and replayed at release — kernel/kernel_io.c),
 # so this evidence is drop-proof up to the kernel's ring bound. Past that bound
 # the log is a lower bound, not an absence, and this check says so by name
 # instead of reporting a `2/3` boot verdict (the evidence-integrity clause
@@ -112,7 +115,7 @@ QPID=$!
 #
 # The marker's absence is still stated in the verdict, because silently
 # tolerating it would hide a real init regression behind a shrug.
-done_marker="tenant environments spawned"
+done_marker="[E3-ENV] done: tenant environments spawned."
 live_re="\[POSIX\] aero state=00000000"
 marker_seen=0
 booted=0
@@ -197,22 +200,17 @@ fi
 # per-env "…spawned" lines init logs.
 
 # The core E3 property: the two tenants got DISTINCT storage base addresses
-# (independent k_alloc_region runs — their block devices cannot alias). Parse
-# the 'storage @ 0x...' address out of each env's region line.
-# Deliberately loose about the LABEL and strict about the FACT. Two shapes have
-# to survive: init's console output can lose a byte (the observed damage lands on
-# names, not addresses), AND it is coalesced — the kernel's console buffer
-# concatenates sidecar messages, so `E3 env 1: …` routinely sits at the END of a
-# long line that already carries another '0x' address (`[INIT] e1000 BAR0 @
-# 0xfeb80000 … [INIT] E3 env 1: drv.ramdisk.1 storage @ 0x1230e000`). Taking "the
-# first 0x on the line" silently reads the BAR instead of the region — measured,
-# and it made two genuinely distinct regions compare equal. So: anchor at
-# `E3 env N:` and take the first hex AFTER it, skipping nothing that could hide
-# another address (`[^@]*` cannot cross the storage address's own `@`).
-# A damaged ADDRESS digit still cannot pass silently -- see the alignment check
-# below, which a mis-parsed hex digit breaks in 15 cases out of 16.
+# (independent k_alloc_region runs — their block devices cannot alias).
+#
+# The address is read from `[E3-ENV] env N: ... storage @ 0x...`, which init
+# emits over SYS_SLS_SERIAL_WRITE (165), NOT the console channel. The console
+# path coalesces sidecar messages and can drop this line while both tenants
+# are healthy; the serial path is the same drop-proof one the tenants' own
+# `[POSIX] aero state=` lines use, so the check no longer depends on console
+# luck. The `[^@]*` anchor keeps the parse from taking the heap address that
+# follows in the same line.
 addr_of() {
-    grep -aoE "E3 env $1: [^@]*@ 0x[0-9a-fA-F]+" "$LOG" \
+    grep -aoE "E3-ENV\] env $1: [^@]*@ 0x[0-9a-fA-F]+" "$LOG" \
         | head -1 | grep -aoE "0x[0-9a-fA-F]+" | head -1
 }
 s1="$(addr_of 1)"
@@ -225,7 +223,7 @@ for a in "$s1" "$s2"; do
 done
 if [ -z "$s1" ] || [ -z "$s2" ]; then
     echo "FAIL  could not read both tenant storage addresses (env1='$s1' env2='$s2')" >&2
-    grep -aE "\[INIT\] E3 env [0-9]+: .* storage @" "$LOG" >&2
+    grep -aE "\[E3-ENV\] env [0-9]+: .* storage @" "$LOG" >&2
     fail=1
 elif [ "$align_ok" -eq 0 ]; then
     echo "FAIL  a tenant storage address is not page-aligned (env1='$s1' env2='$s2') — a damaged log line, not a boot failure" >&2
@@ -255,16 +253,16 @@ fi
 
 if [ "$fail" -ne 0 ]; then
     echo "FAIL  E3 multi-instance boot check failed" >&2
-    echo "      init E3 lines seen:" >&2
-    grep -aE "\[INIT\] E3" "$LOG" >&2
+    echo "      init E3 lines seen (serial evidence and console copy):" >&2
+    grep -aE "\[E3-ENV\]|\[INIT\] E3" "$LOG" >&2
     exit 1
 fi
 
 # Reported, never gating -- see the gate's own comment above.
 if [ "$marker_seen" -eq 1 ]; then
-    echo "ok:   init reported every tenant spawn attempt (E3 done-marker seen)"
+    echo "ok:   init reported every tenant spawn attempt (E3 done-marker seen on the serial path)"
 else
-    echo "note: init's E3 done-marker was not seen in this log (sidecar-console loss) —"
+    echo "note: init's E3 done-marker was not seen on the serial path —"
     echo "      not gating: the three live-rootfs lines above are the property itself"
 fi
 

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # tests/script_conventions_check.sh — every committed .sh must carry the
-# executable bit and a shebang; no committed text file may be stored CRLF.
+# executable bit and a shebang; no committed text file may be stored CRLF;
+# no tracked .sh may sit CRLF in the working tree.
 #
 # ─── Why this exists ───────────────────────────────────────────────────────
 # Every committed .sh was once 100644, so a Linux checkout got the runners
@@ -17,13 +18,22 @@
 #   2. shebang         — every committed .sh must start with `#!`;
 #   3. line endings    — no committed text blob may contain a CR byte
 #      (binary-marked files are skipped: a PNG or PDF legitimately has CR).
+#   4. worktree bytes  — no tracked .sh may be CRLF ON DISK. The index can
+#      be clean LF while the checkout is CRLF: with eol=lf, git status and
+#      git diff report nothing, so rule 3 sees nothing, and the file still
+#      fails at exec with "/usr/bin/env: 'bash\r': No such file". That is
+#      exactly how tests/env_catalog_live_check.sh passed this guard and
+#      then scored BAD (rc 127) in the live guard suite.
 #
-# It inspects the INDEX (git ls-files -s -z / git cat-file -p :<path> /
+# Rules 1-3 inspect the INDEX (git ls-files -s -z / git cat-file -p :<path> /
 # git grep --cached), not the working tree — on a Linux checkout the
 # `eol=lf` attribute would hide a CRLF blob by converting it on the way
 # out, and the executable bit is a property of the committed mode, not the
 # checked-out file. In CI the index is the checkout commit; locally it is
 # what you have staged, which catches a violation before it is committed.
+# Rule 4 is the deliberate exception: it reads the bytes actually on disk,
+# because a normalized index cannot show this violation. A path absent from
+# the worktree (sparse checkout) reports w/none and is skipped.
 # Git calls are batched (one ls-files, one grep, per-.sh cat-file only) so
 # the guard stays fast even on Windows where each spawn costs ~50 ms.
 #
@@ -86,6 +96,22 @@ while IFS= read -r path; do
     echo "FAIL  $path: committed blob is stored CRLF (repo convention: * text=auto eol=lf in .gitattributes)"
     fails=$((fails + 1))
 done < <(git grep --cached -l -F "$(printf '\r')" -- . ':(exclude)vendor' 2>/dev/null || true)
+
+# 4. worktree bytes — one `git ls-files --eol` reports both the index and
+# the checked-out eol per path. w/crlf is the stale-checkout state that
+# `git status` hides; w/mixed is the same hazard with a partly converted
+# file. The loop reads the actual disk bytes via git's own detector, so it
+# also works when the file has no extension-recognisable attribute.
+while IFS= read -r -d '' entry; do
+    meta="${entry%%$'\t'*}"
+    path="${entry#*$'\t'}"
+    case "$meta" in
+        *w/crlf*|*w/mixed*)
+            echo "FAIL  $path: working-tree file is CRLF (exec fails with \"/usr/bin/env: 'bash\\r'\"; re-checkout the file to apply eol=lf)"
+            fails=$((fails + 1))
+            ;;
+    esac
+done < <(git ls-files --eol -z -- '*.sh' ':(exclude)vendor' 2>/dev/null || true)
 
 echo "script_conventions_check: done, $fails violations"
 [ "$fails" -eq 0 ]

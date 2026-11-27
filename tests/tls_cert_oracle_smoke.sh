@@ -146,6 +146,10 @@ PY
 # negative cases are what make the positives mean anything: a test that only
 # ever asserts success cannot tell you it is capable of failing.
 openssl x509 -inform DER -in "$CRT" -out "$BUILD/crt.pem" 2>/dev/null
+# Judge at the oracle's clock, not the host's. The leaf is minted for
+# 2026-08-12 with a 90-day life, so a real-clock verify turns this positive
+# into "certificate has expired" at 2026-11-10T00:00:00Z -- a statement about
+# the wall clock, not about the SAN.
 name_ok=1
 for h in localhost; do
     openssl verify -attime "$ORACLE_NOW" -CAfile "$BUILD/ca.pem" -verify_hostname "$h" \
