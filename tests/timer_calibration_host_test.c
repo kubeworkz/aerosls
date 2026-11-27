@@ -34,7 +34,8 @@
  * Build and run:
  *   gcc -Wall -Wextra -std=c11 -D_GNU_SOURCE -I . -I kernel -I net -I arch/x86 \
  *       -o /tmp/timer_calibration_host_test \
- *       tests/timer_calibration_host_test.c
+ *       tests/timer_calibration_host_test.c \
+ *           tests/e7_group_stubs.c
  *   /tmp/timer_calibration_host_test
  */
 #include <stdio.h>

@@ -13,7 +13,8 @@
  *   gcc -no-pie -std=c11 -Wall -Wextra -I . -I kernel \
  *       -o /tmp/cap_trampoline_host_test \
  *       tests/cap_trampoline_host_test.c kernel/cap.c kernel/frame_pool.c \
- *           kernel/linux_abi.c kernel/elf64_load.c kernel/entropy.c kernel/sha256.c
+ *           kernel/linux_abi.c kernel/elf64_load.c kernel/entropy.c kernel/sha256.c \
+ *           tests/e7_group_stubs.c
  *   /tmp/cap_trampoline_host_test
  */
 #include "kernel/cap.h"

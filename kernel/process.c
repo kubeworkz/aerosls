@@ -2459,30 +2459,37 @@ static void proc_capture_entry_regs(struct CapParkCtx* ctx) {
         "movq %%gs:0x40, %6\n\t"
         "movq %%gs:0x48, %7\n\t"
         "movq %%gs:0, %8\n\t"
-        /* The argument half: read through ONE scratch register (rax),
-         * stored to memory outputs — 15 register outputs here would be
-         * impossible constraints at -O0 (a fixed rbp leaves 14 for 15),
-         * which is exactly how the three host tests that #include
-         * process.c caught the first attempt. */
+        /* The argument half: read through ONE scratch register (rax) and
+         * stored through ONE explicit pointer (%9) — 15 register outputs
+         * here would be impossible constraints at -O0 (a fixed rbp leaves 14
+         * for 15), which is exactly how the three host tests that #include
+         * process.c caught the first attempt. The stores go through the
+         * pointer rather than `=m` operands because at -O0 gcc formed the
+         * memory addresses from ctx in %rdx and %rcx, then reused those two
+         * registers for the captured values — the last two stores landed at
+         * (captured gs value + 0x60/0x68) and faulted. The outputs are
+         * early-clobber (`=&r`) so the pointer's register cannot be one of
+         * them: without it gcc took the input is read before any output is
+         * written, put the pointer in %rdx, and then loaded %gs:0x0 into that
+         * same %rdx — the stores went to (captured user RSP + offset) and
+         * faulted at address 0. */
         "movq %%gs:0x50, %%rax\n\t"
-        "movq %%rax, %9\n\t"
+        "movq %%rax, 0(%9)\n\t"
         "movq %%gs:0x58, %%rax\n\t"
-        "movq %%rax, %10\n\t"
+        "movq %%rax, 8(%9)\n\t"
         "movq %%gs:0x60, %%rax\n\t"
-        "movq %%rax, %11\n\t"
+        "movq %%rax, 16(%9)\n\t"
         "movq %%gs:0x68, %%rax\n\t"
-        "movq %%rax, %12\n\t"
+        "movq %%rax, 24(%9)\n\t"
         "movq %%gs:0x70, %%rax\n\t"
-        "movq %%rax, %13\n\t"
+        "movq %%rax, 32(%9)\n\t"
         "movq %%gs:0x78, %%rax\n\t"
-        "movq %%rax, %14\n\t"
-        : "=r"(ctx->r11), "=r"(ctx->rcx), "=r"(ctx->r15), "=r"(ctx->r14),
-          "=r"(ctx->r13), "=r"(ctx->r12), "=r"(ctx->rbx), "=r"(ctx->rbp),
-          "=r"(ctx->user_rsp), "=m"(ctx->linux_args[0]),
-          "=m"(ctx->linux_args[1]), "=m"(ctx->linux_args[2]),
-          "=m"(ctx->linux_args[3]), "=m"(ctx->linux_args[4]),
-          "=m"(ctx->linux_args[5])
-        : : "rax", "memory");
+        "movq %%rax, 40(%9)\n\t"
+        : "=&r"(ctx->r11), "=&r"(ctx->rcx), "=&r"(ctx->r15), "=&r"(ctx->r14),
+          "=&r"(ctx->r13), "=&r"(ctx->r12), "=&r"(ctx->rbx), "=&r"(ctx->rbp),
+          "=&r"(ctx->user_rsp)
+        : "r"(ctx->linux_args)
+        : "rax", "memory");
 }
 
 /* Shared park capture: snapshot the current process's syscall-entry

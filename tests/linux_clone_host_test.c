@@ -23,7 +23,8 @@
  * Build and run:
  *   gcc -std=c11 -Wall -Wextra -I . -I kernel \
  *       -o /tmp/linux_clone_host_test \
- *       tests/linux_clone_host_test.c kernel/linux_thread.c kernel/linux_abi.c
+ *       tests/linux_clone_host_test.c kernel/linux_thread.c kernel/linux_abi.c \
+ *           kernel/linux_futex.c
  *   /tmp/linux_clone_host_test
  *
  * The process-table teardown hooks are counted stubs; the integration half

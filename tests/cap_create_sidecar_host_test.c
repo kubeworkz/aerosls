@@ -123,7 +123,8 @@
  *       -o /tmp/cap_create_sidecar_host_test \
  *       tests/cap_create_sidecar_host_test.c kernel/cap.c kernel/chan.c \
  *           kernel/console_service.c kernel/env_console.c kernel/linux_abi.c \
- *           kernel/elf64_load.c kernel/linux_thread.c
+ *           kernel/elf64_load.c kernel/linux_thread.c \
+ *           tests/e7_group_stubs.c
  *   /tmp/cap_create_sidecar_host_test
  */
 #include "kernel/cap.h"
@@ -3732,9 +3733,13 @@ int main(void) {
     CHECK(offsetof(struct CapParkCtx, linux_args) + 5 * 8 == 112,
           "P1: the last preserved register (r9) lands at 112, exactly "
           "where the re-stamp's 112(%1) and [gs:0x78] say it does");
-    CHECK(sizeof(struct CapParkCtx) == 120,
-          "P1: the ctx is 15x8 bytes — the eight pushed values, the user "
-          "RSP, and the six argument registers, nothing unaccounted");
+    CHECK(offsetof(struct CapParkCtx, rax) == 120,
+          "P1: park_ctx.rax sits at 120 — E7 increment 29's resume value, "
+          "delivered as 0 into a handler and restored by rt_sigreturn");
+    CHECK(sizeof(struct CapParkCtx) == 128,
+          "P1: the ctx is 16x8 bytes — the eight pushed values, the user "
+          "RSP, the six argument registers, and the resume RAX, nothing "
+          "unaccounted");
 
     if (g_fail == 0) printf("\nALL PASS\n");
     else             printf("\n%d FAILURE(S)\n", g_fail);

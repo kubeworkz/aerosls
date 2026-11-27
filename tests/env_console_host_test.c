@@ -50,7 +50,8 @@
  *       -o /tmp/env_console_host_test \
  *       tests/env_console_host_test.c kernel/cap.c \
  *       kernel/env_console.c kernel/kernel_io.c kernel/console.c \
- *       kernel/linux_abi.c kernel/elf64_load.c kernel/entropy.c kernel/sha256.c
+ *       kernel/linux_abi.c kernel/elf64_load.c kernel/entropy.c kernel/sha256.c \
+ *           tests/e7_group_stubs.c
  *   /tmp/env_console_host_test
  */
 #include "kernel/cap.h"

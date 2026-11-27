@@ -30,14 +30,18 @@
  *   gcc -std=c11 -Wall -Wextra -ffunction-sections -fdata-sections \
  *       -Wl,--gc-sections -no-pie -I . -I kernel \
  *       -o /tmp/pid_tid_collision_host_test \
- *       tests/pid_tid_collision_host_test.c kernel/cap.c kernel/linux_thread.c
+ *       tests/pid_tid_collision_host_test.c kernel/cap.c kernel/linux_thread.c \
+ *           tests/e7_group_stubs.c
  *   /tmp/pid_tid_collision_host_test
  *
  * Exit: 0 pass, 1 failure.
  */
+#define _GNU_SOURCE   /* syscall(): ARCH_SET_GS for the %gs stand-in */
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
+#include <unistd.h>
+#include <sys/syscall.h>
 
 #include "kernel/process.h"
 #include "kernel/linux_thread.h"
@@ -96,8 +100,22 @@ static void plant(struct ProcessDescriptor* pd, uint32_t pid, uint64_t cr3) {
     pd->group_index = LINUX_GROUP_NONE;
 }
 
+/* linux_clone_thread() gives the child the parent's live register state, read
+ * from the syscall entry scratch at %gs:0x10..0x80 — on a boot the only source
+ * that cannot be clobbered by the -O2 call chain. A host process has no
+ * per-CPU block, so the first capture read address 0x10 and faulted at
+ * process.c:2452. Bind GS to a zeroed stand-in (ARCH_SET_GS), which is what a
+ * freshly entered syscall with zero registers would leave there; this test
+ * asserts the ids, not the inherited registers. */
+static uint8_t host_gs_block[0x88];
+
+
 int main(void) {
     printf("=== PID/TID collision and sidecar cap-table binding ===\n\n");
+
+    CHECK(syscall(SYS_arch_prctl, 0x1001 /* ARCH_SET_GS */, host_gs_block) == 0,
+          "the host binds %gs to a stand-in block: the clone's entry capture "
+          "reads real memory instead of faulting at 0x10");
 
     /* ── 1. A Linux clone cannot take a live process's PID ───────────────
      * The live PID 104 sits exactly on the next sequence value, which is
@@ -126,7 +144,7 @@ int main(void) {
 
         struct LinuxClonePlan plan;
         CHECK(linux_clone_plan(LINUX_CLONE_GO_FLAGS, 0x00007FFFF0000000ULL,
-                               0, 0, &plan) == 0,
+                               0, 0, parent->fs_base, &plan) == 0,
               "the clone plan accepts Go's shared-flag shape");
 
         uint32_t tid = 0;
@@ -166,6 +184,11 @@ int main(void) {
         thread->tid = 104;
         thread->active = 1;
         thread->group_index = leader->group_index;
+        /* E7's membership record: linux_group_of() trusts group_index only
+         * when the descriptor's tgid is that group's id, so a zeroed slot
+         * cannot alias group table 0. Without it this hand-planted duplicate
+         * is not a member and proc_group_cap_owner() returns 104. */
+        thread->tgid = leader->tgid;
         thread->is_group_leader = 0;
 
         CHECK(proc_group_cap_owner(104) == 107,
