@@ -17,11 +17,14 @@ use aerosls_proto::env_proto::{
     TASK_POSIX_SIDECAR, TASK_RAMDISK_SIDECAR,
 };
 use aerosls_proto::kabi::{
-    Kernel, ERR_NOMEM, ENV_STORAGE_ERR_IO, ENV_STORAGE_ERR_NOSLOT,
-    ENV_STORAGE_ERR_QUOTA,
+    Kernel, ERR_BUDGET, ERR_BUFSZ, ERR_NOMEM, ERR_NOTFOUND, ERR_PROTO, ERR_RANGE,
+    ERR_REVOKED, ERR_RIGHTS, ERR_SPACE, ERR_STATE, ERR_TARGET, ERR_TIMEOUT, ERR_TYPE,
+    ENV_STORAGE_ERR_IO, ENV_STORAGE_ERR_NOSLOT, ENV_STORAGE_ERR_QUOTA,
 };
 use alloc::vec::Vec;
 use core::fmt::Write;
+
+use crate::serial::serial_log;
 
 use crate::{posix_manifest, ramdisk_manifest};
 
@@ -75,17 +78,19 @@ pub struct Environment {
     pub posix_w: u32,
 }
 
-/// Format a sidecar name (`<prefix>.<index>`) into a small stack buffer —
-/// names are a short prefix plus a decimal index, so 32 bytes is ample and no
-/// heap allocation is needed for the identity.
+/// Format a sidecar name (`<prefix>.<index>`) — or a short log line — into a
+/// stack buffer. A name is a short prefix plus a decimal index, which fitted in
+/// 32 bytes; the create-refusal line below (partition, index, kernel code and
+/// its name) is the longest thing written through here, hence 192. No heap: a
+/// name must not need the bump allocator.
 struct NameBuf {
-    buf: [u8; 32],
+    buf: [u8; 192],
     len: usize,
 }
 
 impl NameBuf {
     fn new() -> NameBuf {
-        NameBuf { buf: [0; 32], len: 0 }
+        NameBuf { buf: [0; 192], len: 0 }
     }
     fn as_str(&self) -> &str {
         core::str::from_utf8(&self.buf[..self.len]).unwrap_or("")
@@ -102,6 +107,82 @@ impl Write for NameBuf {
         self.len += b.len();
         Ok(())
     }
+}
+
+/* The kernel's errno-style refusals (kernel/cap.h, `CAP_E*`). The CREATE path
+ * returns THESE — negative — not the positive `ERR_*`/`CAP_ERR_*` family, which
+ * is why the generic arm below reported a refused create as "unrecognised"
+ * until the negative family was named here too. Declared locally the way
+ * user/aerosls/src/req.rs and user/sidecar/src/linux.rs already declare the
+ * ones they need; kabi exports only the positive family. */
+const CAP_EINVAL: i32 = -1;
+const CAP_EBADF: i32 = -2;
+const CAP_EAGAIN: i32 = -3;
+const CAP_ETABLEFULL: i32 = -4;
+const CAP_ECAPREVOKED: i32 = -5;
+const CAP_EALREADY: i32 = -6;
+const CAP_ENOMEM: i32 = -7;
+const CAP_ENOSPC: i32 = -8;
+const CAP_ERANGE: i32 = -9;
+const CAP_ENOSYS: i32 = -10;
+const CAP_ECONFLICT: i32 = -11;
+const CAP_EPERM: i32 = -12;
+
+/// Name one kernel refusal. `create_sidecar_in` hands back the kernel's own
+/// code, and the ENV_CREATE reply below folds every unrecognised one into
+/// ENV_ERR_PART — "partition absent, paused, or placement refused" — which
+/// says a create was refused without saying why. The reply keeps that
+/// documented shape; this is what a reader (and a guard's log dump) can tell
+/// the reasons apart by.
+fn err_name(rc: i32) -> &'static str {
+    match rc {
+        CAP_EINVAL => "CAP_EINVAL: malformed request or manifest",
+        CAP_EBADF => "CAP_EBADF: no such channel or cap",
+        CAP_EAGAIN => "CAP_EAGAIN: would block",
+        CAP_ETABLEFULL => {
+            "CAP_ETABLEFULL: a table is full — cap slots, process slots or a \
+             registry that a destroy did not give back"
+        }
+        CAP_ECAPREVOKED => "CAP_ECAPREVOKED: the cap was revoked",
+        CAP_EALREADY => "CAP_EALREADY: already done",
+        CAP_ENOMEM => "CAP_ENOMEM: no memory for the image, stack or page tables",
+        CAP_ENOSPC => "CAP_ENOSPC: no space",
+        CAP_ERANGE => "CAP_ERANGE: a count or index is out of range",
+        CAP_ENOSYS => "CAP_ENOSYS: not supported",
+        CAP_ECONFLICT => "CAP_ECONFLICT: the name or identity already exists",
+        CAP_EPERM => "CAP_EPERM: the caller lacks sidecar authority (E2 gate)",
+        ERR_NOTFOUND => "not found: no such image, target, or name",
+        ERR_REVOKED => "revoked capability",
+        ERR_RIGHTS => "missing right",
+        ERR_RANGE => "out of range",
+        ERR_BUDGET => "over budget",
+        ERR_SPACE => "no space: the table or the frame pool is full",
+        ERR_TARGET => "bad target: partition absent, paused, or not the caller's",
+        ERR_STATE => "wrong state",
+        ERR_TYPE => "wrong cap type",
+        ERR_PROTO => "protocol",
+        ERR_NOMEM => "no memory",
+        ERR_BUFSZ => "buffer too small",
+        ERR_TIMEOUT => "timeout",
+        _ => "unrecognised kernel error",
+    }
+}
+
+/// Log a refused create with the kernel's own code, on the drop-proof serial
+/// wire. E5's recycle guard was reporting the generic reply without this, so
+/// the reason a cycle stopped was only recoverable by reading the kernel.
+fn log_create_refused(partition: u32, index: u32, rc: i32) {
+    use core::fmt::Write as _;
+    let mut w = NameBuf::new();
+    let _ = core::write!(
+        &mut w,
+        "[ENV] create refused: partition={} index={} kernel rc={} ({})\n",
+        partition,
+        index,
+        rc,
+        err_name(rc)
+    );
+    serial_log(w.as_str());
 }
 
 /// Create one POSIX environment identified by `index` **in `partition`**:
@@ -726,9 +807,36 @@ impl EnvManager {
                     // different answers to an operator (v0.2 §5).
                     Err(e) if e == ENV_ERR_QUOTA as i32 =>
                         self.reply(reply, ENV_CREATE, ENV_ERR_QUOTA, 0, partition),
+                    // The arms above match this module's OWN positive markers
+                    // (ERR_NOMEM 11, ENV_ERR_CAPACITY 8, ENV_ERR_QUOTA 7), which
+                    // create_environment() returns for its own refusals. A
+                    // refusal that comes from the KERNEL arrives instead as the
+                    // errno-style NEGATIVE CAP_E* family (kernel/cap.h), which
+                    // none of them matched — so a create that genuinely could
+                    // not be backed was answered "partition absent, paused, or
+                    // placement refused". These say what the kernel said: the
+                    // page tables, image or stack could not be backed
+                    // (CAP_ENOMEM, e.g. cap.c's `!new_cr3`), or a helper's frame
+                    // charge found no space (CAP_ENOSPC). Both keep the reply
+                    // codes' own words ("frame pool exhausted", "insufficient
+                    // frame capacity"), so nothing a guard reads changes meaning.
+                    Err(CAP_ENOMEM) => {
+                        self.reply(reply, ENV_CREATE, ENV_ERR_NOMEM, 0, partition)
+                    }
+                    Err(CAP_ENOSPC) => {
+                        self.reply(reply, ENV_CREATE, ENV_ERR_CAPACITY, 0, partition)
+                    }
                     // Any other kernel error is a refused placement: an absent or
-                    // paused partition, or a caller the E4 gate denied.
-                    Err(_) => self.reply(reply, ENV_CREATE, ENV_ERR_PART, 0, partition),
+                    // paused partition, a caller the E4 gate denied, or a table
+                    // the kernel could not extend (CAP_ETABLEFULL — the process
+                    // table, which is not this manager's environment table, so it
+                    // keeps ENV_ERR_PART rather than the misleading ENV_ERR_FULL).
+                    // Name the kernel's own code on the serial wire before
+                    // answering, so the reason is not lost.
+                    Err(e) => {
+                        log_create_refused(partition, index, e);
+                        self.reply(reply, ENV_CREATE, ENV_ERR_PART, 0, partition)
+                    }
                 }
             }
             ENV_DESTROY => {

@@ -40,6 +40,11 @@ pub mod net_manifest;
 #[cfg(feature = "target")]
 mod entry;
 
+/// The one copy of the serial-write syscall: compiled for every build (the
+/// target issues `SYS_SLS_SERIAL_WRITE`, a host build gets the no-op), so the
+/// modules that log do not each carry its register-clobber asm.
+mod serial;
+
 #[cfg(test)]
 pub mod sim;
 

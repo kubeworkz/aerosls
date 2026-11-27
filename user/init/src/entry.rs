@@ -20,6 +20,7 @@ use crate::heap::Bump;
 use crate::posix_manifest;
 use crate::ramdisk_manifest;
 use crate::net_manifest;
+use crate::serial::serial_log;
 use aerosls_proto::bootinfo::BootInfo;
 use aerosls_proto::kabi::{Kernel, RealKernel, SendCap, CAP_CHAN, CAP_CHAN_W, CAP_MEM, CAP_NONE};
 
@@ -163,43 +164,18 @@ macro_rules! log_fmt {
     }};
 }
 
-/// Send one line straight to the kernel serial log (SYS_SLS_SERIAL_WRITE,
-/// 165) instead of the console channel. E3's storage evidence rides this
-/// path because the console channel coalesces sidecar messages and can drop
-/// a line entirely; the kernel's serial TX lock (with loopback deferral) is
-/// the drop-proof one, and it is the same path the tenants' own
-/// `[POSIX] aero state=` lines use. The kernel handler is a strlen, so the
-/// buffer keeps an explicit NUL after the text.
-#[cfg(all(feature = "target", target_arch = "x86_64", target_os = "none"))]
-fn serial_log(msg: &str) {
-    let mut buf = [0u8; 256];
-    let n = msg.len().min(255);
-    buf[..n].copy_from_slice(&msg.as_bytes()[..n]);
-    unsafe {
-        core::arch::asm!(
-            "syscall",
-            inlateout("rax") 165u64 => _,
-            inlateout("rdi") buf.as_ptr() => _,
-            // The kernel's syscall path uses every caller-saved register and
-            // does not restore them; declare them all clobbered so the
-            // compiler cannot keep a stale value across this call.
-            lateout("rcx") _, lateout("r11") _, lateout("rsi") _,
-            lateout("rdx") _, lateout("r8") _, lateout("r9") _,
-            lateout("r10") _,
-            options(nostack),
-        );
-    }
-}
-
-#[cfg(not(all(feature = "target", target_arch = "x86_64", target_os = "none")))]
-fn serial_log(_msg: &str) {}
-
+/* `serial_log` (SYS_SLS_SERIAL_WRITE, 165) is imported from `crate::serial`,
+ * the one module that carries that asm for both builds. E3's storage evidence
+ * rides it because the console channel coalesces sidecar messages and can drop
+ * a line entirely, while the kernel's serial TX lock (with loopback deferral)
+ * is the drop-proof one — the same path the tenants' own `[POSIX] aero state=`
+ * lines use. */
 macro_rules! serial_log_fmt {
     ($fmt:literal $(, $arg:expr)* $(,)?) => {{
         use core::fmt::Write as _;
         let mut w = StackBuf::<256>::new();
         let _ = core::write!(&mut w, $fmt $(, $arg)*);
-        serial_log(w.as_str());
+        $crate::serial::serial_log(w.as_str());
     }};
 }
 
