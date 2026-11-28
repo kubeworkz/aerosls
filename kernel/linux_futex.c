@@ -148,7 +148,19 @@ int linux_futex_expire(uint64_t now, uint32_t* out_tids, uint32_t max) {
     for (uint32_t i = 0; i < LINUX_FUTEX_WAITERS && taken < max; i++) {
         if (!linux_futex_table[i].used) continue;
         if (linux_futex_table[i].deadline == 0) continue;   /* forever */
-        if (now < linux_futex_table[i].deadline) continue;
+        if (now < linux_futex_table[i].deadline) {
+            kernel_serial_printf(
+                "[E7] futex expire: now=%lu deadline=%lu tid=%u (not yet)\n",
+                (unsigned long)now,
+                (unsigned long)linux_futex_table[i].deadline,
+                linux_futex_table[i].tid);
+            continue;
+        }
+        kernel_serial_printf(
+            "[E7] futex expire: now=%lu deadline=%lu tid=%u EXPIRED\n",
+            (unsigned long)now,
+            (unsigned long)linux_futex_table[i].deadline,
+            linux_futex_table[i].tid);
         out_tids[taken++] = linux_futex_table[i].tid;
         linux_futex_table[i].used = 0;
         linux_futex_table[i].group_id = 0;
