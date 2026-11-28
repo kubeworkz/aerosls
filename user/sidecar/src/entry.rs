@@ -544,19 +544,27 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
     // and boot time. A gate TENANT is a different manifest and does not carry
     // the flag, so the E7 gate image still runs its own workload.
     let e3_profile = bib.is_e3_profile();
-    // E7 instrumentation scope — ONE predicate for the census probes below and
-    // for the thread-death arms in the event loop. It is the plain boot that
-    // measures them (its system POSIX owns the NIC) or a gate tenant; a tenant
-    // ENVIRONMENT's POSIX sidecar has neither `nic0.bar0` nor the gate profile,
-    // so it spawns neither. That matters beyond tidiness: the death arms it
-    // used to spawn outlived the environment — parked BLOCKED on a killed
-    // parent's channels — and held proc_table slots (PROC_MAX = 16) that the
-    // next create needed (measured: 3–5 leaked slots per environment, which is
-    // what stopped E5's recycle loop at cycle 5–10 with CAP_ETABLEFULL).
+    // E7 census scope: the plain boot that measures it (its system POSIX owns
+    // the NIC) or a gate tenant. An E3 image drops it — there it would only
+    // compete with the tenants for the serial wire.
     let e7_census = !cfg!(feature = "e7_go_gate")
         && !cfg!(feature = "e7_group_ckpt")
         && (census_host || gate)
         && !e3_profile;
+    // The thread-death arms in the event loop keep that scope WITHOUT the E3
+    // exclusion: an E3 boot (the unified env boot, the M1 net image) has always
+    // run them, and dropping them there perturbs the sidecar's event-loop
+    // timing — CI showed it as `[nettest] FAIL: accept()` and a destroy left
+    // unanswered. What they must NOT do is spawn in a tenant ENVIRONMENT's
+    // POSIX sidecar: that one has no `nic0.bar0` and no gate profile, and its
+    // children outlived the environment — parked BLOCKED on a killed parent's
+    // channels — holding proc_table slots (PROC_MAX = 16) that the next create
+    // needed (measured: 3–5 leaked slots per environment, which is what stopped
+    // E5's recycle loop at cycle 5–10 with CAP_ETABLEFULL). NIC-less is exactly
+    // what this predicate keeps.
+    let e7_arms = !cfg!(feature = "e7_go_gate")
+        && !cfg!(feature = "e7_group_ckpt")
+        && (census_host || gate);
     /* E7 TG-1's live Go acceptance profile: a dedicated build (never the
      * shipped image) spawns the real static Go fixture from the system POSIX
      * sidecar instead of the native probes. Its markers are the G1.1–G1.5
@@ -1004,7 +1012,7 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
         // each. Retrying every few passes (the loop is woken by the parked
         // forwards, so it does pass) creates them through the SAME real create
         // path as soon as the earlier probes release their slots.
-        if e7_census {
+        if e7_arms {
             use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
             static PASSES: AtomicU32 = AtomicU32::new(0);
             static FAULT_SPAWNED: AtomicBool = AtomicBool::new(false);
