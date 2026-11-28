@@ -1,0 +1,83 @@
+# E7 §10.15 — live firstuser guard-page call (real aerobackup.musl.elf)
+#
+# Boot: make x86-iso; qemu-system-x86_64 -cdrom sls_operating_system.iso
+#       -display none -m 4G -no-reboot -netdev user,id=net0
+#       -device e1000,netdev=net0,mac=52:54:00:12:34:01
+#       -serial file:/tmp/aerosls_e7_firstuser_guard.log
+#
+# Captured 2026-11-09 by tests/e7_firstuser_guard_check.sh, exit 0; the
+# guard mmap line carries the shape fields added by the same check.
+# The child is the committed musl aerobackup ELF. The check requires the
+# 131 query to precede its mprotect, the guard mmap to be three pages RW,
+# and forbids a firstuser mprotect ENOSYS.
+# The probe/candidate soft-protect lines are not this claim; the child name
+# e7.linux.user.0 and the order are.
+
+--- serial excerpt (verbatim) ---
+[CAP] woken PID 105 (channel 13)
+[E7] linux: num=00000001 child=e7.linux.probe.0 write ok len=14 |E7FD-WRITE-OK.|
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 106 (channel 14)
+[E7] linux: num=00000001 child=e7.linux.cand.0 write ok len=14 |E7FD-WRITE-OK.|
+[CAP] woken PID 106 (channel 14)
+[CAP] send handoff: PID 104 -> 106
+[CAP] woken PID 107 (channel 15)
+[E7] linux: num=00000083 child=e7.linux.user.0 ok + payload
+
+[CAP] send handoff: PID 104 -> 107
+[CAP] woken PID 105 (channel 13)
+[E7] linux: num=00000001 child=e7.linux.probe.0 ok
+
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 106 (channel 14)
+[E7] linux: num=00000001 child=e7.linux.cand.0 ok
+
+[CAP] woken PID 106 (channel 14)
+[CAP] send handoff: PID 104 -> 106
+[CAP] woken PID 107 (channel 15)
+[E7] linux: num=00000009 child=e7.linux.user.0 ok mmap -> 0x00004000000e8000 len=12288 prot=3
+
+[CAP] send handoff: PID 104 -> 107
+[CAP] woken PID 105 (channel 13)
+[E7] linux: num=0000000C child=e7.linux.probe.0 ok
+
+[CAP] woken PID 105 (channel 13)
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 106 (channel 14)
+[E7] linux: num=0000000C child=e7.linux.cand.0 ok
+
+[CAP] send handoff: PID 104 -> 106
+[CAP] woken PID 107 (channel 15)
+[E7] linux: num=0000000A child=e7.linux.user.0 ok
+
+[CAP] send handoff: PID 104 -> 107
+[E7] mprotect addr=0x4000000e8000 len=4096 prot=0x0: 1 page(s) soft-protected (P=1 U=0)
+[CAP] woken PID 105 (channel 13)
+[E7] linux: num=0000000C child=e7.linux.probe.0 ok
+
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 106 (channel 14)
+[E7] linux: num=0000000C child=e7.linux.cand.0 ok
+
+[CAP] send handoff: PID 104 -> 106
+[CAP] woken PID 107 (channel 15)
+[E7] linux: num=00000083 child=e7.linux.user.0 ok
+
+[CAP] send handoff: PID 104 -> 107
+[CAP] woken PID 105 (channel 13)
+[E7] linux: num=00000001 child=e7.linux.probe.0 write ok len=13 |E7MEM-BRK-OK.|
+[CAP] send handoff: PID 104 -> 105
+[CAP] woken PID 106 (channel 14)
+[E7] linux: num=00000001 child=e7.linux.cand.0 write ok len=13 |E7MEM-BRK-OK.|
+[CAP] send handoff: PID 104 -> 106
+[CAP] woken PID 107 (channel 15)
+[E7] linux: num=0000000E child=e7.linux.user.0 ok
+
+[CAP] woken PID 107 (channel 15)
+[CAP] send handoff: PID 104 -> 107
+
+--- assertions over the whole transcript ---
+firstuser sigaltstack 131 answered: 2
+firstuser mprotect 10 granted:     1
+firstuser mprotect 10 ENOSYS:      0
+kernel soft-protected lines:       3

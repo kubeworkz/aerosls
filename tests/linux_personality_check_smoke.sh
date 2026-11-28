@@ -26,6 +26,9 @@ FILES=(
     kernel/linux_abi.c
     kernel/process.h
     kernel/process.c
+    kernel/linux_thread.h
+    kernel/linux_thread.c
+    tests/linux_clone_host_test.c
     kernel/cap.h
     kernel/cap.c
     kernel/syscall_dispatch.c
@@ -58,11 +61,48 @@ FILES=(
     tests/fpu_enable_host_test.c
     # R (the signal seam) reads the plan's host test, same rule.
     tests/linux_personality_host_test.c
+    # P (increment 26, the signal frame) reads the frame's own host test and
+    # the table test that carries the "15 is not in the table yet" absence.
+    tests/linux_sigframe_host_test.c
+    tests/linux_syscall_table_host_test.c
+    # P5–P8 (increment 27, the delivery) read the delivery's own host test;
+    # P12 (increment 28) reads the LIVE check's script as well as the probe.
+    tests/linux_sigdeliver_host_test.c
+    tests/linux_signal_probe_check.sh
+    # D (increment 31, the fault's own delivery) reads the fault plan's host
+    # test, the live arm's fixture, module and check script — same rule as P12.
+    tests/linux_fault_sig_host_test.c
+    tests/linux_fault_sig_check.sh
+    user/sidecar/fixtures/e7_fault_handler_probe.S
+    user/sidecar/fixtures/e7_fault_handler_probe.flat
+    user/sidecar/src/e7_thread_death.rs
+    # AB (increment 32, the fault handler's return) reads its own host test,
+    # the returning arm's fixture and its check script — same rule as D.
+    tests/linux_fault_return_host_test.c
+    tests/linux_fault_return_check.sh
+    # AC (increment 33, the mask inside a trap handler) and AD (increment 34,
+    # the reveal an unmask owes) read their own host test, the revealing arm's
+    # fixture and its LIVE check — same rule as above.
+    tests/linux_sig_mask_host_test.c
+    tests/linux_fault_reveal_check.sh
+    user/sidecar/fixtures/e7_fault_reveal_probe.S
+    user/sidecar/fixtures/e7_fault_reveal_probe.flat
+    tests/linux_fault_abandon_check.sh
+    user/sidecar/fixtures/e7_fault_abandon_probe.S
+    user/sidecar/fixtures/e7_fault_abandon_probe.flat
+    user/sidecar/fixtures/e7_fault_return_probe.S
+    user/sidecar/fixtures/e7_fault_return_probe.flat
+    # Y (the soft mprotect transition) reads the helper's fake-table test.
+    tests/user_map_identity_host_test.c
     # W (increment 20) reads the capture, the record, the task's name on the
     # wire, the manager that names it, and both host tests that drive them —
     # same rule as O8/Q/R above, and the reason the coverage check below now
     # exists: these eight were added to the guard in #77 and not to this
     # list, so W1–W6 failed on the copy while passing on the real tree.
+    # W6 also greps the payload's release hook in env_service.c — it was read
+    # by the guard but missing here, so the baseline aborted with W6 on any
+    # faithful copy (found while adding clause P, 2026-11-25).
+    kernel/env_service.c
     kernel/env_payload.h
     kernel/env_payload.c
     kernel/env_ckpt.h
@@ -71,6 +111,24 @@ FILES=(
     user/init/src/env_manager.rs
     tests/env_payload_host_test.c
     tests/env_ckpt_host_test.c
+    # P2/P13 (increment 29, the return trip) read the census artifact by
+    # path, so the seeded copy needs it exactly as the guard does.
+    tools/linux_rt_sigreturn_census.txt
+    # Z6 (increment 30, the thread-exit glue) reads the robust-list census,
+    # the thread probe's fixture and its LIVE check, same rule as above.
+    tools/linux_robust_list_census.txt
+    user/sidecar/fixtures/e7_thread_probe.S
+    tests/linux_thread_probe_check.sh
+    # Z8 (increment 30b, the clear on every death) reads both death-arm
+    # fixtures, the module that spawns them and their LIVE check.
+    user/sidecar/fixtures/e7_thread_fault_probe.S
+    user/sidecar/fixtures/e7_thread_groupexit_probe.S
+    user/sidecar/src/e7_thread_death.rs
+    tests/linux_thread_death_check.sh
+    # Z8 also greps the module DECLARATION and both spawn sites by literal
+    # path, which the declared-path coverage check cannot see: without these
+    # two the baseline aborted with Z8 on any faithful copy.
+    user/sidecar/src/lib.rs
 )
 
 for f in "${FILES[@]}" "$GUARD"; do
@@ -132,6 +190,15 @@ fail=0
 # refuse.
 tooth() {
     local name="$1" clause="$2" desc="$3" d="$4" out rc named=0
+    # VACUITY GUARD. A sed whose pattern stopped matching leaves the copy
+    # pristine; the guard then passes and this tooth reports "did not bite",
+    # pointing at the guard when the drift was in the mutation. Prove the
+    # mutation landed before the guard is asked to react to it.
+    if diff -r "$W/base" "$d" >/dev/null 2>&1; then
+        echo "TOOTH FAIL $name — mutation did not apply: the seeded copy is byte-identical to the baseline, so this tooth would assert against a pristine tree"
+        fail=$((fail+1))
+        return
+    fi
     out="$(run_guard "$d")"; rc=$?
     # The verdict is a CASE, not `printf | grep -q`. This file runs under
     # `set -o pipefail`, and grep -q exits at its FIRST match, so the printf
@@ -171,9 +238,15 @@ echo "two-phase writable copy and the stage's four-place lifecycle"
 echo "and increment 16's anonymous-map seam (clause set V) — the"
 echo "first-trap ladder, the verdict's two-cursor re-check, the FIXED"
 echo "replace's frame return and invlpg, and the fixture's map block"
+echo "and increment 26's signal frame (clause P) — the rt_sigframe the"
+echo "guest's libc reads, its compiler-pinned offsets, the altstack and"
+echo "mask rules, and the dispatch that is deliberately still absent"
 echo "and increment 25's munmap seam (clause set X) — the first-trap"
 echo "range refusal, the verdict's page walk and frame return, the"
 echo "sidecar's below-break twin, and the probe's E7MEM-MUNMAP-OK proof"
+echo "and §10.15's soft-protected mprotect (clause set Y) — the"
+echo "frame-preserving transition, the deliberate live fault, and its"
+echo "success/denial markers"
 echo "========================================================================"
 echo
 
@@ -417,11 +490,11 @@ tooth fd-payload-check-off M6 "the request-length invariant is dead-coded" "$W/t
 
 # ─── Increment-6 teeth (the mem class: the budget span, the W^X refusal) ──
 
-# N1: the slot-reuse clear loses the break — a reused slot's brk_cur is
-# its predecessor's, and the next occupant's first granted growth maps
-# pages at a break nobody asked for.
+# N1: the group's destroy loses the break — a reused slot's group keeps
+# its predecessor's brk_cur, and the next occupant's first granted growth
+# maps pages at a break nobody asked for.
 seed "$W/t32"
-sed -i '/pd->linux_brk_cur = 0;/d' "$W/t32/kernel/process.c"
+sed -i '/g->brk_cur = 0;/d' "$W/t32/kernel/linux_thread.c"
 tooth mem-clear-dropped N1 "the reused-slot brk state reset is gone" "$W/t32"
 
 # N2: the stamp made unconditional — every SLS sidecar (init, DM, every
@@ -432,22 +505,23 @@ python3 - "$W/t33/kernel/cap.c" <<'PY'
 import sys
 p = sys.argv[1]
 s = open(p, encoding='utf-8').read()
-old = "    if (personality == PROC_PERSONALITY_LINUX) {\n        pd->linux_heap_base"
-new = "    if (1) {   /* SLS slots get a Linux span too */\n        pd->linux_heap_base"
+old = "    if (personality == PROC_PERSONALITY_LINUX) {\n        group_heap_base"
+new = "    if (1) {   /* SLS slots get a Linux span too */\n        group_heap_base"
 assert old in s, "anchor not found"
 open(p, 'w', encoding='utf-8', newline='').write(s.replace(old, new, 1))
 PY
 tooth mem-span-unconditional N2 "the span stamp is no longer keyed on the LINUX personality" "$W/t33"
 
-# N3: the kernel's first-trap W|X refusal dead-coded — now only the
-# sidecar's arm refuses, and one Rust edit away from W|X pages.
+# N3: the kernel's first-trap W|X refusal dead-coded at its policy
+# predicate — now only the sidecar's arm refuses, and one Rust edit away
+# from W|X pages.
 seed "$W/t34"
-sed -i 's/linux_mprotect_refuses_wx(largs\[2\])) {/0) {/' "$W/t34/kernel/syscall_dispatch.c"
+sed -i 's/if (linux_mprotect_refuses_wx(req->prot)) return -LINUX_EPERM;/if (0) return -LINUX_EPERM;/' "$W/t34/kernel/linux_abi.c"
 tooth wx-firsttrap-off N3 "the dispatcher's first-trap W|X refusal is dead-coded" "$W/t34"
 
 # N3: the sidecar's twin dead-coded — now only the kernel's plan refuses.
 seed "$W/t35"
-sed -i 's/if args\[2\] & 0x2 != 0 && args\[2\] & 0x4 != 0 {/if false {/' "$W/t35/user/sidecar/src/linux.rs"
+sed -i 's/if prot & 0x2 != 0 && prot & 0x4 != 0 {/if false {/' "$W/t35/user/sidecar/src/linux.rs"
 tooth wx-sidecar-off N3 "the sidecar's W|X arm is dead-coded" "$W/t35"
 
 # N4: the verdict's malformed branch dead-coded — a grant that escaped the
@@ -674,12 +748,12 @@ seed "$W/t79"
 sed -i 's/ACT_TERMINATE => Answer::SignalKill(args\[1\]),/ACT_TERMINATE => Answer::Reply(0, STATUS_OK),/' "$W/t79/user/sidecar/src/linux.rs"
 tooth terminate-answers-success R4 "a default-terminate signal no longer converges on SignalKill" "$W/t79"
 
-# t80: the handler-install refusal answered 0 — v1 has no signal frames,
-# so a recorded handler would never run while its caller believes the
-# install succeeded.
+# t80: the handler install's RECORD deleted — the arm still answers
+# success but stores nothing, so a later oldact reports a default the
+# caller never installed while the install claimed to land.
 seed "$W/t80"
-sed -i 's|_ => Answer::Reply(0, E_NOSYS), /\* handler install not landed \*/|_ => Answer::Reply(0, STATUS_OK), /* handler install silently kept */|' "$W/t80/user/sidecar/src/linux.rs"
-tooth handler-install-answered-0 R5 "a handler install is no longer refused by name before any mutation" "$W/t80"
+sed -i 's|sig\.act\[args\[0\] as usize\] = act;|/* handler install not recorded */|' "$W/t80/user/sidecar/src/linux.rs"
+tooth handler-install-not-recorded R5 "a handler install is no longer recorded (oldact would return a default it never installed)" "$W/t80"
 
 # t81: tkill's tid scope deleted — any sender may signal any tid through
 # this arm, silently re-targeted instead of answered ESRCH.
@@ -888,7 +962,7 @@ tooth signal-number-not-logged R7 "neither line carries the signal number anymor
 # back to a bare number (the chain becomes an inference).
 seed "$W/t107"
 sed -i 's/\.take(24)/.take(0)/' "$W/t107/user/sidecar/src/linux.rs"
-sed -i 's/b" -> ENOSYS mmap(len="/b" -> ENOSYS "/' "$W/t107/user/sidecar/src/linux.rs"
+sed -i 's/b"ENOSYS mmap(len="/b"ENOSYS "/' "$W/t107/user/sidecar/src/linux.rs"
 tooth abort-evidence-stripped R8 "neither the written bytes nor the mmap request ride their lines" "$W/t107"
 
 # ─── V teeth (increment 16: the anonymous-map seam) ───────────────────────
@@ -912,7 +986,7 @@ tooth mmap-stage-truncated V1 "the four-word stage carries only part of the ask"
 # a forged grant above the cursor now re-checks against a bound that
 # never moved, so the two cursors' convergence is argued from prose.
 seed "$W/t110"
-sed -i 's/^                                    cur->linux_mmap_top, &mreq, rax);$/                                    cur->linux_heap_limit, \&mreq, rax);/' "$W/t110/kernel/syscall_dispatch.c"
+sed -i 's/^                                    linux_group_mmap_top(cur), &mreq, rax);$/                                    linux_group_heap_limit(cur), \&mreq, rax);/' "$W/t110/kernel/syscall_dispatch.c"
 tooth mmap-verdict-loses-cursor V2 "the verdict is called without the map cursor" "$W/t110"
 
 # t111: the replace's invlpg deleted — "the task is parked anyway" is
@@ -935,14 +1009,14 @@ tooth mmap-replace-gated-off V3 "the replace walk never runs — a FIXED map sil
 # re-checks above a cursor that is 0 and maps nothing: the allocator's
 # wall returns as -ENOMEM from a kernel that forgot to birth its state.
 seed "$W/t113"
-sed -i 's/pd->linux_mmap_top   = pd->linux_heap_limit;/pd->linux_mmap_top   = 0;/' "$W/t113/kernel/cap.c"
+sed -i 's/g->mmap_top = heap_limit;/g->mmap_top = 0;/' "$W/t113/kernel/linux_thread.c"
 tooth mmap-cursor-never-born V4 "the create no longer births the map cursor at the span's top" "$W/t113"
 
 # t114: the slot-reuse clear deleted — "dead code" is how a reused
 # task slot inherits its predecessor's cursor, and the next child's
 # arena lands where the last occupant's map still lives.
 seed "$W/t114"
-sed -i '/pd->linux_mmap_top = 0;/d' "$W/t114/kernel/process.c"
+sed -i '/g->mmap_top = 0;/d' "$W/t114/kernel/linux_thread.c"
 tooth mmap-cursor-slotreuse-clear-gone V4 "a reused slot keeps the dead task's map cursor" "$W/t114"
 
 # t115: the arm renamed away — the measured allocator's two requests
@@ -1033,6 +1107,398 @@ tooth munmap-fixture-marker-gone X5 "the probe no longer carries the E7MEM-MUNMA
 seed "$W/t128"
 sed -i 's/ ok munmap addr=0x//' "$W/t128/user/sidecar/src/linux.rs"
 tooth munmap-range-not-logged X6 "a granted munmap's answer line no longer carries the range" "$W/t128"
+
+# ─── Y teeth (§10.15: the soft-protected mprotect transition) ──────────────
+
+# t132: the positive marker deleted — the probe would still fault, but no
+# line would prove the mprotect returned 0 and the marker write completed
+# BEFORE the access. The fault alone cannot distinguish that from a task
+# that was killed on the mprotect reply.
+seed "$W/t132"
+sed -i '/E7MEM-SOFT-OK/d' "$W/t132/user/sidecar/fixtures/e7_linux_probe.S"
+tooth soft-probe-marker-gone Y6 "the probe no longer carries the E7MEM-SOFT-OK proof" "$W/t132"
+
+# t133: the success path no longer reaches the soft case — the probe would
+# pass the whole map block and exit, so the live boot would be green while
+# never exercising the transition at all.
+seed "$W/t133"
+sed -i '/jmp     .Lsoft/d' "$W/t133/user/sidecar/fixtures/e7_linux_probe.S"
+tooth soft-probe-unreached Y6 "the probe's success path no longer jumps to the soft case" "$W/t133"
+
+# t134: the apply's user_protect_page call deleted — the verdict would still
+# name a page range, and the kernel would log 'soft-protected' without ever
+# changing a PTE. The frame-preserving helper is the mechanism half.
+seed "$W/t134"
+sed -i '/user_protect_page(pml4, va,/,+2d' "$W/t134/kernel/syscall_dispatch.c"
+tooth soft-apply-call-gone Y2 "the reply no longer calls user_protect_page" "$W/t134"
+
+# t135: the asm number chain claims 131 again. This is the exact wall the
+# first live firstuser guard run hit: sigaltstack became an SLS svc_crash,
+# std's old stack_t stayed zeroed, and the guard-page mmap+mprotect never
+# issued. R9 must red by name even though every live line it does not read
+# would look untouched.
+seed "$W/t135"
+sed -i '/je  .do_sls_svc_list/a\    cmp rax, 131\n    je  .do_sls_svc_crash' "$W/t135/arch/x86/syscall.asm"
+tooth sigaltstack-asm-hijack R9 "the asm number chain claims 131 again" "$W/t135"
+
+# ─── Z teeth (TG-1 I2: the kernel-local clone) ──────────────────────────────
+
+# t136: VM dropped from the mandatory Go mask — the planner would accept a
+# "thread" whose address space the group still shares, the exact semantic lie
+# the six-flag requirement exists to prevent.
+seed "$W/t136"
+sed -i 's/#define LINUX_CLONE_GO_FLAGS (LINUX_CLONE_VM | LINUX_CLONE_FS |/#define LINUX_CLONE_GO_FLAGS (LINUX_CLONE_FS |/' "$W/t136/kernel/linux_thread.h"
+tooth clone-go-mask-loses-vm Z1 "the mandatory clone mask no longer carries CLONE_VM" "$W/t136"
+
+# t137: the unknown-bit refusal disabled — vfork/parent/namespace/clear-TID
+# would all reach the group path as if they were the Go shape.
+seed "$W/t137"
+sed -i 's/if (flags & ~LINUX_CLONE_ALLOWED) return -LINUX_EINVAL;/if (0) return -LINUX_EINVAL;/' "$W/t137/kernel/linux_thread.c"
+tooth clone-unknown-flags-allowed Z1 "the planner no longer refuses flags outside the Go mask" "$W/t137"
+
+# t138: rsi no longer carries the child stack — the Go wrapper's first
+# post-syscall instruction would move a zero (or parent) value into SP.
+seed "$W/t138"
+sed -i '/ctx->rsi   = child_stack;/d' "$W/t138/kernel/linux_thread.c"
+tooth clone-context-rsi-dropped Z2 "the child context no longer names its stack in rsi" "$W/t138"
+
+# t139: the child gets a zero cr3 instead of the group's root — a private
+# address space in every way that matters, with no page-table clone to own.
+seed "$W/t139"
+sed -i 's/child->cr3          = g->cr3;/child->cr3          = 0;/' "$W/t139/kernel/process.c"
+tooth clone-cr3-not-shared Z4 "the clone descriptor no longer points at the group's cr3" "$W/t139"
+
+# t140: the group join deleted — the descriptor would run with no tid/tgid,
+# no group index, and no admission count; cap/page teardown could never find
+# it as a member.
+seed "$W/t140"
+sed -i '/linux_group_join_thread(g, child)/d' "$W/t140/kernel/process.c"
+tooth clone-group-join-dropped Z4 "the new descriptor never joins the caller's group" "$W/t140"
+
+# t141: clone reclassified as an fd row — the dispatcher would describe and
+# post it to the sidecar, which has no clone arm or per-thread row, instead
+# of running the kernel-local branch.
+seed "$W/t141"
+sed -i 's/{  56, LSC_THREAD, 0 }/{  56, LSC_FD, 0 }/' "$W/t141/kernel/linux_abi.c"
+tooth clone-table-row-misclassified Z3 "clone is no longer LSC_THREAD" "$W/t141"
+
+# t142: the kernel-local branch gated off — clone falls through to the
+# generic describe/post/park path and never returns a child TID.
+seed "$W/t142"
+sed -i 's/if (num == LINUX_CLONE) {/if (0) {/' "$W/t142/kernel/syscall_dispatch.c"
+tooth clone-branch-gated-off Z3 "the first-trap clone branch never runs" "$W/t142"
+
+# ─── W teeth (increment 20: the checkpoint compatibility cases) ────────────
+
+# t129: the v2 replay label renamed away — the guard's W6 greps are what
+# require the compatibility case to stay in the host test; without this
+# tooth, deleting it would leave every source clause green.
+seed "$W/t129"
+# Retargeted 2026-11-25: the payload moved to the v5 task stride and the old
+# "V2: a soft-free v2 payload replays every page" label no longer exists, so
+# this sed had stopped matching and the tooth reported "mutation did not
+# apply" — invisible until the baseline's W6 seed gap was fixed and the teeth
+# could run at all. The v4-stride refusal W6 actually greps is the case that
+# must stay.
+sed -i 's/"V4: a v4 blob is refused by format before any pour (the v5 task stride is not its stride)"/"V4: stride case removed"/' "$W/t129/tests/env_payload_host_test.c"
+tooth payload-v4-stride-case-gone W6 "the v4-stride refusal case label is gone" "$W/t129"
+
+# t130: the soft-permission refusal label renamed away — the corrupt
+# permission case is the other half of the compatibility contract, and its
+# disappearance must red W6 rather than leave only the happy-path replay.
+seed "$W/t130"
+sed -i 's/"SOFT+USER: the restore refuses the contradictory permission before a byte moves"/"SOFT+USER: case removed"/' "$W/t130/tests/env_payload_host_test.c"
+tooth payload-soft-perm-case-gone W6 "the corrupt soft-permission case label is gone" "$W/t130"
+
+# t131: ONLY the CHECK lines that assert the refusal operand are stripped;
+# the case labels and their message strings remain. A W6 that greps only
+# prose stays green, while the test could be rewritten to accept a torn
+# index CRC. W6's three-occurrence count must red instead.
+seed "$W/t131"
+sed -i '/CHECK(env_payload_last_refusal()\.a == 8,/d' "$W/t131/tests/env_payload_host_test.c"
+tooth payload-perm-refusal-operands-unasserted W6 "the a=8 assertion lines are gone but their labels and messages remain" "$W/t131"
+
+# t132: an offset nudged to a plausible neighbour. 296 is where the sigset
+# sits INSIDE the ucontext; the frame needs 304. P must name it.
+seed "$W/t132"
+sed -i 's/^#define LINUX_SIGFRAME_SIGMASK   304u$/#define LINUX_SIGFRAME_SIGMASK   296u/' "$W/t132/kernel/linux_abi.h"
+tooth sigframe-sigmask-offset-edited P "the frame's sigset offset is the ucontext-relative 296 instead of the frame's 304" "$W/t132"
+
+# t133: the assert that pins rip to greg 16 is deleted. The remaining eleven
+# still satisfy the count, so only P1's specific line can redden — which is
+# the point of asserting the line and not just a tally.
+seed "$W/t133"
+sed -i '/offsetof(struct LinuxSigContextMirror, rip) == 128/,+1d' "$W/t133/kernel/linux_abi.c"
+tooth sigframe-rip-assert-dropped P1 "the rip-at-128 static assert is gone while the rest of the layout still compiles" "$W/t133"
+
+# t134: the entry-shape case is stripped from the host test (its message line
+# stays). A P3 that only greps prose stays green while nothing asserts that a
+# handler is entered with rsp % 16 == 8.
+seed "$W/t134"
+sed -i '/CHECK((entry.r\[LINUX_SIGREG_RSP\] & 0xFu) == 8u,/d' "$W/t134/tests/linux_sigframe_host_test.c"
+tooth sigframe-entry-align-case-gone P3 "the rsp%16==8 assertion line is gone but its message remains" "$W/t134"
+
+# t135: a dispatch for rt_sigreturn smuggled in before its census run. P4's
+# absence clause is the only thing that can notice — the frame still builds.
+seed "$W/t135"
+printf '/* rt_sigreturn would be handled here (LINUX_RT_SIGRETURN) */\n' >> "$W/t135/kernel/syscall_dispatch.c"
+# P2 is the clause that catches this (the census-absence assertion); P4 stays
+# green because no delivery FUNCTION appeared, only a mention of the number.
+tooth sigframe-dispatch-smuggled P2 "the dispatcher mentions rt_sigreturn before any census row exists" "$W/t135"
+
+# ─── P teeth (increment 27: the delivery) ───────────────────────────────────
+
+# t143: the EINTR code remapped onto EAGAIN's number. Everything still
+# compiles, the park still wakes, and the caller retries a would-block it
+# should have waited on — the exact confusion the separate code exists to
+# prevent. Only P5's two-language check can name it.
+seed "$W/t143"
+sed -i 's/const E_INTR: i32 = -33;/const E_INTR: i32 = -3;/' "$W/t143/user/sidecar/src/linux.rs"
+tooth park-wake-eagain-code P5 "the park's wake replies with EAGAIN's code" "$W/t143"
+
+# t144: the map row deleted. The sidecar keeps answering CAP_EINTR, but §5.7
+# has no case for it, so the code falls through the default arm and reaches
+# the task as EIO — a read that fails for the wrong reason and is never
+# retried.
+seed "$W/t144"
+sed -i '/case CAP_EINTR:                  return -LINUX_EINTR;/d' "$W/t144/kernel/linux_abi.c"
+tooth park-wake-map-row-gone P5 "CAP_EINTR no longer maps to -EINTR" "$W/t144"
+
+# t145: SIGSEGV nudged to the neighbouring number in the si_addr table. The
+# frame still builds, the handler still runs, and the crash report names an
+# address that belongs to no fault at all.
+seed "$W/t145"
+sed -i 's/^    case 11u:/    case 9u:/' "$W/t145/kernel/linux_abi.c"
+tooth si-addr-segv-case-gone P7 "SIGSEGV is no longer the CR2 case" "$W/t145"
+
+# t146: the exact-length refusal loosened to a prefix. A 79-byte answer now
+# decodes into a struct whose last word is whatever was in the buffer — a
+# handler and restorer the sidecar never named.
+seed "$W/t146"
+sed -i 's/    if (len != LINUX_SIGDELIVER_BYTES) return -LINUX_EINVAL;/    if (0) return -LINUX_EINVAL;/' "$W/t146/kernel/linux_abi.c"
+tooth deliver-req-prefix-accepted P6 "the delivery request accepts a short answer" "$W/t146"
+
+# t147: the validated copy replaced by a second writer. The frame still lands
+# on the stack (in a boot it may even look right) and every protection check
+# the copy exists for is skipped — P4's "exactly one write path" is the only
+# clause that can see it.
+seed "$W/t147"
+sed -i 's/linux_user_copy_in(frame, root, entry_local.r\[LINUX_SIGREG_RSP\],/user_frame_store(frame, root, entry_local.r[LINUX_SIGREG_RSP],/' "$W/t147/kernel/linux_abi.c"
+tooth deliver-second-writer P4 "a second writer appeared beside the validated copy" "$W/t147"
+
+# t148: the bytes-unchanged sentinel deleted. The refusal still happens and
+# still returns -EFAULT; what is no longer proven is that NOTHING was
+# written — which is the property that keeps a signal off a read-only stack
+# from being kernel-authored corruption.
+seed "$W/t148"
+sed -i '/CHECK(clean,/d' "$W/t148/tests/linux_sigdeliver_host_test.c"
+tooth deliver-unwritten-assert-gone P8 "the guest's stack is no longer proven untouched" "$W/t148"
+
+# ─── P9–P11 teeth (increment 28: the delivery wired up) ────────────────────
+
+# t149: the plan's bound narrowed by one word — the kernel would refuse the
+# sidecar's 80-byte answer as "beyond the staged clamp" and a handler-
+# disposition tkill would come back -EPROTO to a task that never asked for
+# a protocol.
+seed "$W/t149"
+sed -i 's/        p.len  = LINUX_SIGDELIVER_BYTES;/        p.len  = 72u;/' "$W/t149/kernel/linux_abi.c"
+tooth sigframe-plan-bound-narrowed P9 "the tkill plan no longer accepts 80 bytes" "$W/t149"
+
+# t150: the sidecar goes back to record-only — the handler exists, the frame
+# exists, and the task hears ENOSYS. The one shape a boot would show as
+# "signals still don't work" with no kernel-side culprit at all.
+seed "$W/t150"
+sed -i 's/Answer::SignalFrame/Answer::SignalReplies/g' "$W/t150/user/sidecar/src/linux.rs"
+tooth sigframe-sidecar-record-only-again P9 "the tkill arm stopped emitting the delivery" "$W/t150"
+
+# t151: the install nudged one word — rsp lands where rbp is, so the handler
+# is entered with a kernel pointer for a stack. The frame is written, the
+# mask is right, and the first store in the handler faults.
+seed "$W/t151"
+sed -i 's/    w\[8\]  = entry->r\[LINUX_SIGREG_RSP\];/    w[7]  = entry->r[LINUX_SIGREG_RSP];/' "$W/t151/kernel/linux_abi.c"
+tooth sigframe-install-rsp-nudged P10 "the entry install puts rsp in the wrong word" "$W/t151"
+
+# t152: chan.c stops handing the payload to the reply arm. The bytes arrive,
+# the shape checks pass, and the 80-byte request falls through to the RAW
+# copy path — aimed at address 0.
+seed "$W/t152"
+sed -i '/linux_sig_reply_apply(pd, pay, n);/d' "$W/t152/kernel/chan.c"
+tooth sigframe-chan-branch-gone P9 "chan.c no longer routes the delivery request" "$W/t152"
+
+# t153: the handler's own marker removed from the probe. The delivery still
+# happens and the kernel still prints its line — what is gone is the only
+# evidence written BY the code that ran, so a boot that entered the handler
+# with a broken context would look identical from the kernel side.
+seed "$W/t153"
+sed -i '/SIGHAND-OK/d' "$W/t153/user/sidecar/fixtures/e7_linux_probe.S"
+tooth sigframe-probe-marker-gone P12 "the probe no longer carries the handler's marker" "$W/t153"
+
+# t154: the censused row deleted from the table. The host test that asserts
+# the classification and the census artifact both still say the number is
+# classified, so the copy now contradicts itself — the shape that fails if a
+# reader ever "tidies" a row whose trace they do not know about.
+seed "$W/t154"
+sed -i '/{  15, LSC_SIG,    0 },/d' "$W/t154/kernel/linux_abi.c"
+tooth sigframe-census-row-gone P13 "the table no longer carries the traced row" "$W/t154"
+
+# t155: the return trip's frame read replaced by nothing. The restore still
+# exists and still prints its line — what is gone is the only validated read,
+# which is the difference between an -EFAULT and a ring-0 fault on a frame the
+# task itself can forge.
+seed "$W/t155"
+sed -i '/linux_user_copy_out(frame, pd->cr3, pd->linux_sig_frame_rsp,/d' "$W/t155/kernel/process.c"
+tooth sigframe-return-read-gone P14 "the return trip no longer reads through the validated copy" "$W/t155"
+
+# t156: RAX dropped from the bridge. A delivery wants 0 there and a return
+# wants the interrupted value, so a hardcoded zero makes every handler return
+# look like a successful syscall with a value the caller never produced.
+seed "$W/t156"
+sed -i '/w\[15\] = entry->r\[LINUX_SIGREG_RAX\];/d' "$W/t156/kernel/linux_abi.c"
+tooth sigframe-rax-word-gone P15 "the park bridge no longer carries the sysret's RAX" "$W/t156"
+
+# t157: the sidecar's return arm stops restoring its mask. The kernel's half
+# still runs, so the boot looks fine and a SECOND raise pends forever — the
+# divergence between the two masks, made single-sided.
+seed "$W/t157"
+sed -i '/sig.mask = sig.saved_mask;/d' "$W/t157/user/sidecar/src/linux.rs"
+tooth sigframe-return-mask-gone P14 "the sidecar's return arm no longer restores its mask" "$W/t157"
+
+# t158: the gate dropped from chan.c, leaving the old "not -EPROTO" shape —
+# the frame is restored on ANY reply that applied, so a 15 the sidecar refused
+# (no handler entered) returns the task into a context whose mask was never
+# unwound and the errno it should have heard is discarded. The kernel still
+# compiles and the boot still returns, which is why only the gate clause sees
+# it.
+seed "$W/t158"
+sed -i 's/!linux_sig_return_reply_ok(expect_num, rax,/0 \&\& linux_sig_return_reply_ok(LINUX_READ, rax,/' "$W/t158/kernel/chan.c"
+tooth sigframe-return-gate-gone P16 "the return trip restores without asking the sidecar's own answer" "$W/t158"
+
+# t159: the live refusal's errno widened to "any error" — the probe now accepts
+# -1 as readily as -EINVAL for a 15 with no handler entered. Nothing about the
+# boot changes (the marker still prints, the frame is still untouched), which
+# is exactly why the check has to name the number: a gate that surfaced some
+# other refusal would pass a boot that only looked for "it returned".
+seed "$W/t159"
+sed -i 's/cmp     \$-22, %rax/cmp     $-1, %rax/' "$W/t159/user/sidecar/fixtures/e7_linux_probe.S"
+tooth sigret-nohand-errno-unnamed P17 "the live refusal no longer pins -EINVAL" "$W/t159"
+
+# t160: the robust walk marks EVERY word it sees, dropping the owner check.
+# A mutex owned by a live sibling would be handed FUTEX_OWNER_DIED, so the
+# next owner takes over a lock nobody released — the one rule that keeps the
+# walk from being "write a number into every entry the task named".
+seed "$W/t160"
+sed -i 's/    if ((word \& LINUX_FUTEX_TID_MASK) != (tid \& LINUX_FUTEX_TID_MASK)) return 0;/    if (0) return 0;/' "$W/t160/kernel/linux_thread.c"
+tooth robust-owner-check-gone Z6 "the robust walk no longer checks that the dead thread owned the word" "$W/t160"
+
+# t161: the group-teardown glue call deleted, leaving only the descriptor
+# funnel. A thread that faults or exits with its group would then never clear
+# its TID word and its joiner would park forever — the exact shape Z7 exists
+# to forbid, and silent on every path the exit(60) live arm exercises.
+seed "$W/t161"
+sed -i '/^        linux_thread_exit_glue(pd);$/d' "$W/t161/kernel/process.c"
+tooth group-teardown-clear-gone Z7 "the group teardown no longer runs the exit glue" "$W/t161"
+
+# t162: the group's waiters are forgotten BEFORE the glue loop, which is the
+# ordering the whole I5b live arm rests on — a forgotten waiter cannot be
+# woken, so the clear would find nobody and the joiner would stay parked. The
+# words still get cleared, so no other clause sees it.
+seed "$W/t162"
+awk '/^static void linux_group_release_all/ { inb = 1 }
+     inb && /^    for \(int i = 0; i < PROC_MAX; i\+\+\) \{/ && !done {
+         print "    linux_futex_forget_group(g->group_id);"; done = 1 }
+     { print }' "$W/t162/kernel/process.c" > "$W/t162/kernel/process.c.new" &&
+    mv "$W/t162/kernel/process.c.new" "$W/t162/kernel/process.c"
+tooth forget-before-glue Z8 "the teardown forgets the group's waiters before the glue can wake them" "$W/t162"
+
+# t163: the fault path stops asking the delivery plan. CR2 is still captured,
+# the stub still saves a full frame, and every other delivery still works — a
+# handler installed for a FAULT simply never runs, which is the pre-increment
+# symptom with the capture half already present (and the reason AA pins the
+# call, not just the function's existence).
+seed "$W/t163"
+sed -i 's/linux_fault_sig_plan(&fcur->linux_fault_act\[fi\],/linux_fault_sig_unasked(\&fcur->linux_fault_act[fi],/' "$W/t163/kernel/stubs.c"
+tooth fault-delivery-unasked AA "the #PF path stopped asking for a delivery" "$W/t163"
+
+# t164: a fault delivery that never marks itself as the TRAP's. The frame is
+# built, installed and entered exactly as before — so increment 31's arm stays
+# green — but the return gate needs that flag, and without it the sidecar's
+# truthful EINVAL is the last word on a handler that is trying to return.
+seed "$W/t164"
+sed -i '/fcur->linux_sig_fault_active = 1;/d' "$W/t164/kernel/stubs.c"
+tooth fault-return-unflagged AB "a fault delivery stopped marking itself as the trap's" "$W/t164"
+
+# t165: the return reads the frame at park_ctx.user_rsp again — the address
+# the tkill path happened to have, and the fault path never does.
+seed "$W/t165"
+sed -i 's/linux_user_copy_out(frame, pd->cr3, pd->linux_sig_frame_rsp,/linux_user_copy_out(frame, pd->cr3, pd->park_ctx.user_rsp,/' "$W/t165/kernel/process.c"
+tooth fault-return-parkctx AB "the return went back to reading the frame at park_ctx" "$W/t165"
+
+# t166: the live arm's handler stops returning (it argues with the frame
+# instead of using it), so nothing exercises the trip the clause describes.
+seed "$W/t166"
+sed -i 's/^    ret .*$/    jmp     .Lbad/' "$W/t166/user/sidecar/fixtures/e7_fault_return_probe.S"
+tooth fault-return-no-ret AB "the handler no longer returns through its restorer" "$W/t166"
+
+# t167: the kernel answers 14 inside the window but never commits the
+# result, so the handler's mask stops being the mask's state — the query
+# reads right once and every BLOCK/UNBLOCK after it computes on a stale base.
+seed "$W/t167"
+sed -i '/cur->linux_sig_mask = new_mask;/d' "$W/t167/kernel/syscall_dispatch.c"
+tooth fault-mask-uncommitted AC "the kernel answered 14 without committing the mask" "$W/t167"
+
+# t168: the gate stops asking whether the frame came from the TRAP, so the
+# tkill path's rt_sigprocmask — whose mask the sidecar moved before it
+# answered, and whose frame it entered — is answered by the kernel instead.
+seed "$W/t168"
+sed -i 's/int owned = linux_sig_mask_fault_owned(/int owned = 1 || linux_sig_mask_fault_owned(/' "$W/t168/kernel/syscall_dispatch.c"
+tooth fault-mask-gate-too-wide AC "the kernel claimed a sidecar-delivered handler's mask" "$W/t168"
+
+# t169: the probe is never tagged, so the forward stays the child's own call
+# and the sidecar answers it as the ordinary arm does — the reveal the window
+# owes never runs, and the pending bit waits for after the return.
+seed "$W/t169"
+sed -i '/largs\[5\] = LINUX_SIG_REVEAL_TAG;/d' "$W/t169/kernel/syscall_dispatch.c"
+tooth fault-reveal-untagged AD "the reveal probe stopped being tagged" "$W/t169"
+
+# t170: the sidecar stops recognising the probe, so the tagged request falls
+# through to the ordinary arm — which parses it as a QUERY (no set, no oldset)
+# and answers 0 without a single reveal.
+seed "$W/t170"
+sed -i 's/if args\[5\] == SIG_MASK_REVEAL_TAG {/if false {/' "$W/t170/user/sidecar/src/linux.rs"
+tooth fault-reveal-arm-gone AD "the sidecar stopped recognising the reveal probe" "$W/t170"
+
+# t171: the kernel commits the staged mask whatever the sidecar answered, so a
+# refused reveal moves the mask it was asked to keep still.
+seed "$W/t171"
+sed -i 's/if (rax == 0) pd->linux_sig_mask = nm;/pd->linux_sig_mask = nm;/' "$W/t171/kernel/chan.c"
+tooth fault-reveal-blind-commit AD "the kernel committed the mask without the sidecar's consent" "$W/t171"
+
+# t172: the closure fires for ANY active frame instead of only the TRAP's,
+# so a tkill-delivered handler — whose mask window the sidecar owns and whose
+# frame the sidecar entered — loses its frame at the first 14 made above it.
+seed "$W/t172"
+sed -i 's/if (cur->linux_sig_fault_active \&\&/if (1 \&\&/' "$W/t172/kernel/syscall_dispatch.c"
+tooth fault-abandon-gate-too-wide AE "the abandoned-frame check stopped asking whether the frame was the trap's" "$W/t172"
+
+# t173: the window closes without putting the mask back to the number both
+# ends agree on, so the task keeps running under the dead handler's set while
+# the sidecar holds the pre-delivery one — the divergence, made quiet.
+seed "$W/t173"
+sed -i '/cur->linux_sig_mask         = agreed;/d' "$W/t173/kernel/syscall_dispatch.c"
+tooth fault-abandon-keeps-divergent-mask AE "the closure dropped the frame but kept the dead handler's mask" "$W/t173"
+
+# t174: the live arm's handler stops leaving the frame — it falls through to the
+# after-jump code with rsp still inside it, so the 14 arrives inside the window
+# and nothing on the machine ever exercises the abandonment the clause names.
+seed "$W/t174"
+sed -i '/mov     0(%r12), %rsp/d' "$W/t174/user/sidecar/fixtures/e7_fault_abandon_probe.S"
+tooth fault-abandon-no-jump AE "the abandoning arm stopped popping rsp above its frame" "$W/t174"
+
+# t175: the sidecar stops spawning the arm, so the closure is never reached on
+# a boot even though every line it is built from is still there.
+seed "$W/t175"
+sed -i '/crate::e7_thread_death::spawn_fault_abandon(/d' "$W/t175/user/sidecar/src/entry.rs"
+tooth fault-abandon-unspawned AE "the sidecar stopped spawning the abandoning arm" "$W/t175"
 
 echo
 echo "linux_personality_check_smoke: $pass passed, $fail failed"

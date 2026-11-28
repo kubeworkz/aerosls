@@ -90,7 +90,8 @@
  * Build and run:
  *   gcc -Wall -Wextra -std=c11 -I . -I kernel -I arch/x86 \
  *       -o /tmp/env_service_wait_host_test \
- *       tests/env_service_wait_host_test.c kernel/env_service.c kernel/env_ckpt.c
+ *       tests/env_service_wait_host_test.c kernel/env_service.c kernel/env_ckpt.c \
+ *           tests/e7_group_stubs.c
  *   /tmp/env_service_wait_host_test
  */
 #include "kernel/cap.h"

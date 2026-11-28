@@ -22,7 +22,9 @@
  * Build and run:
  *   gcc -Wall -Wextra -std=c11 -I . -I kernel -I arch/x86 -I user \
  *       -o /tmp/scheduler_fairness_host_test \
- *       tests/scheduler_fairness_host_test.c kernel/partition.c
+ *       tests/scheduler_fairness_host_test.c kernel/partition.c \
+ *           kernel/linux_thread.c kernel/linux_abi.c kernel/linux_futex.c \
+ *           tests/e7_group_stubs.c
  *   /tmp/scheduler_fairness_host_test
  */
 #include "kernel/process.h"

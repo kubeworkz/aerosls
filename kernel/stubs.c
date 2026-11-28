@@ -67,12 +67,160 @@ int memcmp(const void* a, const void* b, size_t n) {
  * matters on a path that runs when memory access is what failed. */
 extern char stack_bottom[], stack_top[];
 
-void handle_page_fault(unsigned long error_code, unsigned long saved_rip,
-                       unsigned long user_rsp, unsigned long saved_rdi) {
+/* ─── E7 increment 31: what the fault stub hands over ──────────────────────
+ * isr14_stub pushes the 14 caller-reachable GPRs above the user's rbp, then
+ * the CPU's error-code frame sits above that. These two structs are that
+ * stack, by name, so the C side never indexes by a raw constant:
+ *
+ *   [rsp]                    LinuxFaultGPRs.r15   (pushed LAST, so lowest)
+ *   ...                                              ...
+ *   [rsp + 13*8]             LinuxFaultGPRs.rax   (pushed FIRST)
+ *   [rsp + 14*8]             LinuxFaultGPRs.rbp   (the entry `push rbp`)
+ *   [rsp + 15*8]             LinuxFaultTrap.error_code
+ *   [rsp + 17*8]             LinuxFaultTrap.rip
+ *
+ * The push/pop order in arch/x86/interrupt.asm and the field order here are
+ * ONE decision: a mismatch is a handler entered with a neighbouring
+ * register's value. Clause D3 pins both orders against each other, and the
+ * host test pins the mapping into LinuxSigRegs.
+ */
+struct LinuxFaultGPRs {
+    uint64_t r15, r14, r13, r12, r11, r10, r9, r8;
+    uint64_t rdi, rsi, rbx, rdx, rcx, rax;
+    uint64_t rbp;                       /* the INTERRUPTED rbp            */
+};
+
+struct LinuxFaultTrap {
+    uint64_t error_code, rip, cs, rflags, rsp, ss;
+};
+
+/* The interrupted context a frame records, out of the stub's stack. */
+static void fault_ctx_from_frame(struct LinuxSigRegs* ctx,
+                                 const struct LinuxFaultGPRs* f,
+                                 const struct LinuxFaultTrap* tf) {
+    int i;
+    for (i = 0; i < (int)LINUX_SIGREG_COUNT; i++) ctx->r[i] = 0;
+    ctx->r[LINUX_SIGREG_R15] = f->r15;
+    ctx->r[LINUX_SIGREG_R14] = f->r14;
+    ctx->r[LINUX_SIGREG_R13] = f->r13;
+    ctx->r[LINUX_SIGREG_R12] = f->r12;
+    ctx->r[LINUX_SIGREG_R11] = f->r11;
+    ctx->r[LINUX_SIGREG_R10] = f->r10;
+    ctx->r[LINUX_SIGREG_R9]  = f->r9;
+    ctx->r[LINUX_SIGREG_R8]  = f->r8;
+    ctx->r[LINUX_SIGREG_RDI] = f->rdi;
+    ctx->r[LINUX_SIGREG_RSI] = f->rsi;
+    ctx->r[LINUX_SIGREG_RBP] = f->rbp;
+    ctx->r[LINUX_SIGREG_RBX] = f->rbx;
+    ctx->r[LINUX_SIGREG_RDX] = f->rdx;
+    ctx->r[LINUX_SIGREG_RAX] = f->rax;
+    ctx->r[LINUX_SIGREG_RCX] = f->rcx;
+    ctx->r[LINUX_SIGREG_RSP] = tf->rsp;
+    ctx->r[LINUX_SIGREG_RIP] = tf->rip;
+    ctx->eflags = tf->rflags;
+}
+
+/* And the other direction: the handler's entry context INTO the stub's stack.
+ * After this the stub's pop/iretq epilogue is itself the jump into the
+ * handler — which is why the epilogue does not branch: the delivery is a
+ * rewrite of what it is about to restore, not a second return path. */
+static void fault_ctx_to_frame(struct LinuxFaultGPRs* f,
+                               struct LinuxFaultTrap* tf,
+                               const struct LinuxSigRegs* entry) {
+    f->r15 = entry->r[LINUX_SIGREG_R15];
+    f->r14 = entry->r[LINUX_SIGREG_R14];
+    f->r13 = entry->r[LINUX_SIGREG_R13];
+    f->r12 = entry->r[LINUX_SIGREG_R12];
+    f->r11 = entry->r[LINUX_SIGREG_R11];
+    f->r10 = entry->r[LINUX_SIGREG_R10];
+    f->r9  = entry->r[LINUX_SIGREG_R9];
+    f->r8  = entry->r[LINUX_SIGREG_R8];
+    f->rdi = entry->r[LINUX_SIGREG_RDI];
+    f->rsi = entry->r[LINUX_SIGREG_RSI];
+    f->rbx = entry->r[LINUX_SIGREG_RBX];
+    f->rdx = entry->r[LINUX_SIGREG_RDX];
+    f->rcx = entry->r[LINUX_SIGREG_RCX];
+    f->rax = entry->r[LINUX_SIGREG_RAX];
+    f->rbp = entry->r[LINUX_SIGREG_RBP];
+    /* rsp and rip are the iretq frame's, not the GPR block's: the handler's
+     * stack is what the frame builder chose and its entry is the handler. */
+    tf->rsp = entry->r[LINUX_SIGREG_RSP];
+    tf->rip = entry->r[LINUX_SIGREG_RIP];
+}
+
+/* Returns 1 when the trap frame was rewritten to enter a handler (the stub's
+ * epilogue then iretq's there), 0 for every other outcome — including every
+ * refusal — which the caller handles by killing, as before. */
+int handle_page_fault(unsigned long error_code, unsigned long saved_rip,
+                      unsigned long user_rsp, unsigned long saved_rdi,
+                      unsigned long frame_rbp) {
     unsigned long faulting_address;
     __asm__ volatile("mov %%cr2, %0" : "=r"(faulting_address));
 
     if (error_code & 0x4) {
+        struct LinuxFaultGPRs* f =
+            (struct LinuxFaultGPRs*)((unsigned char*)frame_rbp - 14 * 8);
+        struct LinuxFaultTrap* tf =
+            (struct LinuxFaultTrap*)((unsigned char*)frame_rbp + 8);
+        extern struct ProcessDescriptor* process_find_current(void);
+        struct ProcessDescriptor* fcur = process_find_current();
+
+        /* E7 increment 31: THE CAPTURE SITE. `linux_cr2` is read by every
+         * delivery's si_addr (linux_sig_deliver), so a value left at 0 there
+         * means a SIGSEGV handler is told the fault was at NULL. It is set
+         * here, before any decision, so even the kill path leaves an accurate
+         * record for the crash line. */
+        if (fcur && fcur->active) {
+            int fi;
+            fcur->linux_cr2 = faulting_address;
+            fi = linux_fault_act_index(LINUX_SIGSEGV);
+            if (fi >= 0) {
+                struct LinuxSigRegs ctx, entry;
+                uint8_t frame[LINUX_SIGFRAME_SIZE];
+                uint64_t mask = 0;
+                int d;
+                fault_ctx_from_frame(&ctx, f, tf);
+                /* The P bit picks si_code: an access to a page that is not
+                 * mapped is MAPERR, one that protection refused is ACCERR. */
+                d = linux_fault_sig_plan(&fcur->linux_fault_act[fi],
+                                         fcur->linux_sig_mask,
+                                         LINUX_SIGSEGV,
+                                         (error_code & 1u) ? LINUX_SEGV_ACCERR
+                                                           : LINUX_SEGV_MAPERR,
+                                         faulting_address, &ctx, frame,
+                                         &entry, &mask);
+                if (d == 1 &&
+                    linux_user_copy_in(frame, fcur->cr3,
+                                       entry.r[LINUX_SIGREG_RSP],
+                                       LINUX_SIGFRAME_SIZE) == 0) {
+                    fcur->linux_sig_mask   = mask;
+                    fcur->linux_sig_active = 1;
+                    /* E7 increment 32: the frame's address and whose
+                     * delivery it was. The sidecar never saw this one, so
+                     * rt_sigreturn's sidecar half refuses it and the
+                     * kernel's own gate (linux_sig_fault_return_ok) is what
+                     * lets the handler return to the interrupted context. */
+                    fcur->linux_sig_frame_rsp = entry.r[LINUX_SIGREG_RSP];
+                    fcur->linux_sig_fault_active = 1;
+                    fault_ctx_to_frame(f, tf, &entry);
+                    kernel_serial_printf(
+                        "[E7] fault sig %u (code %u) addr 0x%lx -> handler "
+                        "%lx, frame %lx, mask %lx (not a kill)\n",
+                        (unsigned)LINUX_SIGSEGV,
+                        (unsigned)((error_code & 1u) ? LINUX_SEGV_ACCERR
+                                                     : LINUX_SEGV_MAPERR),
+                        (unsigned long)faulting_address,
+                        (unsigned long)entry.r[LINUX_SIGREG_RIP],
+                        (unsigned long)entry.r[LINUX_SIGREG_RSP],
+                        (unsigned long)mask);
+                    return 1;
+                }
+                /* d == 0 (no handler), a builder refusal, or a stack the
+                 * task cannot write: the attributed kill below is Linux's
+                 * own answer, and the old dump still says which. */
+            }
+        }
+
         kernel_serial_printf(
             "[FAULT] Ring-3 #PF  error=0x%lx  addr=0x%016lx  rip=0x%016lx  "
             "rdi=0x%016lx — killing process.\n",
@@ -120,7 +268,7 @@ void handle_page_fault(unsigned long error_code, unsigned long saved_rip,
     /* Phase 1: shadow PT miss — walk guest PT, install mapping, retry. */
     if (qemu_sls_mmu_shadow_fault((uint64_t)faulting_address,
                                    (uint32_t)error_code) == 0)
-        return;
+        return 0;
 
     /* ─── M7: a genuine guest #PF ────────────────────────────────────────
      * shadow_fault() refused, and a kernel #PF is the usual reason. But when

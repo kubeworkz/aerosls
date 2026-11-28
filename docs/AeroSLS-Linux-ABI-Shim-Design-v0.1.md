@@ -408,6 +408,51 @@ The reason is structural rather than budgetary. A dynamic binary is a `PT_INTERP
 - **If dynamic linking is ever needed, the work is more syscalls, not a shim feature** — enough of `openat`/`mmap`/`read`/`fstat` that `ld.so` can load itself, find its objects, and relocate them (plus `AT_PHDR`/`AT_BASE` in the auxv and `mmap(PROT_EXEC)` in the budget, both already in §5). The shim would then run the *guest's* `ld.so` exactly as it runs the guest's binary.
 - **Falsifiable trigger to revisit:** a named first user brings a dynamically linked binary *and* a static rebuild is impossible (a vendored blob, a licence, a toolchain that cannot link static). The response is then an `ld.so`-capable syscall set on a written schedule — and note that the answer is never "give the Linux task more authority", because `ld.so` needs no authority the static case lacks.
 
+### 6.1 Reopening, with a number attached (recorded 2026-11-25, the P1 audit)
+
+The P1 remediation plan's **P1-F** is this same decision restated against the
+P1 audit finding "static binaries only". It is recorded here as **out of scope
+for now** — not refused forever, and not waiting on a second design pass. What
+§6 above lacked is the price, so this subsection names the syscall surface an
+`ld.so`-capable shim would have to carry, each with the number the census would
+have to grow:
+
+| Needed by | Syscall (x86-64) | Why `ld.so`/libc needs it |
+| --- | --- | --- |
+| thread exit / robust mutexes | `set_robust_list` (273) | glibc's `pthread_exit` marks live robust mutexes; absent, a holder dies silently |
+| restartable sequences | `rseq` (334) | glibc 2.35+ registers a per-thread rseq area during start-up, before `main` |
+| stack canary / AT_RANDOM fallback | `getrandom` (318) | §5.2's `AT_RANDOM` covers the auxv case, but glibc and `ld.so` also call the syscall directly |
+| path resolution | `newfstatat` (262) | `ld.so` stats each object and its `ld.so.cache` lookup path |
+| object resolution | `readlinkat` (267) | resolving `/lib64/ld-linux-x86-64.so.2` and `$ORIGIN` chains |
+| limits probing | `prlimit64` (302) | glibc sizes the main thread's stack and guard at start-up |
+| CPU feature dispatch | `sched_getaffinity` (204) | libc picks memcpy/string variants from the affinity mask |
+| `RELRO` / text relocation | `mprotect` outside §5.4's W\|X refusal | `ld.so` re-protects `.data.rel.ro` and text after relocation; the refusal is a *policy* here, so relaxing it is a deliberate exception with its own gate, not an oversight |
+
+The loader half is the smaller half and is already designed: read `PT_INTERP`,
+map the interpreter at `AT_BASE`, build the Linux-shaped initial stack with
+§5.2's builder (`AT_PHDR`, `AT_ENTRY`, `AT_BASE`, `AT_PHNUM`, `AT_RANDOM`,
+`AT_EXECFN`), and jump to it. `ld.so` then loads and relocates its objects
+itself through `openat`/`read`/`mmap`, which the shim already runs — the
+answer stays "more syscalls", exactly as §6 says, now with the list.
+
+**Cost: 4–6 increments** in the P1 plan's units (each one a kernel/sidecar
+change with a host test, a guard clause with teeth and one live arm), plus a
+`sidecars.cpio` re-pack and an ISO boot per change because the archive is
+tracked. **Why it is out of scope rather than merely unstarted:** every entry
+in that table assumes working threads and signals, so the surface is only
+worth carrying *after* P1-A/B (thread semantics: `CLONE_CHILD_CLEARTID`,
+`clone3`) and P1-C/D (signal frames, async preemption) have landed. Before
+them, `ld.so` starts and dies inside pthread or signal start-up — a worse state
+than refusing the image by name.
+
+**`cgo` is not this decision.** A static cgo binary needs threads and
+per-thread channels (P1-B, P1-A), not the dynamic loader, and comes nearly free
+once those land. **`dlopen` needs a real `ld.so`,** so the static-musl case
+cannot have it at all — musl's own property, not a gap in this shim.
+
+The §6 trigger remains the reopen condition; this subsection only makes the
+answer to "how much?" a number instead of a shrug.
+
 ---
 
 ## 7. Decision 4 — the target order, sharpened: Rust, then Go behind threads
@@ -438,13 +483,13 @@ The inherited gate is "a static binary doing the first user's actual work, runni
 
 **Explicitly not in scope:**
 
-- **Dynamic linking** (§6) — refused, with a named trigger and a scoped path.
+- **Dynamic linking** (§6) — refused for v1, with a named trigger and a scoped path; recorded as **P1-F out of scope** on 2026-11-25, with the syscall surface it would need (273, 334, 318, 262, 267, 302, 204, plus `mprotect` outside the W|X refusal) priced in §6.1.
 - **Threads, `clone`, `futex`, thread groups** (§7) — refused in v1, named as Go's gate.
 - **The ARM64 rig** (§4.3) — it is H2 item #1's, not E7's.
 - **The environment checkpoint/restore mechanism** (§8) — v0.2 item 1's, and landed as P1a: the capture, the versioned record and the payload are not E7's to build. E7's share of it — the Linux task's entry in that record, its per-page permissions and its resumed `rip`/`rsp` — is in scope and landed (§10.14, increments 20–21).
 - **A translator** (§4.5) — QEMU-SLS's, and the line that keeps the two from competing.
 - **Nested environments** — already closed in the POSIX roadmap §12 for the same reason LPAR §9 closed nested partitions.
-- **Signal delivery to Linux tasks** (§5.6) — accepted and recorded, never delivered; E5's `env destroy` is the lifecycle.
+- **Signal delivery to Linux tasks** (§5.6) — dispositions accepted and recorded, and as of increment 26 the frame exists (§10.16); the delivery hook, the `rt_sigreturn` row and `-EINTR` wakes are increment 27's. E5's `env destroy` remains the lifecycle.
 - **Networking syscalls** (`socket`, `connect`, …) — v0.2 item 2's, and H2 §2 item #2 does not require them for the first user.
 
 ---
@@ -2508,9 +2553,11 @@ capture, 21 the replay that resumes the tenant at its captured `rip`/`rsp`, and
 that turn its failure side from an assumption into an observation. The gate's
 two halves have each now been observed on the real machine (19 the work, 21 the
 work continuing through a cycle) and 22 makes that observation re-runnable from
-one command; what it is not is automated: only the harness's source clauses run
-on a push, the boots are manual invocations, and the `fs_base` break is still
-unarmed. The contract it was scoped against is kept as written. It takes as
+one command; what it is not is automated is the LIVE run: the boots are still
+manual invocations. The harness's source clauses and the committed recording's
+replay now run on every guard sweep (§10.14's check-harness paragraph), while
+the `fs_base` break is armed only by the teeth profile, never by the default
+image. The contract it was scoped against is kept as written. It takes as
 given the file class landed at increments 17–18 (`4fbe386`, `baf0469`) — the
 thirteen census numbers crossing through the VFS, the flag contract measured
 from the real opens, the reply payload's STAT/DENTS kinds (§10.13's plan text
@@ -3298,7 +3345,7 @@ not a separate arm: `descriptor` produces a restart as its consequence and
 B3/B4 are asserted on it. The fifth is `fs_base`, armed below.
 
 **The gate's check harness has five modes, so the gate is checked even where
-QEMU is not.** Its default mode is the G1–G6 source clauses — the drill is a
+QEMU is not.** Its default mode is the G1–G7 source clauses — the drill is a
 build-time feature inside the gate branch; the wait's two bounds and the
 switch-in ledger; the outlived line gated on an open window and naming the
 running posture; the designated tenant, staged image and continuation; the
@@ -3313,6 +3360,21 @@ live arm ends with, over a recording, and that function has teeth: a recording w
 deleted reddens D1, one with a `wait ended` line injected reddens D2, and a
 tooth recording is judged against the tooth it names — each with its own
 message and a non-zero exit, not a generic failure.
+
+**The committed recording is replay-checked on every push.**
+`tests/e7_gate_evidence_check.sh` is a source-only guard over
+`evidence/e7_gate_drill_adaptive/`: it invokes the harness's `--replay` and
+requires the GREEN verdict line, not merely exit 0, because a tooth recording
+is a legitimate exit-0 outcome with expected reds. It is picked up by the same
+`tests/*_check.sh` sweep as the harness, so the adaptive wait's D1–D2 evidence
+and the gate's B1–B7 assertions are re-derived from the committed boot logs and
+`facts` on every guard run. The live boots remain manual; what this closes is
+the gap between "the recording passed once" and "the committed recording is
+still what the clauses accept." The guard's failure side is exercised on EVERY
+run: it copies the committed recording, flips `payloads=1` to `0`, and
+requires B1 to redden — a guard that accepts an empty replay cannot pass by
+doing nothing. `E7_EVIDENCE_DIR` remains the path override for an external
+check.
 
 The wait's own line is part of the change, not just the drill: a wait that
 crosses 30 s while still being scheduled now says so once, because the
@@ -3484,6 +3546,1232 @@ same recording passed all clauses. Evidence:
 
 ---
 
+### 10.15 Implementation — soft-protected pages for real `mprotect`
+
+**Status.** The representation, checkpoint v3, first-trap/apply path and
+sidecar arm below are implemented and built. Before this increment the tree
+answered every non-W|X `mprotect` with `ENOSYS` (and W|X with `EPERM`); it now
+performs the transition. The live probe has RUN (2026-11-09): the flat probe
+and the ELF candidate each mprotected a present brk page to `PROT_NONE`,
+wrote `E7MEM-SOFT-OK`, and then took a Ring-3 #PF at that same address with
+`error=0x5`. The kernel's line names `1 page(s) soft-protected (P=1 U=0)`;
+the task's `exited (code=139)` is the observation, because this shim has no
+signal frames to return to. Neither MARKER 405 (mprotect refused) nor 406
+(the read succeeded) appeared. The transcript excerpt is
+`evidence/e7_soft_mprotect_live.log`. That transcript's firstuser did not
+reach its own guard-page call; the dedicated live check now does
+(`tests/e7_firstuser_guard_check.sh`, 2026-11-09, exit 0): the real
+`aerobackup.musl.elf` issues `sigaltstack(NULL, &old)` (131 answered with
+`SS_DISABLE`), so Rust std falls through to its guard-page `mmap` +
+`mprotect(page, 4096, PROT_NONE)`, and the kernel soft-protects the page. The
+ordered serial lines are `num=00000083 … ok + payload` → `mmap ->
+0x00004000000e8000 len=12288 prot=3` → `num=0000000A … ok` → `mprotect
+addr=0x4000000e8000 len=4096 prot=0x0: 1 page(s) soft-protected (P=1 U=0)`,
+with no firstuser `mprotect … -> ENOSYS`; the mmap line carries the
+request's own three-page RW shape before the one-page carve-out, and the
+transcript is `evidence/e7_firstuser_guard_live.log`.
+
+The first live run also exposed a second wall on the same path:
+`arch/x86/syscall.asm`'s number chain routed rax=131 to `.do_sls_svc_crash`
+BEFORE `do_syscall`'s personality branch, so the query became `svc crash:
+Service '(null)' not found`, the old `stack_t` stayed zeroed, and std returned
+early. 131 is now absent from that chain; SLS still reaches the same handler
+through `do_syscall`'s `SYS_SLS_SVC_CRASH` arm, and clause set **R9** keeps it
+that way. The live check's own mutation test
+(`tests/e7_firstuser_guard_check_smoke.sh`) replays the committed transcript,
+a CRLF-serialized copy of it (pinning the serial-line strip), and twenty-one
+mutants: one whose firstuser 131 line is `-> ENOSYS` with the guard
+mmap+mprotect removed; one where 131 is answered but the guard `mprotect(0xA)`
+line is `-> ENOSYS`; one where the mprotect is granted but the kernel's
+`soft-protected` apply line is removed; one where the mprotect grant line is
+moved before its 131 query, so every line succeeds but the causal order is
+wrong; one where the apply line names a different page from the guard mmap
+base, so every request succeeds but the page protected is not the page the
+mmap reserved; one where the apply names the right page but covers only half
+of it; one where the apply protects the page writable (`prot=0x2`) instead of
+PROT_NONE; one where the apply omits its `prot` field entirely; one where the
+apply keeps addr/len/prot but drops the kernel's
+`soft-protected (P=1 U=0)` claim; one where the apply omits its `len` field
+entirely; one where the apply carries a non-hex address and must be rejected
+as unparseable; one where the firstuser's guard mmap base line is removed,
+leaving the apply with no base to match; one where the mmap base carries a
+non-hex digit and must be rejected as unparseable; and one where the guard's
+mprotect grant line is removed, leaving the apply without a preceding grant; one where both firstuser 131
+lines are removed, so the grant and apply remain but the query that must
+precede them is gone; one where that same missing-query transcript is
+serialized with CRLF, so the named failure must survive both conditions
+together; and one where a probe's soft-protect line follows the firstuser
+grant and the firstuser apply is gone, so the address assertion must reject
+the foreign page; one where the guard mmap is two pages (`len=8192`);
+one where it is read-only (`prot=1`); one where the grant line omits its
+`len` field; and one where it omits its `prot` field. The checker must fail
+each by name, so the assertions cannot rot into "any transcript passes."
+
+**The representation is a present, supervisor-only leaf.** A page made
+inaccessible with `mprotect(PROT_NONE)` keeps its frame and its present PTE,
+clears the user bit, and sets one of the PTE's software-available bits:
+
+| PTE field | normal user page | soft-protected page |
+|---|---|---|
+| bit 0 `P` | 1 | 1 |
+| bit 1 `W` | from `PROT_WRITE` | 0 |
+| bit 2 `U/S` | 1 | 0 |
+| bits 3–4 `PWT/PCD` | preserved | preserved |
+| bits 5–6 `A/D` | preserved | preserved |
+| bit 7 `PS` | 0 (4 KiB leaf) | 0 (4 KiB leaf) |
+| bit 9 `SOFT_NONE` | 0 | 1 |
+| bits 12–51 | frame | the **same** frame |
+| bit 63 `NX` | `!PROT_EXEC` | 1 |
+
+The new constant is `USER_PTE_SOFT_NONE = (1ULL << 9)`; bits 9–11 are
+documented as software-available for 4 KiB PTEs, and bit 9 is the one this
+design claims. `SOFT_NONE` is a state bit, not a frame bit: the frame mask
+never sees it.
+
+**Why this state, and why not the obvious alternatives.** Clearing `P` would
+make the frame invisible to the three walks that must still find it:
+`env_payload`'s capture (`ep_resolve_ex`), `user_destroy_page_table`'s
+teardown, and the `linux_user_page_frame` read-back used by `munmap` and
+the brk/mmap unwinds. A side table of protected frames would duplicate page
+table state, need its own capture/restore format and teardown path, and
+could drift from the PTE. Keeping `P=1` and clearing `U` is the x86
+mechanism that denies every Ring-3 access while leaving the frame owned and
+walkable by the kernel. There is no read-disable bit on x86, so `U=0` is
+also the only honest representation of `PROT_NONE`; `W=0` and `NX=1` make
+the state explicit rather than relying on the fault path to infer it.
+
+**Invariants.**
+
+1. A soft leaf is `P=1`, `U=0`, `W=0`, `NX=1`, `SOFT_NONE=1`, `PS=0`.
+2. A normal user leaf is `P=1`, `U=1`, `SOFT_NONE=0`; `W` and `NX` are the
+   requested protection.
+3. `SOFT_NONE` appears only on a 4 KiB leaf, never on an intermediate table.
+4. The leaf's frame is unchanged across every `mprotect`; no frame is
+   allocated, freed, zeroed, or re-owned by the transition.
+5. `USER` and `SOFT_NONE` are mutually exclusive on a captured page.
+6. A transition validates the whole range before changing the first PTE; a
+   missing, huge, or foreign page leaves every byte of the range unchanged.
+7. `mmap(PROT_NONE)`'s no-frame reservation is **not** a soft page. It has no
+   PTE, and a later `mprotect` over it returns `ENOMEM` in v1 rather than
+   inventing frames the reservation never owned.
+
+**Transitions.** `mprotect` is a page-table transition, not a mapping. The
+valid `prot` words map as follows (bits outside 0x7 are `EINVAL`):
+
+| `prot` | leaf after the change |
+|---|---|
+| `0` (`PROT_NONE`) | soft leaf: `U=0`, `W=0`, `NX=1`, `SOFT_NONE=1` |
+| `1` (`R`) | `U=1`, `W=0`, `NX=1` |
+| `2` (`W`) | `U=1`, `W=1`, `NX=1` (x86 makes it readable) |
+| `3` (read+write) | `U=1`, `W=1`, `NX=1` |
+| `4` (`X`) | `U=1`, `W=0`, `NX=0` |
+| `5` (read+execute) | `U=1`, `W=0`, `NX=0` |
+| `6`/`7` (write+execute) | refused `-EPERM` at the first trap, both ends |
+
+The soft→normal transition clears `SOFT_NONE`, sets `U`, and installs the
+requested `W`/`NX` bits; the frame returns unchanged. Normal→soft preserves
+the frame and contents, so a later `mprotect(R)` is not a remap and does not
+lose data. Each changed page gets one `user_invlpg`; the task is parked in
+this trap on this CPU with its CR3 loaded, the same single-CPU posture the
+MAP_FIXED replace already relies on.
+
+**Ownership walks.** Three existing readers must learn the new state without
+loosening the two copy walks:
+
+- `user_destroy_page_table`'s leaf test becomes `USER || SOFT_NONE` for a
+  present leaf; intermediate tables keep their existing user-bit test. The
+  soft frame is freed exactly once, by the same `user_frame_refused` and
+  frame-owner checks as any other leaf.
+- `linux_user_page_frame` (and the brk/mmap unwind's read-back) must accept a
+  soft leaf: it is the ownership read, not a copy. It should use a dedicated
+  owner walk, or an `accept_soft` parameter, and never become the walk the
+  copy plans use.
+- `linux_user_copy_out`/`linux_user_copy_in` and `linux_path_measure` keep
+  their `U=1` requirement at every level. A soft page is not a buffer the
+  sidecar may read or the kernel may write; `U=0` is the security boundary,
+  and loosening the copy walk would turn `PROT_NONE` into a decorative bit.
+
+**The page-table helper.** The transition is
+`int user_protect_page(uint64_t* pml4, uint64_t va, uint64_t flags)`: a
+present-child walk, no allocation, 4 KiB leaves only, returning 0 after
+changing one leaf and -1 for a missing or huge page. The caller walks the
+whole range once to validate and again to apply, then `user_invlpg`s every
+changed page. The helper is deliberately separate from `user_map_page`:
+`user_map_page` may allocate intermediate tables from a tenant-supplied
+address, while this path must never turn a permission check into a memory
+lever.
+
+**The syscall split.** The first trap validates the request words and stages
+`addr`, `len`, and `prot` in the existing `mem_stage_*` fields; no new
+request struct is needed. It refuses zero/overflowing lengths, an unaligned
+address, unknown prot bits, and W|X before any post. The sidecar's 10 arm
+repeats the shape and W|X policy and answers success for a valid transition;
+it does not choose an address, allocate a frame, or move `MemBrk.cur` or
+`MemBrk.mtop`. Unlike mmap, there is no address choice to delegate: the
+kernel's page tables are the only truth about which pages exist, so the
+reply's apply walks them, requires every page to be a present 4 KiB page in
+the task's image, stack, or heap window, and refuses with `ENOMEM` before
+mutating anything if one is absent or outside those windows. A negative
+sidecar reply passes through unchanged. The sidecar therefore remains the
+policy half for W|X and prot shape, while the page-table walk is the
+mechanism half; neither end alone can grant a page the other would refuse.
+
+**Checkpoint and restore.** The page-permission word grows one bit:
+`EP_PAGE_PERM_SOFT = 0x8`, with `EP_PAGE_PERM_MASK = 0xf`. `ep_perm_of`
+records `SOFT` from the leaf and records `USER` only when `U=1`;
+`ep_resolve_ex` accepts a present leaf whose leaf is `USER` **or** `SOFT`.
+The capture therefore includes a soft page's bytes and records `0x8`
+(no `USER`, no `WRITE`, no `EXEC`). The restore's missing-page mapping
+sets `USER_PTE_SOFT_NONE` and does not set `USER` when the bit is present;
+a blob that sets `SOFT` together with `USER`, `WRITE`, or `EXEC` is a format
+refusal, and the live-permission comparison includes `SOFT`, so a replay
+cannot silently turn a protected page back into a normal one.
+
+The blob version becomes **3**. The writer emits 3; the reader accepts 2
+and 3, because a v2 environment has no soft pages and its existing
+permission words remain valid. A v2 reader then refuses a v3 blob by
+version rather than misreading it. The directory header and the blob head
+must be bumped together, and the existing gate evidence (v2) must still
+replay.
+
+**Tests the design requires before it is called landed.**
+
+- Host tests over the pure transition table: every `prot` 0–7, W|X, unknown
+  bits, zero/overflow lengths, unaligned addresses, and the soft→normal and
+  normal→soft directions with the frame unchanged.
+- Fake-page-table tests for `user_protect_page`: present leaf changed,
+  missing leaf refused without allocation, huge page refused, soft leaf
+  found by the owner walk, and the copy walkers still refusing `U=0`.
+- A teardown test that creates a soft leaf and proves its frame is freed
+  once; a second teardown of a normal page must be unchanged.
+- Capture/restore tests for `EP_PAGE_PERM_SOFT`: v3 round trip, v2 replay,
+  soft page mapped `U=0` on a fresh page table, a soft+W/X or soft+USER blob
+  refused by format, and a live permission mismatch refused by name.
+- Sidecar unit tests for the 10 arm: valid non-W|X grant with no cursor
+  movement, W|X EPERM, unknown prot EINVAL, and malformed range EINVAL.
+- A live probe task that `mprotect`s a mapped page `PROT_NONE`, observes
+  success, and proves a subsequent access faults rather than reading. **Done
+  (2026-11-09):** both the flat probe and the ELF candidate wrote
+  `E7MEM-SOFT-OK` after the transition and then took a Ring-3 #PF at the
+  same address with `error=0x5`; the kernel logged the soft state by name.
+  The probe is disposable: this shim has no signal frames, so the task's
+  death is the observation, not a handler invocation. **The real firstuser's
+  guard call is observed separately** (`tests/e7_firstuser_guard_check.sh`,
+  2026-11-09, exit 0): its 131 query and install are answered, its guard-page
+  `mprotect(PROT_NONE)` is granted, and the kernel soft-protects the page;
+  `evidence/e7_firstuser_guard_live.log`. Source clause set **Y** in
+  `tests/linux_personality_check.sh` (and its three smoke teeth) names the
+  soft state in the source, and the live transcript names it in the kernel
+  line — not merely "mprotect returned 0."
+
+**Implementation order.** (1) the PTE bit, `user_protect_page`, and the owner
+walk; (2) teardown and the copy-walk regression tests; (3) the v3 checkpoint
+permission bit and restore mapping, with v2 compatibility; (4) the mprotect
+first-trap plan, sidecar arm, reply apply, and `invlpg`; (5) the probe, source
+clause set Y, and the live evidence. No step is safely reordered: the checkpoint
+and teardown must understand the state before the syscall can create it,
+or a crash after a real `mprotect` would leak the frame it is supposed to
+preserve.
+
+**Coverage added with this implementation.** `tests/user_map_identity_host_test.c`
+drives `user_protect_page` in both directions, proves the frame is unchanged,
+and refuses a missing leaf without allocation. `tests/env_payload_host_test.c`
+captures a soft heap page and restores it after removing its leaf, proving the
+pour allocates a frame and installs `P|NX|SOFT_NONE` rather than `USER`. The
+sidecar's `mprotect` arm has shape, W|X and no-cursor-movement tests, and the
+same host test proves teardown frees a soft leaf's frame exactly once. The checkpoint host test now covers a soft-free v2 replay, a v2 blob claiming the
+v3-only soft bit, and soft+USER / soft+W|X permission words with a valid index
+CRC. `tests/linux_personality_check.sh` clause set **Y** now pins the contract,
+the first trap, the all-pages prewalk/apply, the page-table helper, the sidecar
+twin, both host tests and the probe's marker/fault pair; its three new teeth
+remove the positive marker, the success-path jump to the soft case, and the
+`user_protect_page` call. The live probe has run (transcript above), and the
+real firstuser's own guard-page call is verified by its dedicated boot
+(`tests/e7_firstuser_guard_check.sh`, exit 0,
+`evidence/e7_firstuser_guard_live.log`); clause set **R9** keeps 131 out of
+the asm number chain that had been deciding it before the personality branch.
+
+---
+
+### 10.16 What has landed — increment 26 (the signal frame, P1-C's first half)
+
+Increment 10's seam recorded dispositions and refused to run them, because
+there was no frame to run a handler in. Increment 26 lands the frame itself as
+a **pure function**, and nothing else — the split is deliberate, because the
+layout is the one artifact a guest's libc reads unaided and a wrong number in
+it fails in the handler rather than here.
+
+- **The contract** (`kernel/linux_abi.h`): `LINUX_RT_SIGRETURN` 15 (named, not
+  yet classified), the 440-byte `rt_sigframe` at the kernel's own offsets
+  (pretcode 0, ucontext 8, sigcontext 48, sigset 304, siginfo 312), the
+  sigcontext's internal offsets (rip at 128, eflags at 136, cs at 144, fpstate
+  at 184, reserved1 192..256), and four decisions: `linux_sig_frame_build`,
+  `linux_sig_frame_restore`, `linux_sig_default_action` (Linux's action table,
+  0..64 total), `linux_sig_delivery_needed` and `linux_sig_park_is_eintr` —
+  Linux's EINTR rule (install, not blocked, no `SA_RESTART`) as a predicate
+  rather than an inline condition, so increment 27's park flag and the
+  sidecar's answer have one named rule to agree on.
+- **The mechanism** (`kernel/linux_abi.c`): the builder applies Linux's own
+  `align_sigframe` arithmetic (`rsp % 16 == 8` at handler entry), picks the
+  alternate stack only for a usable, enabled one under `SA_ONSTACK` (and
+  records `SS_ONSTACK`), composes the handler's mask as
+  `blocked | sa_mask | the signal` minus `SA_NODEFER`, writes `cs = 0x33`,
+  and fills `siginfo`'s `si_signo`/`si_code`/`si_addr` (a real crash reporter's
+  three fields). It refuses — `-EINVAL`, before any write — a short buffer, a
+  signal outside 1..64, a `SIG_DFL`/`SIG_IGN` handler, a zero restorer (a
+  handler that cannot return), and a stack with no room. Restore refuses a
+  short frame and one whose `cs` is not `0x33` — the one field a forged frame
+  cannot pick correctly.
+- **The layout is pinned by the compiler, twice**: a mirror of `sigcontext`,
+  `ucontext` and `rt_sigframe` in the .c plus twelve `_Static_assert`s tying
+  each field to the published offset. That is not ceremony: the first build
+  failed on `offsetof(uc_sigmask) == 296`, which is what caught the author's
+  own 304-vs-296 confusion between the frame offset and the ucontext-relative
+  one.
+- **Named limits, in the header where they cannot be missed**: no `fpstate`
+  (pointer NULL, sigreturn does not touch the FPU — so a handler that clobbers
+  xmm keeps the clobbering, and P1-D's async preemption needs the real one),
+  and **no delivery** — nothing writes a user stack, touches CR2 or hooks
+  return-to-user, and `rt_sigreturn`'s table row stays absent until a real
+  census run (increment 27) rather than being added on belief.
+- **Evidence**: `tests/linux_sigframe_host_test.c` (64 checks: offsets as
+  literals, the entry shape, `cs` both ways, altstack plus its disabled/tiny
+  fallbacks, the mask with and without `SA_NODEFER`, the build/restore round
+  trip, the EINTR/`SA_RESTART` split, and the deliberate-absence assertion);
+  `tests/linux_personality_check.sh` clauses **P–P4**; four new teeth in
+  `tests/linux_personality_check_smoke.sh` (offset edited, rip assert dropped,
+  entry-align case removed, dispatch smuggled in) — 139 teeth total, all
+  biting. `make x86-iso` still builds.
+
+**What increment 27 needs before a live arm is worth wiring**: the
+return-to-user delivery hook (frame write through the validated copy path, RIP
+handed to the handler), the `rt_sigreturn` row *with* its census trace, the
+sidecar's `-EINTR` answer on the parked forward, and `CR2` for `SIGSEGV`.
+Until those land, clause **P4** refuses the increment being read as delivery.
+
+---
+
+### 10.17 What has landed — increment 27 (the delivery's mechanism)
+
+Increment 26 built the frame; this one gives it somewhere to go, and gives
+the park a way to end. Four pieces, all of them mechanism, none of them a
+claim that the live arm works:
+
+- **The request** (`struct LinuxSigDeliverReq`, 80 bytes): the sidecar's act
+  words — signo, code, addr, handler, restorer, flags, mask, the thread's
+  blocked set, the altstack — decoded from a fixed reply payload by
+  `linux_sig_deliver_req_parse`. Exactly 80 bytes: 79 is truncated and 81 is
+  a different message, and neither is repaired. The struct's size is pinned
+  to the wire length by a `_Static_assert`, and the decoder refuses a signo
+  outside 1..=64, a `SIG_DFL`/`SIG_IGN` handler and a zero restorer before the
+  write path exists to be reached.
+- **si_addr from the fault, not from habit** (`linux_sig_si_addr`): CR2 for
+  SIGSEGV and SIGBUS, RIP for SIGFPE and SIGILL (CR2 is stale on those), the
+  sidecar's own address for a software-sent signal, and — the case that makes
+  the function worth having — `cr2 == 0` for a NULL deref is returned as an
+  *answer*, not mistaken for "no address".
+- **The hook's core** (`linux_sig_deliver`): build the frame from the
+  interrupted context plus the request, then write those 440 bytes through
+  `linux_user_copy_in` against the task's own cr3, returning the handler's
+  entry context (RIP = handler, rsp = frame, RDI = signo) and the mask to
+  install. The copy is two-phase, so a read-only or unmapped stack is
+  `-EFAULT` with the guest's bytes untouched — asserted by sentinel in the
+  host test. **Registers are not applied here**: the return-to-user caller
+  owns that, which is what keeps this half host-testable against fake tables.
+- **The park's wake** (sidecar): `park_interrupt` — arrived-and-unblocked, a
+  `DISPO_HANDLER`, and no `SA_RESTART` — answers a parked console read or
+  poll with `-EINTR` and clears the pending bit. A restartable handler leaves
+  the park alone (Linux restarts the syscall). Its code is `CAP_EINTR (-33)`,
+(-21..-32 are M1's network frontier, so the family moved past it),
+  mapped to `-EINTR` through §5.7 like every other code: it is *not* EAGAIN's,
+  because a caller retries an EINTR and must not retry a would-block.
+
+**What this is still missing, and it is the load-bearing part of "live":**
+nothing calls `linux_sig_deliver` yet. The reply that would carry the 80-byte
+request has no shape in `chan.c`'s deliver (a tkill stages no payload, so the
+bound would refuse it), the sidecar's tkill arm still answers `E_NOSYS` to a
+handler instead of emitting the request, and the dispatcher's reply-apply has
+no arm that installs the returned entry context into the task. Until those
+three land, a handler still does not run — and the guard says so: **P4** pins
+that the only writer is the validated copy, **P5** that the EINTR rule is one
+rule in two languages, and `rt_sigreturn` remains `LSC_UNKNOWN` with no
+dispatcher mention (clauses P2, P4), which is the one thing this increment is
+not allowed to fake.
+
+**Evidence**: `tests/linux_sigdeliver_host_test.c` (32 checks — the decoder's
+three refusals, six si_addr cases, and a real delivery through fake page
+tables: entry shape, pretcode, sigcontext, `cs = 0x33`, the composed mask
+`0x406` with and without `SA_NODEFER`, `-EFAULT` on a read-only and on an
+unmapped stack with the sentinel untouched); the sidecar's
+`a_parked_forward_is_woken_only_by_a_handler_without_sa_restart` (six cases,
+one per branch of the rule); guard clauses **P4–P8**; teeth t143–t148
+(EAGAIN code, map row deleted, si_addr case nudged, length refusal loosened,
+second writer, sentinel assertion removed).
+
+---
+
+### 10.18 What has landed — increment 28 (the delivery, wired)
+
+Increment 27 built the mechanism and said plainly that nothing called it.
+This one connects the three ends, and a handler is now entered by the same
+reply channel the rest of the shim already uses — no new protocol, no
+second queue:
+
+- **The plan** (`linux_fd_reply_plan`): tkill stages `LINUX_STAGE_SIGFRAME`
+  with **no user destination** (dst 0) and a bound of exactly 80 bytes — the
+  bytes are the kernel's instruction, not something owed to a pointer — and
+  `linux_reply_shape_ok` demands `ret == 0 && n == 80` for that number, so a
+  short or padded answer is refused before anything is built.
+- **The sidecar** (`LINUX_TKILL`'s handler arm): instead of the old
+  record-only `E_NOSYS`, it answers `Answer::SignalFrame` with the 80-byte
+  request, moving its own mask to `blocked | sa_mask | the signal` (minus the
+  signal under `SA_NODEFER`) *before* the reply, and sending it through
+  `reply_bytes` so the kernel sees 72 + 80 with a zero status and an echoing
+  num. The old contract's test is retired and replaced by two: the request's
+  field-by-field contents, and "a handler never falls back to its default".
+- **The kernel's arm** (`chan.c`): the SIGFRAME branch bypasses the pointer
+  copy path entirely and calls `linux_sig_reply_apply`, which decodes the
+  request, reads the interrupted context out of the park context, calls
+  `linux_sig_deliver` (frame built, written through the validated copy), and
+  installs the entry context back into the park context. **A second writer
+  still does not exist**: the only store into a user page is
+  `linux_user_copy_in`.
+- **The entry** (`cap_resume_linux_sig`): the return path rebuilds its frame
+  from `park_ctx`, so installing RIP at word 1, the frame's rsp at word 8 and
+  the signo at word 9 *is* the jump into the handler. It is
+  `cap_sysret_resume`'s push-and-sysret — the code the boots already
+  validated — with `do_syscall` removed (the syscall has been answered) and
+  **no `swapgs`**: this runs inside `do_syscall`, already in the kernel view.
+  `CapParkCtx`'s size is asserted at 120 bytes where the layout is defined.
+  Every refusal (bad request, builder refusal, `-EFAULT`, failed install)
+  returns an errno with the task's memory untouched and the park intact.
+
+**What a live arm will and will not do**: a task that raises a
+handler-disposed signal will now *enter* its handler. It will not get out of
+it — the handler returns through the restorer, which issues `rt_sigreturn`,
+and that number is still `LSC_UNKNOWN` (clauses P2/P4): the sidecar answers
+`-ENOSYS` and the return path breaks there. That row needs a real census
+trace, not a belief, and it is the next increment's whole subject. Two
+smaller named gaps: `linux_cr2` is not yet captured by the page-fault path,
+so a `SIGSEGV` delivery names the request's address (a software-sent signal
+is exact; a fault-derived one is not yet), and the *reveal* path —
+`rt_sigprocmask` unblocking a pending handler-disposed signal — still refuses
+by name rather than delivering from inside that syscall.
+
+**Evidence**: `tests/linux_sigdeliver_host_test.c` now 38 checks (the park
+bridge's read/install round trip, both short-context refusals, and the
+install-by-offset assertions); sidecar 77 tests; guard clauses **P9–P11**
+(the wire's three ends agreeing on one length, the install's offsets and the
+resume's absent `swapgs`, and one mask in two languages with the resume
+reachable only after a successful install); teeth t149–t152 (plan bound
+narrowed, sidecar back to record-only, install word nudged, chan.c's branch
+deleted). `make selfhost-bootimage` and `make x86-iso` both exit 0.
+
+---
+
+### 10.19 The live proof — a handler actually runs in ring 3
+
+Increment 28's wiring was asserted from source: host tests, a guard clause
+and teeth, with the honest note that no boot had entered a handler. This is
+the boot.
+
+The fixture is the probe that already ran at every boot
+(`fixtures/e7_linux_probe.S`, spawned by `entry.rs` through the real
+`create`), extended at the end of its flow rather than beside it. The
+cheapness is the point: no new fixture, no new spawn hook, no new archive
+variant, no new QEMU recipe — the existing probe now also measures the
+delivery.
+
+- **Order, and why it is this order.** The probe's last step was already
+  terminal: it soft-`mprotect`s a page to `PROT_NONE`, writes its marker and
+  then *reads* the page, which must `#PF` and kill the task (that death is
+  the mprotect's proof). A handler that cannot yet return is equally
+  terminal, so the two compose: the probe arms the soft page, installs
+  `SIGUSR1 -> .Lhandler`, raises it with `tkill`, and **the handler** writes
+  `SIGHAND-OK` and then performs the soft case's marker write and its
+  fault. Nothing the probe proved before was dropped, and the fault at the
+  end now happens in ring-3 code the kernel jumped to.
+- **What the boot shows** (`tests/linux_signal_probe_check.sh`, serial
+  transcript saved to `/tmp/e7_signal_probe_boot.log`):
+
+  ```
+  [E7] sig 10 (code 0) -> handler 400000000427, frame 400000004c98, mask 200
+  [E7] linux: num=00000001 child=e7.linux.probe.0 write ok len=11 |SIGHAND-OK.|
+  ```
+
+  The first line is the kernel's own — a frame was built at
+  `0x400000004c98` and the handler's mask is `0x200`, which is bit 9:
+  SIGUSR1's own bit, the number the sidecar computed and the kernel
+  installed. The second is the fd class logging the **handler's** write,
+  attributed to the probe's task (`e7.linux.probe.0`) — the bytes
+  `SIGHAND-OK` are only in `.Lhandler`, so the code that ran is the code
+  the kernel jumped to. Markers 409 (the `tkill` returned), 410 (the install
+  refused) and 411 (a handler returned into the restorer) were all absent,
+  and the probe's earlier markers were all present in the same run.
+- **What it still does not show, by construction**: the handler finishes the
+  soft case and dies instead of returning — `rt_sigreturn` still has no
+  table row, so a handler that returned would forward 15 and come back
+  `-ENOSYS`. Marker 411 exists to make that failure loud if anyone changes
+  the handler's tail before the row lands.
+
+### 10.20 The return trip — a handler that comes back, and the row's trace
+
+Increment 29 closes the gap 10.19 named. Two things had to be true first: the
+number had to be *measured* rather than assumed, and the frame had to hold the
+right mask.
+
+- **The census.** §5.6's rule is that a table row is built from a measured
+  trace. The candidate's own artifact (`tools/linux_syscall_census.txt`) was
+  the wrong instrument here: the backup operation never returns from a
+  handler, so 15 never appears in it. `tools/linux_rt_sigreturn_census.sh`
+  measures the flow the row exists for — a two-function program that installs
+  a handler, raises it, and lets it return, traced with `strace -f`,
+  entry-counted, in the same columns and with the same provenance block
+  (method, binary sha256, host, date) as the candidate artifact. Result:
+  `tools/linux_rt_sigreturn_census.txt`, one row — `15 rt_sigreturn 1` — and
+  the program exits 0, which is the return landing. The table cites the
+  artifact by path; guard clause P13 asserts the row, its provenance columns
+  and its presence in both the table and the host test, and tooth t154
+deletes the row to prove the clause reddens.
+- **The mask the frame had to carry.** Increment 26's builder stored the
+  *handler's* mask (`blocked | sa_mask | the signal`) at `uc_sigmask`
+  (offset 304). That is the wrong field: Linux's frame setup copies
+  `current->blocked` there *before* adding `sa_mask` and the signal, and
+  `rt_sigreturn` restores from it. A frame storing the handler's mask leaves
+  the signal blocked forever after one return — the exact defect the P11
+  test could not see, because both ends agreed on the wrong number. The
+  builder now writes `spec->blocked`, the host test asserts that the frame's
+  mask and the entry mask are *different numbers* (`0x2` vs `0x406`), and the
+  boot below shows the restored mask as `0`.
+- **The restore, split by what each side owns.** The handler's restorer is
+  its own guest code (`mov $15, %eax; syscall`). The number is classified
+  `LSC_SIG` and forwarded like the rest of the sig class — the sidecar owns
+  the mask, so it puts back the `saved_mask` it captured when the delivery
+  happened, and refuses a 15 with no handler entered (`-EINVAL`, nothing
+  mutated). The frame is *not* the sidecar's: only the kernel can walk the
+  task's page tables, and the frame address is whatever `rsp` the handler was
+  entered with (`park_ctx.user_rsp`). So `linux_sig_return_apply()` reads 440
+  bytes through `linux_user_copy_out` against the task's own cr3 (a frame the
+  task unmapped is `-EFAULT`, never a ring-0 fault, and a forged `cs != 0x33`
+  is refused by name), restores the registers and the mask, clears
+  `linux_sig_active`, and resumes into the interrupted context.
+- **RAX had to join the context.** `cap_resume_linux_sig` hardcoded
+  `xor %eax, %eax` — correct for a delivery (nothing was returned) and wrong
+  for a return (the interrupted syscall owes its caller the value it had).
+  The park bridge gained word 15 (`CapParkCtx` is 128 bytes, asserted where
+  it is defined), the resume loads `120(%1)`, and a delivery installs 0 there.
+  Guard P15 and tooth t156 pin it.
+- **The boot** (`tests/linux_signal_probe_check.sh`, transcript
+  `/tmp/e7_signal_probe_boot.log`). The probe's handler now ends by jumping
+  to its restorer instead of into the soft case's death, and the code after
+  the `tkill` is where the return lands:
+
+  ```
+  [E7] sig 10 (code 0) -> handler 400000000441, frame 400000004c98, mask 200
+  [E7] linux: num=00000001 child=e7.linux.probe.0 write ok len=11 |SIGHAND-OK.|
+  [E7] rt_sigreturn: restored rip 400000000415 rsp 400000004e60 rax 0 mask 0
+  [E7] linux: num=00000001 child=e7.linux.probe.0 write ok len=10 |SIGRET-OK.|
+  ```
+
+  Four lines, four different authors: the kernel's delivery (frame at
+  `…4c98`, handler mask `0x200`), the handler's own bytes from ring 3, the
+  kernel's restore (`rip 0x415` is the instruction after the `tkill`, `rsp`
+  back at `0x4e60`, mask `0` = the pre-handler set), and finally the probe's
+  `SIGRET-OK`, written by code that only runs if the interrupted context came
+  back. Markers 409/410/411 stay absent; the probe still ends in the soft
+  `PROT_NONE` death, which is now the flow *after* a completed return.
+- **Named remainders.** The alternative stack (`sa_restorer` on the guest's
+  own `SA_ONSTACK` stack) is still the kernel's synthetic frame, not the
+  guest's trampoline; `rdx`-carried `ucontext` details beyond `uc_sigmask`
+  are not restored; and a signal delivered *during* a restorer's single
+  instruction window is still not restartable. None of them are reachable
+  from the flows measured so far.
+
+### 10.21 What has landed — increment 29b (the return trip's gate)
+
+Increment 29 split the return trip by ownership — the sidecar restores its
+mask, the kernel restores the frame — and then gated the kernel's half on the
+wrong question: `chan.c` restored unless the apply had answered `-EPROTO`. But
+`-EPROTO` is "the reply was not the request struct", not "the sidecar said
+yes"; the sidecar's own refusal of a 15 with no handler entered (`-EINVAL`,
+nothing mutated) passes that test and was therefore *restored anyway*, with its
+errno discarded. Two effects, both silent: the task resumes into a frame whose
+mask the sidecar never unwound, and the caller is handed a context instead of
+the error Linux would have faulted on.
+
+The gate is now the sidecar's answer, named once:
+
+- **The contract** (`kernel/linux_abi.h`, `linux_abi.c`):
+  `linux_sig_return_reply_ok(num, rax, status)` — pure, and deliberately three
+  questions rather than one. `num == 15` because the gate belongs to
+  rt_sigreturn, not the sig class (a successful `rt_sigprocmask` must not
+  resume through a frame nobody pushed); `rax != -EPROTO` because a reply that
+  never applied leaves `status` at `describe`'s zero, which is *not* the
+  sidecar's; and only then `status == 0`, which is the one status its 15 arm
+  sends after putting `saved_mask` back.
+- **The mechanism** (`kernel/chan.c`): the branch is `if (15) { if (!gate)
+  return rax; …restore }` — a refusal falls through to the rax the §5.7 map
+  already produced, so the task hears `-EINVAL` with its frame untouched. The
+  old `rax != (uint64_t)(int64_t)(-LINUX_EPROTO)` shape is gone by name, and
+  clause P16 fails if it comes back.
+- **The checks.** The host test drives all four answers (open, sidecar
+  refusal, never-applied, wrong number) before it drives the restore itself;
+  clause P16 pins the predicate's three lines, the call site and the removal
+  of the old condition; tooth `t158` rewrites the gate to `0 && …`, which
+  restores on any applied reply — the exact defect — and reddens P16.
+
+What this does *not* change: the boot's success path. `status == 0` was already
+the only reply the 15 arm sent on a real return, so the live flow still ends in
+`[E7] rt_sigreturn: restored …` and `SIGRET-OK`; what is new is that the
+refusal branch now has a named condition, a host test and a tooth instead of
+riding on a negative.
+
+### 10.22 What has landed — increment 29c (the refusal, on a boot)
+
+29b's refusal branch was proven only where the tree can see it: the host test
+drove all four gate answers and tooth `t158` reddened P16 when the gate was
+rewritten to restore anything. Neither shows what a boot shows — that a real
+ring-3 task issuing 15 with no handler entered hears `-EINVAL`, keeps running,
+and sees no restore.
+
+The probe now measures it, in the same boot as the return trip. Before it
+installs SIGUSR1 (the new head of `.Lsig_try` in
+`user/sidecar/fixtures/e7_linux_probe.S`), it issues `rt_sigreturn(15)` with
+nothing delivered: the install is later in the same flow, so "no handler
+entered" is a property of the program's order rather than a claim. The
+sidecar's 15 arm refuses by name (`E_INVAL`, nothing mutated), the gate
+declines to restore, and `chan.c` falls through to the rax the §5.7 map
+produced — so the task must see exactly `-22` (`-EINVAL`). It then writes
+`SIGRET-NOHAND-OK` through increment 5's fd seam, a marker that can only
+appear if the syscall returned as an errno and the task continued at the
+instruction after it, and goes on to arm the soft page and run the delivery
+and return trip that end the boot.
+
+What the check asserts (`tests/linux_signal_probe_check.sh`): the marker is
+present; the boot carries **exactly one** `[E7] rt_sigreturn: restored …`
+line — the handler's own return — so a second one can only be the refused 15
+restoring anyway; the marker precedes that line; and MARKER 412 (the refusal
+answered with anything but `-EINVAL`) is absent. Clause P17 pins both halves
+of that binding, and tooth `t159` widens the expected errno to `-1`, which
+leaves the boot silent but reddens P17 — the check names the number, so the
+number cannot drift unnoticed.
+
+What this does *not* prove: that a 15 carrying a *forged* frame in a task
+that never had a delivery is refused by the kernel too. The kernel's own
+`linux_sig_active` guard in `linux_sig_return_apply` refuses that shape after
+the gate, and this boot's refusal never reaches it because the sidecar answers
+first.
+
+### 10.23 What has landed — increment 30 (the thread-exit glue)
+
+The thread group could create a sibling and let it exit, but nothing observed
+the exit the way a pthread does: `CLONE_CHILD_CLEARTID` was *deliberately
+absent* from the clone allowlist, `set_tid_address` was "stored and ignored",
+and `set_robust_list` did not exist. So `pthread_join` could only hang and a
+robust mutex could only lie, however correct the group substrate was.
+
+This increment adds Linux's two exit duties, both kernel-local for the same
+reason futex is (the word lives in the group's page table, which the sidecar
+does not have, and the waiter is a descriptor this scheduler parks):
+
+- **The contract** (`kernel/linux_thread.h`): `LINUX_CLONE_CHILD_CLEARTID` in
+the allowlist with the plan carrying its word; `LINUX_SET_ROBUST_LIST` (273),
+the 24-byte head, Linux's 2048-entry walk bound, `FUTEX_OWNER_DIED|tid` and the
+tid mask; and three pure decisions — `linux_ctid_ok`,
+`linux_robust_list_ok`, `linux_robust_died_word`, `linux_robust_word_addr`
+(incl. the negative-offset-underflow and canonicality refusals).
+- **The mechanism** (`kernel/process.c`): `linux_thread_exit_glue(pd)`, called
+once at the top of a thread's own exit while the group's root is alive. It
+writes 0 into the clear-TID word through `linux_user_copy_in` and wakes that
+futex; then reads the robust head, walks entries (bounded, stopping at the head
+or the first unreadable entry), and for every word the dead thread still owns
+writes `FUTEX_OWNER_DIED|tid` and wakes one waiter. A word it does not own is
+left alone; the next pointer is read before the word is touched.
+- **The seam** (`kernel/syscall_dispatch.c`): clone passes `args[3]` into the
+plan; `set_tid_address` (218) is still answered by the sidecar (that arm is
+where `tkill`'s tid echo is recorded), but the kernel captures the word at the
+first trap; `set_robust_list` (273) is answered wholly in the kernel and
+refuses anything but the 24-byte canonical head.
+- **The census.** 273's row is not belief: `tools/linux_robust_list_census.txt`
+is a strace trace whose count is **2** for a one-call program — glibc registers
+its own robust head at start-up before `main`, then the program registers its
+own. That is the measured version of §6.1's claim that a libc asks for this
+before any application code runs.
+
+What is deliberately not promised, and named: `CLONE_PARENT_SETTID` and
+`CLONE_CHILD_SETTID` stay refused (a parent's write is a different promise), a
+mutex being locked at the instant of death (`list_op_pending`) is not marked,
+and the `exit_group` path runs no per-thread clear (a whole-group exit leaves
+nobody to join).
+
+**The checks.** `tests/linux_clone_host_test.c` grew from 34 to 44 checks — the
+flag accepted, its word carried, a non-canonical word refused *before* the
+child exists, the owner/mark arithmetic, both offset directions and the two
+refusals. `tests/linux_syscall_table_host_test.c` gained 273 (54 checks) — and
+surfaced a pre-existing red: increment 29 added the 15 row to the table but not
+to that test's `want[]`, so its length clause had been failing since then; the
+row is now in `want[]` too. Clause **Z6** pins every half above and tooth
+**t160** drops the owner check, which would mark a live sibling's mutex dead.
+
+**The live arm** is the existing two-thread probe, now pthread-shaped at
+syscall level: clone carries `CLONE_CHILD_CLEARTID` with the shared tid word,
+the parent stores the child's tid there and parks on it, and the child
+registers a robust list owning one word and exits with `exit(60)`. The parent
+then reads back `0` and `FUTEX_OWNER_DIED|tid` and prints `E7TG-CTID-OK` /
+`E7TG-ROBUST-OK` — markers only the joiner can write after the words changed —
+and the check reads the kernel's own `[E7] clear-TID:` and
+`[E7] robust list: TID … walked 1 entries, released 1` lines beside them.
+The join accepts a wake (rax 0) or an already-cleared word (`-EAGAIN`) because
+a preemptible probe can lose the wake to the timer between releasing the child
+and parking; the state it verifies is the same either way.
+
+### 10.24 What has landed — increment 30b (the clear on every death)
+
+30's glue ran from `linux_thread_exit()` alone, which is `exit(60)`'s path. A
+thread that died any other way — a fault, a kill, `exit_group` — never cleared
+its TID word, so a joiner parked on it would wait forever, and the robust list
+it still held stayed owned by a dead thread. Linux clears in `do_exit`, on
+every path.
+
+The hook moved to the two funnels every Linux death actually passes through:
+
+- **`linux_descriptor_release()`** — the descriptor-level death: `exit(60)` and
+the deferred-kill sweep. The call is placed *before*
+`proc_clear_resume_state()`, which is what zeroes the very words being
+honoured; `linux_thread_exit()` keeps no call of its own.
+- **`linux_group_release_all()`** — the group-fatal teardown behind
+`exit_group`, a kill, and a sibling's fault: every member runs the glue while
+`g->cr3` is still alive, before `linux_group_destroy()`. The wakes there are
+no-ops by construction (a private futex is keyed by group and no member
+survives), so the state change is what the path owes.
+
+The two sites overlap — the last thread of a group runs the descriptor funnel
+and then the group funnel — so the promise is made idempotent structurally:
+`linux_thread_take_exit_words()` hands the two words out once and clears them,
+and the glue returns early when it is owed nothing. `tests/linux_clone_host_test.c`
+drives that directly (51 checks): both words taken once, the **second call
+takes nothing**, one-word-only still counts as work, a thread that registered
+neither owes nothing, a NULL descriptor is not a fault, and the call leaves
+the tid/cr3/pid alone so a dying thread stays resolvable.
+
+Clause **Z7** pins the shape by site rather than by hope: exactly two glue
+calls in `process.c`, one per funnel, the descriptor one above
+`proc_clear_resume_state`, and none left in `linux_thread_exit`; tooth
+**t161** deletes the group-teardown call, which leaves the fault and
+`exit_group` paths silent again — precisely the defect this increment fixes.
+The `exit(60)` live arm from §10.23 still passes unchanged, now exercising the
+descriptor funnel rather than a call beside it.
+
+### 10.25 What has landed — increment 30c (the joiner those paths wake)
+
+Calling the glue on the fault and `exit_group` paths was necessary but not
+sufficient. `linux_group_release_all()` ran `linux_futex_forget_group()`
+*before* its member pass, so on exactly those two paths the clear wrote 0 and
+its futex wake found nobody: the word went away but no joiner was released,
+and a `[E7] clear-TID … joiner woken` line would have claimed otherwise. The
+teardown now runs, in order:
+
+1. **every member's glue** — while the root is alive *and* the group's waiters
+   are still registered, the order Linux's `do_exit` gives (clear, wake, then
+   the rest of the group);
+2. `linux_futex_forget_group()` — after the wakes, before any descriptor is
+   released, so no descriptor is ZOMBIE with a live waiter and no tick between
+   here and the destroy can resume one whose stack is about to be freed;
+3. the release pass (reports, resume state, syscall stacks, ZOMBIE) and the
+   one destroy.
+
+Nothing is scheduled between 1 and 3 — the whole teardown runs inside the
+fault/kill/exit dispatch with IF=0 — so a woken member cannot execute before
+it is released. The clear line now reports what it did (`… cleared, joiner
+woken (n=%u)`): a boot can tell a real wake from a silent one, and the count
+is what the live arm asserts.
+
+**Two live arms** (`tests/linux_thread_death_check.sh`), both spawned by
+`e7_thread_death.rs` through the real create path:
+
+- `e7.tdeath.fault.0` (`fixtures/e7_thread_fault_probe.S`) — one cloned thread
+  registers a robust list owning one word, a second cloned thread parks on the
+  first one's CLEARTID word, and the first dies by reading a `PROT_NONE` page
+  (Ring-3 #PF, no handler). Required lines: the #PF, the clear of `0x…78` with
+  `n≥1`, the same word's `futex wake … woken=1`, `walked 1 entries, released
+  1`, one group teardown *after* the clear, and **no** `thread exit: TID n`
+  line — the thread never took exit(60).
+- `e7.tdeath.group.0` (`fixtures/e7_thread_groupexit_probe.S`) — the same two
+  words owed, but the leader calls `exit_group` (231) with both threads alive;
+  the same five lines are required for its `0x…58` word, with the exit_group
+  request line present.
+
+The two arms use different word offsets (`0x78` / `0x58`) so a boot log
+identifies which path produced a clear without guessing from ordering alone.
+
+Building the arms found two more real defects, both fixed here:
+
+- **The fault path dropped its own words before the glue.** `process_exit()`
+  calls `proc_clear_resume_state()` — which zeroes `linux_clear_tid` and
+  `linux_robust_list` — before the group teardown. A thread killed by a #PF
+  therefore had nothing left to clear: the boot showed the #PF, the group's
+  one teardown and no `clear-TID` line at all. The glue now runs in
+  `process_exit()` immediately above that call, while the pages are mapped;
+  the teardown that follows is the no-op the consumption rule buys.
+- **The arms had to be created from the event loop, not at boot.** A
+  synchronous create at boot answers `-EAGAIN` ("group cap or resources
+  exhausted"): `PROC_MAX` is 16 and the probe fleet already holds every slot,
+  while each arm needs three descriptors. They are now created from the
+  sidecar's loop, retrying every few passes until the same real create path
+  succeeds, and each fixture retries an `EAGAIN` clone the way glibc does.
+- **The fault's own delay was too short to arm the wake.** With the faulting
+  thread driving a 20 ms window, the joiner was cloned but never scheduled
+  inside it, so the clear woke nobody (`n=0`) and the arm failed for a
+  scheduling reason instead of testing its claim. The leader now waits for
+  both children's flags, settles for 200 ms and only then releases the fault,
+  so the wake always has a parked waiter to find.
+Clause **Z8** pins the ordering (glue loop < forget < release pass), the wake
+count in the line, both fixtures, the module, both spawn sites and the live
+check; tooth **t162** re-inserts a `forget_group` call *before* the glue loop,
+which leaves every word cleared and every joiner parked — the exact silent
+shape this ordering removes, and invisible to Z7.
+
+### 10.26 What has landed — increment 31 (P1-C: the fault's own delivery)
+
+A ring-3 fault was the last signal source with no delivery. `tkill` reaches the
+sidecar and comes back as an 80-byte request the kernel turns into a frame; a
+`#PF` has no syscall behind it and cannot be parked, so it killed the thread
+whatever its disposition said. Worse, `pd->linux_cr2` — the value every
+delivery's `si_addr` is computed from — was declared and read but never
+assigned, so even a delivered `SIGSEGV` would have named address 0.
+
+**What landed.**
+
+- **A kernel copy of the four fault signals' actions.** `struct LinuxFaultAct`
+  (`handler`, `flags`, `mask`, `restorer`) for `SIGILL`(4), `SIGBUS`(7),
+  `SIGFPE`(8) and `SIGSEGV`(11), recorded at `rt_sigaction`'s first trap from
+  the same 32 bytes the forward already carries, through the same validated
+  walker. It is per descriptor and cleared with the rest of the slot state, so
+  a reused slot cannot run its predecessor's handler.
+- **A pure planner.** `linux_fault_sig_plan()` answers `0` for every "no frame"
+  case (`SIG_DFL`, `SIG_IGN`, a blocked signal, no restorer — this path has no
+  pending queue), `1` with the built frame, the handler's entry context and the
+  mask to install, and `-EINVAL` for a builder refusal (a stack with no room).
+  `si_addr` comes from the existing `linux_sig_si_addr`, so `SIGSEGV`/`SIGBUS`
+  name CR2 and `SIGFPE`/`SIGILL` name the faulting instruction. The `#PF` error
+  code's P bit picks `si_code`: `SEGV_MAPERR` for an unmapped page,
+  `SEGV_ACCERR` for one protection refused.
+- **The capture site.** `handle_page_fault()` writes
+  `fcur->linux_cr2 = faulting_address` before any decision, so both the
+  delivered frame and the kill line carry the real address.
+- **A full-register trap frame.** `isr14_stub` now saves all 15 GPRs above the
+  user's `rbp`; the C struct that reads them and the push order that writes them
+  are one decision, pinned against each other by clause **AA**.
+- **The redirect.** A delivery copies the frame through `linux_user_copy_in`,
+  sets `linux_sig_mask`/`linux_sig_active`, and rewrites the saved GPRs plus the
+  iretq frame's `rip`/`rsp`. The stub's epilogue is unchanged — popping and
+  `iretq`'ing *is* the jump into the handler — and the attributed kill
+  (`process_exit(139)`, the `[FAULT] … killing process` line) is still the path
+  taken when there is no handler.
+
+The boot shows both answers in one run, which is what makes the arm a
+difference and not a coincidence:
+
+```
+[FAULT] Ring-3 #PF  error=0x4  addr=0x0000400000015000  rip=0x… — killing process.
+[E7] fault sig 11 (code 1) addr 0x400000015000 -> handler 4000000000dd, frame 400000004cc8, mask 400 (not a kill)
+E7FH-OK
+```
+
+The first line is `e7.tdeath.fault.0` (no handler, still dies). The second is
+`e7.fault.handler.0`, the same `PROT_NONE` read with `SIGSEGV` installed;
+`E7FH-OK` is written **by the handler** only when `si_signo == 11`, `si_code`
+is `MAPERR`/`ACCERR` and `si_addr` equals the page the program mapped — checked
+against `r13`, a register the frame restored, so a frame recording the
+handler's own context or an address invented from `rip` writes `E7FH-BAD`
+instead. `mask 400` is bit 10: `SIGSEGV` blocked inside its own handler.
+
+**Evidence.** `tests/linux_fault_sig_host_test.c` (45 checks, links the real
+`linux_abi.c`): the four-signal table, the recording, every "no frame" answer
+(with the frame buffer proven untouched), the handler entry (rip, rsp % 16 == 8,
+the frame fitting below the interrupted rsp, `sa_mask | the signal`), the
+`SA_SIGINFO` arguments and `si_addr == cr2`, the decode back through
+`linux_sig_frame_restore` equalling the *interrupted* registers, `SA_NODEFER`,
+`SIGILL` naming the instruction, a NULL-pointer fault reporting 0 rather than a
+substitute, and the no-room refusal. `tests/linux_fault_sig_check.sh` boots the
+ISO and reads the lines above. Clause **AA** pins the whole chain (word order,
+capture-before-decision, struct/push agreement, the plan before the kill line,
+the live arm's two answers); tooth **t163** stops the fault path asking the plan,
+which leaves CR2 captured, the kill working and a handler that never runs.
+
+**A defect this increment walked past, named rather than fixed.** The tree's
+signal-action word order is `{handler, flags, mask, restorer}` — the sidecar
+(`sig.act[2]` = `sa_mask`, `[3]` = restorer) and every probe agree, and this
+increment's record matches them because the sidecar is the other reader of the
+same bytes. x86-64's kernel `struct sigaction` is
+`{handler, flags, restorer, mask}`, so a real musl `sigaction` — which sets
+`sa_restorer` — is read by this tree with the mask and the restorer swapped.
+Nothing catches it today because only hand-written probes install handlers;
+fixing it means changing the sidecar, the probes and the SIGRET arm together,
+which is its own increment. It is recorded here so the next reader does not
+"fix" one end of it.
+
+**Still open, by name.** A fault-delivered handler cannot return through
+`rt_sigreturn`: the sidecar never entered it, so its 15 arm answers `EINVAL`.
+A handler that `longjmp`s or exits is the shape this serves, which is exactly
+the acceptance program §1 of the P1 plan names. The kernel's `linux_sig_mask`
+tracks deliveries, not `rt_sigprocmask`, so a guest that blocks `SIGSEGV` after
+a delivery is not seen at the fault. The altstack, `fpstate`, and siginfo
+queueing remain the P1-C remainders they were.
+
+### 10.27 What has landed — increment 32 (P1-C: the fault handler's return)
+
+§10.26 named this as its remainder: a fault-delivered handler could not
+return, because `rt_sigreturn` (15) is answered by the sidecar, and the
+sidecar never entered that handler. Its `sig.handler_active` is false, so its
+15 arm answers `-EINVAL` — "no handler was entered" — which is **true for its
+own bookkeeping** and was the last word on a return the kernel owes.
+
+**Why the answer was not to teach the sidecar.** The delivery has no
+round trip to ride: a `#PF` is a trap, not a reply. The sidecar's mask was
+not moved by that delivery either (it moved nothing, so a return owes it
+nothing), which means the refusal is not lying about state — it is simply not
+the authority for a frame it never built. The kernel built the frame, holds
+it, and is the only half that can read it out of the task's pages. So the
+kernel takes exactly that one return, and
+`linux_sig_fault_return_ok()` names how narrow "that one" is — four
+questions, each fail-closed:
+
+1. **is a frame installed at all?** No frame means nothing to restore, and
+   `-EINVAL` is right — the sigret probe's `SIGRET-NOHAND-OK` arm depends on
+   it and still passes.
+2. **did that frame come from the trap?** A sidecar-delivered frame keeps
+the old gate: if the sidecar ever refuses its own delivery, that refusal is
+   the task's answer.
+3. **was the answer a refusal?** `status == 0` is a consent and belongs to
+   the gate above (which also runs its `-EPROTO` check); taking it here would
+   skip both.
+4. **is the errno the task would have heard exactly `-EINVAL`?** A different
+   refusal — a crashed sidecar, a refused class — stays the task's answer by
+   name.
+
+**The frame's address is recorded, not inferred.** The tkill path could
+always recover the frame's address from `park_ctx.user_rsp`, because its
+delivery installed the handler's entry context there. A trap never parks:
+give the return a stale park context and it restores a frame that is no
+longer behind it. `pd->linux_sig_frame_rsp` is therefore written at whichever
+delivery built the frame, and read by `linux_sig_return_apply`. On the tkill
+path the two are the same number (`linux_sig_park_install` put it there), so
+nothing changes there; on the fault path it is the only true answer.
+
+**What this buys, concretely.** A handler can FIX its fault the way real
+ones do — rebuild the faulted mapping, or, as the live arm does, rewrite the
+interrupted register in its own `ucontext` — and the kernel resumes at the
+instruction that faulted with that fix in place. That is the first time in
+this shim that a faulting instruction makes progress after a handler ran.
+
+Evidence, one boot (`tests/linux_fault_return_check.sh`):
+
+```
+[E7] fault sig 11 (code 1) addr 0x… -> handler …, frame …, mask 400 (not a kill)
+[E7] rt_sigreturn: restored rip … rsp … rax … mask 0
+E7FR-OK
+```
+
+`E7FR-OK` is written by the **resumed** program, not the handler: after the
+return the retried `movl (%r13), %eax` must read `0xfeedface` and `r13` must
+equal the pointer the handler wrote at `80(%rdx)` (its `ucontext`'s
+`gregs[REG_R13]`). The handler counts its own entries and writes `E7FR-LOOP`
+on the second, so a return that restored nothing is a named line rather than
+a silent hang — the failure mode a fault loop otherwise has. `E7FR-BAD`
+covers the rest (a wrong context, a bad `si_addr`, or the restorer's 15
+coming back with an errno). The same boot still shows increment 31's
+`E7FH-OK` (a handler that exits, unchanged) and the handlerless attributed
+kill.
+
+**Evidence.** `tests/linux_fault_return_host_test.c` (29 checks, links the
+real `linux_abi.c`): the gate's whole truth table — trap frame + `-EINVAL`
+returns 1, a sidecar frame / no frame / a consent / `-ENOSYS` / `-EPROTO`
+all return 0 — and the frame's journey, including that `uc + 40 +
+REG_R13*8` **is** the frame offset of r13 (the number the live arm's
+`80(%rdx)` depends on), that a handler's write there comes back through the
+decoder with every other register untouched, and that the frame address is
+the entry rsp and not the interrupted one. Clause **AB** pins the wiring and
+the order that makes it reachable (the kernel gate runs *before* the
+sidecar's). Teeth: **t164** (a fault delivery that no longer marks itself as
+the trap's — increment 31 stays green, the return dies), **t165** (the
+return reads `park_ctx` again), **t166** (the live handler stops returning).
+
+**Still open, by name.** No restart window, no `fpstate`, no `sigaltstack`,
+and no async preemption remain the P1-C remainders they were. (The mask split
+this section named — the kernel holding the handler's set while the sidecar
+still held the pre-delivery one — is closed by §10.28.)
+
+
+## 10.28 E7 increment 33 — the mask inside a trap-delivered handler
+
+Increment 32 ended with a named disagreement. A handler entered by a ring-3
+`#PF` runs under the handler's set — the kernel's `linux_sig_mask` is the
+blocked set | `sa_mask` | the signal — while the sidecar, which entered
+nothing and was told nothing, still held the **pre-delivery** set. So an
+`rt_sigprocmask(14, NULL)` from inside such a handler reported the narrower
+mask, and a `SIG_BLOCK`/`SIG_UNBLOCK` there did its arithmetic on the wrong
+base. The `tkill` path never had the split: its 14 arm moved the sidecar's
+copy to that same number *before* it answered, which is the one decision
+clause P9 holds both ends to.
+
+**Why the kernel answers instead of forwarding.** There is no round trip to
+ride: a trap has no syscall behind it, so nothing can carry this delivery's
+mask to the sidecar. Rewriting the forwarded request would fix the reading
+half, but it would leave the sidecar's copy at the handler's last value after
+the return instead of at the pre-handler set the frame restores — a
+divergence moved, not removed. So for exactly the window in which a
+TRAP-delivered frame is active, the kernel is the mask's authority: it
+answers 14 itself, out of `pd->linux_sig_mask`, posts nothing, and writes the
+oldset back through the same validated copy every reply uses.
+
+**The arithmetic is the sidecar's own.** `linux_sig_mask_step()` — BLOCK is
+union, UNBLOCK is difference, SETMASK is replacement, `how` outside 0..2 is a
+refusal that moves nothing, and no KILL/STOP bit is filtered because the
+sidecar's arm filters none. The host test replays that arm's own worked
+example (`0b101`/`0b010`/`0b001`) rather than inventing a second set of
+numbers, so the two languages cannot drift in silence. A query (`set` NULL)
+never reaches it: Linux ignores `how` then and so does the arm it mirrors,
+and the identity that matters is that the answer is the handler's 0x400, not
+the sidecar's stale 0.
+
+**The gate is two questions.** `linux_sig_mask_fault_owned(sig_active,
+fault_active)` — a frame installed *and* delivered by the trap. Whose copy is
+stale is decided by who built the frame, not by "a handler is active":
+`linux_sig_reply_apply` clears `linux_sig_fault_active` precisely because the
+sidecar entered that frame and moved its own mask, so the `tkill` path keeps
+the forward it always had — its mask was never the kernel's to answer.
+
+**What the window does not do, by name.** The sidecar's pending *reveal* — the
+unblock that delivers a blocked `tkill` — is itself a delivery and needs the
+sidecar, so an unmask here answered the mask and left the reveal for after
+the return (closed by §10.29, which forwards a tagged probe for exactly that
+half). A nested delivery inside such a handler still nests two frames:
+unchanged by this increment. At the return the two agree again for free — the
+kernel restores `uc_sigmask`, the pre-handler set, and the sidecar never left
+that value.
+
+**The prerequisite §10.29 needed, recorded here because §10.28 is where it
+bit.** `pd->linux_sig_mask` moved only at DELIVERIES, so a guest that blocked
+or unblocked a signal between two signals was invisible to the fault path:
+the frame it built carried the wrong mask, and a trap handler could not free a
+bit the kernel never knew was blocked. Every forwarded 14 now stages the
+mask it moved to and the reply hook commits it on a consent only — the
+sidecar still answers every unblock it answered before, and the kernel's
+copy finally follows the thread's own blocks.
+
+**Evidence.** `tests/linux_sig_mask_host_test.c` (22 checks, links the real
+`linux_abi.c`): the gate's four corners — trap frame answers, a
+sidecar-entered frame and a bare task do not — and the arithmetic, including
+the two bases disagreeing (`BLOCK` of 0x2 is 0x402 from the handler's set and
+0x2 from the stale one), a foreign `how` leaving the output untouched, and
+`SETMASK ~0` keeping the KILL bit the way the sidecar does. Clause **AC**
+pins the wiring and its order: the branch sits after every first-trap refusal
+and before the forward's describe (nothing is posted), the oldset is written
+**before** the new mask is committed (a bad pointer refuses with nothing
+moved), and the gate reads both flags while `reply_apply` still clears the
+fault one. The live arm's handler now asks for its own mask
+(`rt_sigprocmask(SIG_SETMASK, NULL, &old, 8)`) before it fixes the fault and
+requires `old == 0x400` — its frame's whole set — writing `E7FR-MASK` if it
+is handed the narrower one, and the boot's own account of the same answer is
+`[E7] rt_sigprocmask in a fault handler: oldset 400 -> 400`. Teeth: **t167**
+(the answer is never committed, so later BLOCK/UNBLOCK compute on a stale
+base), **t168** (the gate stops asking whether the frame came from the trap,
+so the sidecar's own delivery is answered by the kernel).
+
+---
+
+## 10.29 E7 increment 34 — the reveal an unmask owes
+
+Increment 33 answered a trap handler's `rt_sigprocmask` out of the kernel's
+mask, which closed the *reading* half. An unmask has a second half that is
+not arithmetic: a signal that was BLOCKED and is now UNBLOCKED must be
+**revealed** — discarded if its disposition is IGN, terminated if its default
+action terminates, refused if this v1 cannot perform it — and what that means
+depends on the PENDING set and the dispositions, both of which live in the
+sidecar. Answering locally therefore left the bit pending until after the
+handler returned, where a tkill-delivered handler's unmask has always
+revealed it *inside the call*.
+
+**The stage this needed first.** `pd->linux_sig_mask` used to move only at
+deliveries, so a block made between two signals never reached the fault path:
+the frame carried the wrong mask, and a handler could not free a bit the
+kernel did not know existed. Every forwarded 14 now stages the mask it moved
+to (`linux_sig_mask_stage_*`) and the reply hook commits it **only on a
+consent** — a refusal moves nothing, exactly as the sidecar's own arm leaves
+it. With that, a signal blocked before a fault is in the frame's mask and can
+be freed from inside the handler at all.
+
+**The second thing the arm found: a pending `tkill` was `-EPROTO`.** The
+stage's 80-byte delivery request belongs to a handler disposition alone, but
+the kernel arms that stage for EVERY forwarded `tkill` — the disposition is
+the sidecar's to read, so the kernel cannot know which answer it will get —
+and the shape-1 rule refuses a *payloadless* success on a staged number.
+Every pending, ignored and `SIG 0` tkill therefore came back `-EPROTO` to a
+task that asked for no protocol, and the live arm's own `tkill` step is where
+it surfaced: the bit was pending (the sidecar said so) and the call still
+reported failure, so the fixture went to its `E7RV-FAIL` line instead of the
+fault. `linux_reply_zero_ok()` now names tkill beside read and getdents64 —
+a payloadless success is the 0 Linux answers — while a delivery answer that
+arrives WITHOUT its frame is still refused: that reply is 80 bytes and
+shape 2, where `linux_reply_shape_ok` holds `n` to the exact bound, so
+Increment 28's P9 clause keeps its teeth (t149's narrowed bound is still
+caught).
+
+**The probe.** `linux_sig_mask_reveals(old, new)` names when a call frees a
+bit — `old & ~new`, not `new & ~old`, or every BLOCK would read as a reveal.
+`linux_sig_mask_fault_plan()` is the one decision the dispatch makes for a
+14: the new mask plus whether it owes a reveal. When it does, the forward
+stops being the child's call and becomes a tagged **control request**:
+`SIG_SETMASK` (a shape the arm already parses), no set and no oldset
+pointers, no payload, the mask the kernel computed in `args[4]` and
+`LINUX_SIG_REVEAL_TAG` in `args[5]`. The sidecar's `reveal_verdict()` — the
+same ladder the ordinary arm calls, lifted out so the two cannot drift —
+runs over its own `pending` and dispositions, and its tagged arm deliberately
+leaves `sig.mask` alone: the kernel owns that for the window and restores the
+frame's at the return, so moving it here would recreate the divergence §10.28
+closed. The answer is a verdict, not a value: status 0 commits the staged
+mask (writing the oldset through the validated copy first), and anything else
+is the refusal the task hears with nothing moved.
+
+**Whose call is whose.** The whole window is gated on the TRAP flag, so a
+tkill-delivered handler's unmask is untouched — it still goes to the sidecar,
+whose copy it moved at the delivery, and whose answer the child has always
+heard. The control request exists only where the kernel answers the mask and
+the sidecar answers the reveal, and the two must not be swapped.
+
+**What stays open.** The nested-delivery limit from §10.28 is unchanged (a
+delivery inside a trap handler still nests two frames), and `pending` is
+still a bitmask with `tkill` as its only producer.
+
+**Evidence.** `tests/linux_sig_mask_host_test.c` (39 checks now — 22 from
+§10.28, 17 here): the reveal predicate both ways, the live arm's own numbers
+(SIGTERM blocked before the fault, freed from a 0x4400 handler mask), BLOCK
+and identity owing no probe, a `SETMASK` that drops blocked bits owing one,
+a foreign `how` writing neither output, and the tag being one number for both
+ends. Clause **AD** pins the crossing and its order (the stage is armed
+before the describe, the commit sits after the payload copy, the sidecar's
+file has exactly ONE `sig.mask = new_mask;`, which is the ordinary arm's).
+`tests/linux_personality_host_test.c` (249 checks) carries the prerequisite
+the arm needed: tkill's three payloadless successes are 0-byte successes
+alongside read and getdents64, while a staged struct number still refuses
+one.
+The live arm `e7.fault.reveal.0` blocks SIGTERM, pends it with `tkill`, faults
+into its handler, and unblocks it there: the sidecar's ladder must kill the
+task inside that call, so the boot shows
+`[E7] fault handler unmask: forwarding the reveal, mask 400` and then
+`sig=15 default-action -> kill` after `E7RV-ARM`, with the handler's own
+`E7RV-AFTER` the named failure (`tests/linux_fault_reveal_check.sh`). Teeth:
+**t169** (the probe is never tagged), **t170** (the sidecar stops recognising
+it), **t171** (the kernel commits without the sidecar's consent).
+
+### 10.30 Increment 35 — the frame a handler leaves instead of returning from
+
+**The hole.** §10.27–§10.29 close the mask window at `rt_sigreturn`:
+`linux_sig_return_apply` restores `uc_sigmask`, clears `linux_sig_active`,
+`linux_sig_fault_active` and `linux_sig_frame_rsp`. A handler that leaves by
+`longjmp` never sends that 15. `siglongjmp` does restore the mask first —
+through a 14, which the window answers — and then pops `rsp` back to the
+`sigsetjmp` caller; nothing tells the kernel. Both flags therefore stay set
+for the rest of the task's life, and every later 14 is still answered out of
+`linux_sig_mask` by a kernel the sidecar has stopped informing: the split
+§10.28 closed, now permanent and impossible to close from the sidecar's side.
+
+**The predicate.** The delivery's geometry is the whole test. A handler is
+entered with `rsp` equal to the frame's address (the builder writes
+`[rsp, rsp + 440)` and the stub's epilogue `iretq`s there), and a handler's
+stack only grows **down**, so a handler still inside its frame makes every
+syscall with `rsp <= frame_rsp`. `siglongjmp` restores `rsp` to the
+`sigsetjmp` caller — the interrupted context's side of the frame, strictly
+above it. `linux_sig_frame_abandoned(frame_rsp, user_rsp)` is that one
+comparison, pure: `1` when a frame address is recorded and `rsp` is above it,
+`0` otherwise, including no frame at all (an ordinary task). A tkill-delivered
+frame **does** record its address — `linux_sig_reply_apply` stores
+`linux_sig_frame_rsp` for that path too — so the predicate is not what excludes
+it; the gate is, because `fault_active` is 0 for a frame the sidecar entered.
+A `longjmp` copies
+nothing back into the frame, so the frame's **bytes** cannot answer this — the
+address comparison is the only structural fact a syscall can see. The current
+`rsp` is read the way every other late read is: `proc_read_user_rsp()` reads
+`[gs:0]`, the word `syscall_entry_stub` stored before any call signalled.
+
+**What closes, and to what mask.** The dispatch asks the predicate at the head
+of its 14 branch, before the window's ownership is read — otherwise the very
+call meant to survive the dead window would be answered from the stale copy.
+On a hit it restores the mask to the number **both ends agree on**: the
+frame's own `uc_sigmask`, which the builder filled from `spec->blocked`, the
+thread's PRE-delivery set. The sidecar's copy still holds exactly that number
+(it never moved during the window, and every 14 outside the window stages what
+it moved to), so the two copies are identical again without a round trip. It
+then clears `linux_sig_active`, `linux_sig_fault_active` and
+`linux_sig_frame_rsp`, so the task's next 14 is the sidecar's call again and a
+later 15 answers `-EINVAL` instead of restoring a frame that is behind the
+task. The read is the validated walker: a frame the task unmapped leaves the
+copy where it was, and the next consented 14's reply commit realigns it — the
+window is dropped on that path too, which is the part that matters.
+
+**What is dropped, by name.** A handler that changed its mask and *then*
+abandoned its frame loses that change: the frame's recorded set is the only
+number both ends can reach without telling the sidecar, and the alternative —
+keeping the kernel's copy — is precisely the silent divergence this
+increment exists to prevent. The sanctioned exit is exact rather than lossy:
+`siglongjmp`'s own `__sigprocmask` put the kernel on that same set through
+this very number before the jump.
+
+**The predicate's one false positive.** A handler that runs on a stack
+*above* its frame — `makecontext`/`swapcontext` switching to a context whose
+stack sits higher in the address space, or a handler that copies its ucontext
+to such a stack and jumps there — makes a 14 with `rsp > frame_rsp` while the
+frame is still live. The predicate reads that as an abandonment and closes the
+window early: the mask is realigned to `uc_sigmask`, the frame is dropped, the
+handler's later 15 answers `-EINVAL`, and any mask edit it made after the
+switch is lost. Named rather than solved: the geometry cannot tell "the frame
+is behind me" from "I am above it", and no syscall-visible state distinguishes
+the two. The ordinary shapes — the ladder below the frame, `siglongjmp` above
+it — are the ones this increment is for.
+
+**The tkill path.** Untouched, and doubly so: the whole branch is gated on
+`linux_sig_fault_active`, which `linux_sig_reply_apply` clears for a frame the
+sidecar entered — that frame's address *is* recorded (both delivery paths
+write `linux_sig_frame_rsp`), so the flag, not a missing address, is what keeps
+that path's 14s on the forward the sidecar answers. And the mask, too: the
+sidecar moved its copy to the handler's set before it entered, so there is no
+divergence there to close.
+
+**Live arm.** `e7.fault.abandon.0`
+(`user/sidecar/fixtures/e7_fault_abandon_probe.S`, spawned by the sidecar like
+the other fault arms) blocks SIGTERM before the fault — a forwarded 14, so
+both copies hold `0x4000` and the frame **records** it — then reads a
+PROT_NONE page. The handler blocks SIGUSR1 inside the window (the kernel's
+copy moves to `0x4600`, the sidecar is told nothing), writes `E7AB-LEAP` and
+leaves the way `siglongjmp` does: pop `rsp` to the saved setjmp caller, above
+the frame. The first 14 after the jump is the call under test. It must log
+`[E7] fault handler abandoned the frame at … : mask window closed at 4000`,
+return the **frame's** recorded `0x4000` (not the dead handler's `0x4600`,
+which is what an open window would answer — `E7AB-MASK`), and leave the task
+on the sidecar's forward, so the rt_sigreturn(15) that follows answers
+`-EINVAL` instead of restoring the frame — `E7AB-RET` names a restore and
+`E7AB-LOOP` a faulting load that ran again. `E7AB-OK` is written only when
+the mask and the refusal both hold, and the boot check requires the
+abandoned line to sit between `E7AB-LEAP` and `E7AB-OK`
+(`tests/linux_fault_abandon_check.sh`).
+
+**Evidence.** `tests/linux_sig_mask_host_test.c` (44 checks now — five here):
+`rsp` exactly at the frame is the entry point, `rsp` below it is a live
+handler (the case every ordinary 14 of a handler takes, which must NOT close
+the window), one word above is an abandonment, no recorded frame is nothing
+to abandon, and the live shape (`siglongjmp` 0x40 above). Clause **AE** pins
+the predicate, the `[gs:0]` accessor, the check's place **before** the
+ownership read, the `uc_sigmask` restore, the three clears, and the live
+arm's wiring (fixture, spawn function, entry point and the boot check's own
+`0x4000` assertion). Teeth: **t172** (the gate stops asking whether the frame
+was the trap's), **t173** (the frame is dropped but the dead handler's mask is
+kept), **t174** (the arm's handler stops popping `rsp` above its frame) and
+**t175** (the sidecar stops spawning the arm, so the closure is never reached
+on a boot).
+
+---
+
 ## 11. Open questions for review
 
 1. **The first user: designated, built, and censused.** `AeroSLS-Roadmap-2026H2-v0.1.md` §5 says in bold that there is no named first user, and the tree agreed — no Go source, no `std`-Rust binary, every real operational workload bash or Python (§5.5.1) — so the target was a *decision*. It is now made and carried out: the backup operation, as `backup/aerobackup/` (a static single-threaded Rust rewrite of `backup/backup.sh`'s snapshot-and-retain core, 27 tests, no dependencies), designated in `tools/linux_abi_candidate.conf`, with the census measured and checked in at `tools/linux_syscall_census.txt` (§5.6). **The open question is no longer about the first user; it is whether this candidate is narrow enough to gate on.** Its measured surface is 27 syscalls, and the two that are structurally hardest — `arch_prctl(ARCH_SET_FS)` (§5.3) and the vDSO-backed `clock_gettime` — are both now named rather than discovered. Whether the other three operations follow, and in what order, is a product question this design does not answer.
@@ -3503,6 +4791,7 @@ Everything this document asserts about the tree, with its source:
 | Claim | Source |
 |---|---|
 | Trap entry, `swapgs`, per-CPU scratch, asm number chain, `.unknown_syscall` → `do_syscall` | `arch/x86/syscall.asm` |
+| The real firstuser's Rust std guard-page call crosses the seam: `sigaltstack` (131) answered with `SS_DISABLE` and its install accepted, guard mmap three pages RW, guard-page `mprotect(PROT_NONE)` granted and applied to the guard mmap's base with a one-page length and PROT_NONE, no firstuser `mprotect … -> ENOSYS`; 131 is absent from the asm number chain | `arch/x86/syscall.asm`; `kernel/linux_abi.{h,c}`; `user/sidecar/src/linux.rs`; `tests/e7_firstuser_guard_check.sh` + `tests/e7_firstuser_guard_check_smoke.sh` (the 131, mprotect, missing-apply, ordering, wrong-address, short-length, writable-prot, prot-missing, no-soft-claim, len-missing, malformed-addr, mmap-missing, malformed-mmap-base, grant-missing, no-sigaltstack, foreign-apply, mmap-short, mmap-readonly, mmap-len-missing and mmap-prot-missing replay mutants, plus a CRLF replay and a CRLF missing-sigaltstack replay); `evidence/e7_firstuser_guard_live.log` |
 | The errno map is total over both families and the `CAP_NONE` sentinel, with the reverse defined only on unique preimages | `kernel/linux_abi.h`/`.c`; `tests/linux_errno_map_host_test.c` (51 checks, §10.5) |
 | Every census number — traced and vDSO-declared — has a dispatch class, and the SLS overlaps 105/160/320 are UNKNOWN | `tests/linux_syscall_table_host_test.c` (42 checks) over `tools/linux_syscall_census.txt` |
 | The initial stack builder emits the canonical psABI image with §5.2's AT_* set, no `AT_SYSINFO_EHDR`, and refuses by returning 0 | `tests/linux_initial_stack_host_test.c` (46 checks, the current run; 40 before Q2's scan checks) |
@@ -3552,6 +4841,7 @@ Everything this document asserts about the tree, with its source:
 | The E7 gate's resume half ran in the guest: one invocation, two boots of the same NVMe image, the tenant adopted at `rip=0x8057ab7 rsp=0x4000000a9778` (`stop=spent`), its copy finishing after the reboot — one `Copying`, one `Done (524288 bytes, 504 sparse holes, 4 kept)`, no `[FAULT]` — and its `exit_group` reaped by name (`[TORE] address space … 172 frame(s) freed`, the work-half count) | `evidence/e7_gate_reboot.log`; `tests/env_payload_host_test.c` (81 checks: the one-shot stop, the held replay's page mapping, and the stall-bounded wait's three outcomes); `tests/cap_create_sidecar_host_test.c` (the caller's-partition resolve) |
 | The gate's failure side is observed, not assumed: one invocation, one capture and five replays — the control green, `descriptor` reddening B2/B3/B4, `no-fd` B3/B4, `no-heap` B4/B5 (the 64 KiB buffer's `free` faulting inside the withheld page), `fs_base` B2/B4/B5 (the adopted TLS base one page off, the copy running to the end of the file and the tenant dying at a pointer read from the wrong TCB) — with each tooth's own line in the transcript and the shipped image refusing a named tooth by name | `evidence/e7_gate_teeth.log`, `evidence/e7_gate_teeth_fsbase.log`; `tests/e7_gate_check.sh --teeth`; `kernel/env_payload.h`'s `E7G_TOOTH` block and `Makefile`'s `E7_TOOTH` (both compiled out by default) |
 | The drill's tenant-spawn wait follows host progress, and the full default `--live` gate passes B1–B7 plus D1–D2 when the 45G stretch crosses the old 120 s bound: the wait extended at 318,476 serial bytes, D1 saw the pre-pour wait outlive its old 30 s bound with a sidecar RUNNING (`running=1/2`), D2 saw no `wait ended` and the pour land (`payloads=1, payload_skips=0`); the plain gate keeps its fixed 120 s total | `tests/e7_gate_check.sh` (`E7G_SPAWN_STALL_S`/`E7G_SPAWN_CEIL_S`); `evidence/e7_gate_drill_adaptive/`; commit `f3c1d19` |
+| The committed adaptive recording is replayed on every guard sweep, a tooth recording's exit 0 is not accepted as a passing gate, and the guard's own `payloads=0` counterexample reddens B1 on every run | `tests/e7_gate_evidence_check.sh` (invokes `tests/e7_gate_check.sh --replay` and requires the green verdict line); `evidence/e7_gate_drill_adaptive/` |
 | Console reads and poll: buffered input is served, an empty buffer PARKS the read until input or close, poll scans the task's fd table plus the console and rewrites revents, and a timed or infinite wait parks until readiness or a real deadline — a timeout answers zero revents | `user/sidecar/src/linux.rs` (`console_read_answer`, `Answer::{ReadWait,PollWait}`, `poll_scan`, `poll_answer`, `next_wait_ns`, the `PENDING_*` state and `service`'s pending block); `kernel/linux_abi.{h,c}` (the poll IN/OUT plans and reply shape); `kernel/syscall_dispatch.{h,c}` (`SYS_SLS_NOW_NS` 329, write-only clamp); `user/proto/src/kabi.rs`; `tests/linux_personality_host_test.c` (the poll crossings/shape) + linux.rs unit tests (27); guard clauses S/S1–S4, teeth t84–t89, t121–t122 (§10.13's poll coda) |
 | `munmap` (11) crosses the channel in a live E3 boot: the probe unmaps its arena twice (1 page freed, then 0 freed/1 already absent), the below-break call is refused before the post, and a 16-byte write carries `E7MEM-MUNMAP-OK`; the real firstuser also unmaps its own pages, and no marker-404 syscall line appears | `evidence/e7_munmap_live.log`; `tests/e3_multi_env_boot_check.sh`; guard clause X |
 
@@ -3571,7 +4861,7 @@ Everything this document asserts about the tree, with its source:
 | `rt_sigprocmask` (14), `rt_sigaction` (13) and `tkill` (200) refuse | `abort()` cannot die at its first `raise(SIGABRT)`, so its tail runs and faults on `hlt` (`rip=0x805260c`) — the firstuser's run ends there, ten attributed traps deep (§10.13's step 2; `rt_sigaction` newly visible) | **LANDED** — increment 10: the kernel's copy plan with all three refusals by name at the first trap, the sidecar's dispositions/mask/pending and the `SignalKill` delivery; host teeth (98 + 11 checks), guard clause R with teeth t76–t83; measured: both firstuser runs end at their first `tkill` with the kill attribution and NO `[FAULT]` (§10.13's step 2). §10.10's copy-IN gap then stayed as the named wall — retired at **increment 12**: the reply payload carries oldact/oldset back through the staged destination, measured (§10.13's step 3) |
 | No `CAP_E*` → Linux errno table (and a `CAP_NONE` sentinel in returns) | silent wrong errors (§5.7) | **LANDED** — increment 1 (§10.5): `linux_errno_from_cap()`/`cap_code_from_linux_errno()` total over all twelve `CAP_E*`, the `CAP_ERR_*` family and the `CAP_NONE` sentinel, applied only at the reply; `tests/linux_errno_map_host_test.c` (51 checks, exhaustive both ways), and the flipped-mapping tooth reddens the forward clause |
 | Target designated, but no candidate binary and therefore no artifact | the table is still unmeasured; `--check` reports a named skip rather than a pass | **LANDED** — `backup/aerobackup/` (static musl, 27 tests, no dependencies) is designated in `tools/linux_abi_candidate.conf` and censused at `tools/linux_syscall_census.txt` (26 traced syscalls plus the proved vDSO backstop, §5.5); `tests/linux_syscall_table_host_test.c` (42 checks) and the source-only `tests/linux_abi_census_check.sh` with its smoke hold the artifact and the anti-placeholder refusals |
-| No thread groups / `clone` / `futex` | Go and every threaded runtime are out (§7) | named as Go's gate; unscoped |
+| No thread groups / `clone` / `futex` | Go and every threaded runtime are out (§7) | **SCOPED** — design/scoping pass: `docs/AeroSLS-E7-Thread-Group-Gate-v0.1.md`; no implementation landed. The gate is a pinned static Go fixture (clone/futex/shared space) plus a checkpoint-parity phase; the single-task channel, per-descriptor memory cursors and one-Linux-task checkpoint are the named blockers |
 | No ARM64 userspace OS | E7 cannot run there (§4.1) | H2 item #1 |
 | No environment checkpoint/restore | the inherited gate cannot be passed (§8) | **LANDED** — v0.2 P1a (commits #58/#62): the versioned record, the payload's pages, park state and console, and a partition quiesce that restores its prior pause state; `tests/env_checkpoint_restore_check.sh` proves a file and a shell variable survive a reboot. The Linux task's share rode it at increments 20–21 (§10.14) |
 | No Linux task in the checkpoint record or payload | the gate's cycle half restores the two sidecars and loses the first user; its descriptors and heap cannot come back | **LANDED** — increment 20 (§10.14): the record's third slot carries `entry`/stack/caps and the payload's `EnvPayloadTask` carries the 20-word context, `fs_base`, both cursors and every page's permission. Increment 21's live run replays it |

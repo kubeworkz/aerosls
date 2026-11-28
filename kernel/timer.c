@@ -4,6 +4,7 @@
 #include "net_event.h"
 #include "cap.h"   /* Phase 5: cap_park_deadline_tick (weak default / process.c override) */
 #include "process.h"  /* E1: proc_control_plane_tick (unified-boot yield budget) */
+#include "linux_futex.h" /* E7 TG-1 I3: SYS_LINUX_FUTEX_RESUME */
 #include "console_service.h"  /* BSP console drain when AP is offline */
 #include "dashboard.h"  /* read_tsc() -- the wall-clock source this file calibrates against */
 #include "kernel_io.h"  /* kernel_serial_printf, for the calibration's own report */
@@ -322,6 +323,12 @@ void timer_irq_handler(void) {
      * there is no cross-CPU race (unlike the AP core's console-service
      * wake, which is pre-existing and separate). */
     cap_park_deadline_tick();
+    /* E7 TG-1 I3: the same kind of wake for a futex waiter whose relative
+     * timeout has passed. Runs here — after the park tick and BEFORE
+     * isr32_stub's schedule_ring3 — so a timed-out waiter is resumed with
+     * -ETIMEDOUT and is schedulable this very tick. Pure proc-table state
+     * flip plus a ring-3 frame rebuild; BSP only, like the two ticks above. */
+    linux_futex_deadline_tick();
     /* POSIX-Environments E1: the same kind of wake for the Ring-0 control
      * plane. A unified boot's foreground loop yields the CPU to Ring-3 work
      * (kernel_yield_to_ring3) with a tick budget; this flips the parked

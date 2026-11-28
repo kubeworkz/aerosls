@@ -78,6 +78,13 @@ pub const BOOT_INFO_FLAG_ENV_CONSOLE: u32 = 1 << 1;
 /// tenant has. The default E3 image never sets it.
 pub const BOOT_INFO_FLAG_GATE: u32 = 1 << 2;
 
+/// POSIX-Environments E3: this sidecar was created from an E3 profile
+/// manifest (`FLAG_E3_PROFILE` in the manifest header), i.e. the image boots
+/// tenant environments. The sidecar uses it to skip the E7 native census
+/// probes on that image: they are instruments for the plain image, and their
+/// serial output competes with tenant boot for the same drop-proof wire.
+pub const BOOT_INFO_FLAG_E3_PROFILE: u32 = 1 << 3;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BootErr {
     BadMagic,
@@ -270,6 +277,12 @@ impl<'a> BootInfo<'a> {
     /// E7 increment 19: was this environment created with the gate profile?
     pub fn is_gate_profile(&self) -> bool {
         self.flags & BOOT_INFO_FLAG_GATE != 0
+    }
+
+    /// POSIX-Environments E3: was this environment created from an E3
+    /// profile manifest? See `BOOT_INFO_FLAG_E3_PROFILE`.
+    pub fn is_e3_profile(&self) -> bool {
+        self.flags & BOOT_INFO_FLAG_E3_PROFILE != 0
     }
 
     /// POSIX-Environments E6: this sidecar's own identity `(index, pid)` — the

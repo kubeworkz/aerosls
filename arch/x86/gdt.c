@@ -1,12 +1,32 @@
 #include "gdt.h"
+#include "user_paging.h"
 
 // Define a 7-entry GDT (Null, KCode, KData, UData, UCode, and 2 slots for the 16-byte TSS)
 static struct GDTEntry gdt[7];
 struct GDTPointer gdt_ptr;   // exported for smp.c trampoline handshake
 static struct TaskStateSegment tss;
 
-// Static kernel stack dedicated strictly for handling exceptions/syscalls from user space
+// Static kernel stack dedicated strictly for handling exceptions/syscalls from user space.
+// Retained as the pre-relocation TSS stack; after kernel_tables_map() every
+// switch into a user task points TSS.RSP0 at that task's own kernel syscall
+// stack (a low .bss stack would be shadowed by a low-linked ET_EXEC image).
 static uint8_t interruption_stack[4096];
+
+/* A low-linked ET_EXEC (0x400000 + segments) shadows every low kernel .bss
+ * page its segments cover -- including the GDT, IDT and TSS at 0x440000.
+ * Keep the CPU's descriptor tables at a high canonical supervisor alias, mapped
+ * by static page tables and inherited by every user PML4 (clone_kernel_slots
+ * copies supervisor PML4 entries by pointer). The aliased physical pages are
+ * still the same objects, so init-time construction and tss_set_rsp0() need no
+ * second copy. */
+#define KERNEL_TABLES_VA 0xFFFF800000000000ULL
+static uint64_t kt_pdpt[512] __attribute__((aligned(4096)));
+static uint64_t kt_pd[512]   __attribute__((aligned(4096)));
+static uint64_t kt_pt[512]   __attribute__((aligned(4096)));
+static uint64_t g_idt_high;
+
+extern uint64_t p4_table[512];
+extern void idt_page_info(uint64_t* phys, uint64_t* off);
 
 void set_gdt_gate(int num, uint32_t base, uint32_t limit, uint8_t access, uint8_t gran) {
     gdt[num].base_low    = (base & 0xFFFF);
@@ -26,9 +46,42 @@ void set_gdt_tss(int num, uint64_t base, uint32_t limit, uint8_t access) {
     tss_entry->reserved   = 0;
 }
 
+void tss_set_rsp0(uint64_t top) {
+    tss.rsp0 = top;
+}
+
+uint64_t kernel_tables_gdt_va(void) {
+    return KERNEL_TABLES_VA + ((uint64_t)&gdt & 0xFFFULL);
+}
+
+uint64_t kernel_tables_tss_va(void) {
+    return KERNEL_TABLES_VA + ((uint64_t)&tss & 0xFFFULL);
+}
+
+uint64_t kernel_tables_idt_va(void) {
+    return g_idt_high;
+}
+
+static void kernel_tables_map(void) {
+    uint64_t idt_phys = 0, idt_off = 0;
+    idt_page_info(&idt_phys, &idt_off);
+    (void)idt_off;   /* idt is page-aligned by idt.c */
+
+    kt_pt[0] = ((uint64_t)&gdt & ~0xFFFULL) |
+               USER_PTE_PRESENT | USER_PTE_WRITE;
+    kt_pt[1] = idt_phys | USER_PTE_PRESENT | USER_PTE_WRITE;
+    kt_pd[0] = (uint64_t)kt_pt | USER_PTE_PRESENT | USER_PTE_WRITE;
+    kt_pdpt[0] = (uint64_t)kt_pd | USER_PTE_PRESENT | USER_PTE_WRITE;
+    p4_table[256] = (uint64_t)kt_pdpt | USER_PTE_PRESENT | USER_PTE_WRITE;
+    g_idt_high = KERNEL_TABLES_VA + 0x1000;
+
+    __asm__ volatile("invlpg (%0)" : : "r"(KERNEL_TABLES_VA) : "memory");
+}
+
 void init_gdt(void) {
+    kernel_tables_map();
     gdt_ptr.limit = (sizeof(struct GDTEntry) * 7) - 1;
-    gdt_ptr.base  = (uint64_t)&gdt;
+    gdt_ptr.base  = kernel_tables_gdt_va();
 
     // Entry 0: Null Descriptor
     set_gdt_gate(0, 0, 0, 0, 0);
@@ -51,7 +104,8 @@ void init_gdt(void) {
     tss.iomap_base = sizeof(struct TaskStateSegment);
 
     // Entry 5 & 6: TSS Descriptor (Takes 16 bytes, occupying two standard slots). Access: 0x89
-    set_gdt_tss(5, (uint64_t)&tss, sizeof(struct TaskStateSegment) - 1, 0x89);
+    set_gdt_tss(5, kernel_tables_tss_va(),
+                sizeof(struct TaskStateSegment) - 1, 0x89);
 
     // Flush and reload registers via inline assembly
     __asm__ volatile(

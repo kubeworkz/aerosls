@@ -1,10 +1,14 @@
 #include "process.h"
+#include "linux_abi.h"   /* increment 28: the signal bridge and linux_sig_deliver */
+#include "linux_thread.h"
+#include "linux_futex.h"
 #include "object_catalog.h"
 #include "kernel_io.h"
 #include "loader.h"
 #include "partition.h"
 #include "frame_pool.h"
 #include "timer.h"   /* Phase 5 deadlines: kernel_tick_counter in cap_park_deadline_tick */
+#include "../arch/x86/gdt.h"
 #include "../arch/x86/user_paging.h"
 #include "../user/permissions.h"
 #include "cap.h"   /* Seed Kernel Phase 1: strong cap_current_pid()/cap_proc_cr3() below */
@@ -35,6 +39,10 @@ extern void syscall_return_path(void);
 extern void kernel_yield_switch(uint64_t* rsp_save, uint64_t cr3,
                                 const uint64_t* frame);
 extern void kernel_resume_control_plane(void);
+
+/* Defined beside the park capture lower in this file; clone needs the same
+ * per-CPU entry scratch while the syscall is still in flight. */
+static void proc_capture_entry_regs(struct CapParkCtx* ctx);
 
 struct ProcessDescriptor proc_table[PROC_MAX];
 uint32_t                 proc_count = 0;
@@ -148,30 +156,42 @@ static void proc_clear_resume_state(struct ProcessDescriptor* pd) {
     pd->fs_base = 0;
     pd->fs_base_stage = 0;
     pd->fs_stage_valid = 0;
-    /* E7 increment 6 (§5.4): the mem class's state clears here for the
-     * same two reasons — a reused slot must not inherit its
-     * predecessor's heap span (a stale brk_cur would make the next
-     * occupant's grant map pages at a break it never asked for, and a
-     * stale limit would let a grant the policy side refused through the
-     * kernel's own re-check), and an unanswered brk stage must not
-     * survive into a slot whose pid it never belonged to. Spawn paths
-     * that want LINUX stamp the span inside the same create call
-     * (cap_create_sidecar_in_personality), like the personality itself.
-     * E7 increment 16 widens the same rule: a stale mmap cursor would
-     * let a reused slot's non-FIXED grant land on (or its brk growth
-     * map over) a page the PREVIOUS occupant's map owned, and the
-     * staged mmap words must not survive into a slot whose pid they
-     * never belonged to — a reply carrying them would map against a
-     * span that is not the ask's. */
-    pd->linux_heap_base = 0;
-    pd->linux_heap_limit = 0;
-    pd->linux_brk_cur = 0;
-    pd->linux_mmap_top = 0;
-    /* E7 increment 20: the image range clears with the span for the same
-     * reason — a reused slot's capture would otherwise walk (and pour) the
-     * previous occupant's image pages as if they were this task's own. */
-    pd->linux_image_lo = 0;
-    pd->linux_image_hi = 0;
+    /* E7 TG-1 I5: the exit glue's words are per-thread state of the same
+     * shape — a reused slot that kept them would clear a stranger's TID word
+     * (and wake its joiner) or walk a robust list it never registered. */
+    pd->linux_clear_tid  = 0;
+    pd->linux_robust_list = 0;
+    /* E7 increment 31: the fault path's own state is per-thread in the same
+     * way — a reused slot that kept the act copy would run its predecessor's
+     * SIGNAL HANDLER on its own fault, and a stale mask or cr2 would silently
+     * block a delivery or name an address this occupant never touched. */
+    pd->linux_sig_mask   = 0;
+    pd->linux_sig_active = 0;
+    pd->linux_sig_frame_rsp   = 0;
+    pd->linux_sig_fault_active = 0;
+    /* E7 increment 34: a reveal probe's stage is per-forward, not per-thread
+     * state that may survive a slot's reuse — a stale one would commit a
+     * stranger's mask at the next 14's reply. */
+    pd->linux_sig_mask_stage_valid = 0;
+    pd->linux_sig_mask_stage_probe = 0;
+    pd->linux_sig_mask_stage_old   = 0;
+    pd->linux_sig_mask_stage_new   = 0;
+    pd->linux_sig_mask_stage_dst   = 0;
+    pd->linux_cr2        = 0;
+    for (unsigned fi = 0; fi < LINUX_FAULT_SIG_COUNT; fi++) {
+        pd->linux_fault_act[fi].handler  = 0;
+        pd->linux_fault_act[fi].flags    = 0;
+        pd->linux_fault_act[fi].mask     = 0;
+        pd->linux_fault_act[fi].restorer = 0;
+    }
+    /* E7 TG-1 I1: the shared span/cursors are the GROUP's (linux_thread.h);
+     * this per-descriptor clear no longer touches them. linux_group_create()
+     * stamps a fresh group, linux_group_destroy() zeroes its cursors, and the
+     * identity fields are cleared by linux_group_clear_identity() at teardown
+     * — after the group's one cap/page teardown, never here, because a live
+     * group must stay resolvable until its resources are released. The one
+     * per-thread value the resume path owns is the futex result. */
+    pd->sysret_result = 0;
     /* Q2: the gate stack's measurement identity clears with the span for the
      * same reason — a reused slot must not scan (or report) its predecessor's
      * freed frames, and the poison count is what says whether a measurement
@@ -206,11 +226,11 @@ static void proc_clear_resume_state(struct ProcessDescriptor* pd) {
     pd->reply_stage_aux = 0;
     /* M1: the network reply's secondary destinations die with the slot
      * for the same reason — a reused descriptor must never aim a
-     * successor's accept/recvfrom payload at its predecessor's pages. */
+     * successor's accept/recvfrom payload at its predecessor's pages.
+     * (The getdents64 cursor is the group's now — linux_group_reset.) */
     pd->reply_stage_va2 = 0;
     pd->reply_stage_len2 = 0;
     pd->reply_stage_va3 = 0;
-    pd->linux_dir_pos = 0;
 }
 
 /* E7 (increment 2): read this CPU's captured Linux argument registers.
@@ -238,9 +258,36 @@ int proc_read_linux_args(uint64_t out[6]) {
     return 1;
 }
 
+/* E7 TG-1 I2: the user RIP the current syscall must return to. syscall_entry
+ * saved RCX at [gs:0x18] before any call (the stack copy is not safe late —
+ * see proc_capture_entry_regs). The clone child starts there with rax=0, so
+ * the Go wrapper's post-syscall instruction is its first instruction. */
+int proc_read_linux_return_rip(uint64_t* out) {
+    if (!out) return 0;
+    __asm__ volatile("movq %%gs:0x18, %0" : "=r"(*out) : : "memory");
+    return 1;
+}
+
+/* E7 increment 35: the user RSP the current syscall was made with. [gs:0] is
+ * per_cpu_data.user_rsp, stored at syscall entry (proc_capture_entry_regs
+ * reads the same word; it survives until the return, which is why a park can
+ * capture it this late). The abandoned-frame check needs it: where the task's
+ * stack is NOW is what says whether it is still inside the frame its handler
+ * was entered for. */
+uint64_t proc_read_user_rsp(void) {
+    uint64_t rsp = 0;
+    __asm__ volatile("movq %%gs:0, %0" : "=r"(rsp) : : "memory");
+    return rsp;
+}
+
 // ─── process_init ─────────────────────────────────────────────────────────────
 void process_init(void) {
     for (int i = 0; i < PROC_MAX; i++) proc_table[i].active = 0;
+    /* E7 TG-1 I1: every descriptor starts group-less; the Linux create
+     * stamps the identity and index onto the group it makes. */
+    linux_groups_init();
+    /* E7 TG-1 I3: no futex waiter survives a machine init. */
+    linux_futex_init();
     // Phase 12: -1 = "never scheduled from this partition yet" for every
     // partition's round-robin cursor (BSS zero-init would give 0, a real
     // proc_table[] index, not a sentinel — must be set explicitly).
@@ -249,19 +296,29 @@ void process_init(void) {
 }
 
 // ─── alloc_pid ───────────────────────────────────────────────────────────────
-// Returns a fresh PID that doesn't collide with any currently active process.
-// Used by cap_create_sidecar() which bypasses process_create()'s catalog
-// lookup (sidecar images are not SLS catalog objects).
-uint32_t alloc_pid(void) {
-    /* Scan for the highest active PID and return max+1. This is O(PROC_MAX)
-     * but that's 16 — negligible, and monotonic PIDs never recycle so no
-     * bitmap is needed. */
-    uint32_t max_pid = 99;  /* below the 100+ range */
+// Every PID and Linux TID comes from the same `next_pid` sequence. A sidecar
+// respawn therefore cannot hand a live process a number that a later clone
+// will reuse as a TID: cap_table_index() resolves a pid through
+// proc_group_cap_owner(), so two live descriptors with one pid would make the
+// sidecar's capability lookups run against the Linux thread's group table
+// (the single-vCPU watchdog-respawn nettest failure).
+//
+// The active-descriptor check is defence in depth: `next_pid` is monotonic, but
+// a slot can still hold a pid from a path that did not allocate through here,
+// and returning it would recreate the collision.
+static int pid_is_live(uint32_t pid) {
     for (int i = 0; i < PROC_MAX; i++) {
-        if (proc_table[i].active && proc_table[i].pid > max_pid)
-            max_pid = proc_table[i].pid;
+        if (proc_table[i].active && proc_table[i].pid == pid) return 1;
     }
-    return max_pid + 1;
+    return 0;
+}
+
+uint32_t alloc_pid(void) {
+    uint32_t pid;
+    do {
+        pid = next_pid++;
+    } while (pid < 100 || pid_is_live(pid));
+    return pid;
 }
 
 // ─── nested_ring3_prep ───────────────────────────────────────────────────────
@@ -451,7 +508,7 @@ uint32_t process_create(struct ProcCreateRequest* req) {
 
     // 6. Populate the descriptor
     struct ProcessDescriptor* spawner = process_find_current();
-    pd->pid             = next_pid++;
+    pd->pid             = alloc_pid();
     pr_strcpy(pd->name, req->object_name, PROC_NAME_LEN);
     pd->object_id       = obj->object_id;
     pd->cr3             = new_cr3;
@@ -503,6 +560,7 @@ uint32_t process_create(struct ProcCreateRequest* req) {
     //    nested case — same value, redundant but harmless).
     per_cpu_data[0].kernel_rsp = pd->syscall_stack_top;
     if (spawner) nested_ring3_prep(spawner, pd);
+    tss_set_rsp0(pd->syscall_stack_top);
     kernel_enter_ring3(&pd->kernel_rsp, &pd->kernel_cr3,
                        pd->cr3, pd->user_rip, pd->user_rsp);
 
@@ -616,7 +674,7 @@ static uint32_t program_spawn_common(const char* object_name, uint32_t owner_uid
 
     // 6. Populate the process descriptor
     struct ProcessDescriptor* spawner = process_find_current();
-    pd->pid          = next_pid++;
+    pd->pid          = alloc_pid();
     pr_strcpy(pd->name, object_name, PROC_NAME_LEN);
     pd->object_id    = obj->object_id;
     pd->cr3          = new_cr3;
@@ -666,6 +724,7 @@ static uint32_t program_spawn_common(const char* object_name, uint32_t owner_uid
 
     if (!async) {
         if (spawner) nested_ring3_prep(spawner, pd);
+        tss_set_rsp0(pd->syscall_stack_top);
         kernel_enter_ring3(&pd->kernel_rsp, &pd->kernel_cr3,
                            pd->cr3, pd->user_rip, pd->user_rsp);
 
@@ -779,6 +838,247 @@ static void proc_free_syscall_stack(struct ProcessDescriptor* pd) {
     pd->syscall_stack_top = 0;
 }
 
+/* ─── E7 TG-1 I2: kernel-local clone (the Go thread shape) ─────────────────
+ * Go's newosproc expects clone to create a schedulable peer in the SAME
+ * address space, not a process: no page-table clone, no sidecar request, no
+ * new LinuxTask row. The child is born SUSPENDED with a synthetic ring-3
+ * context and a fresh 8 KiB syscall stack, joins the caller's group, and
+ * returns the child's TID to the caller. Everything shared stays the
+ * group's; only fs_base, the context, the stack and the trap state are the
+ * child's own. Called with the caller's trap frame captured and interrupts
+ * off (the syscall path); no other CPU can observe the half-built slot. */
+int linux_clone_thread(struct ProcessDescriptor* parent,
+                       const struct LinuxClonePlan* plan,
+                       uint64_t parent_rip, uint32_t* out_tid) {
+    if (!parent || !plan || !out_tid) return -LINUX_EINVAL;
+    if (parent->personality != PROC_PERSONALITY_LINUX) return -LINUX_EINVAL;
+    struct LinuxThreadGroup* g = linux_group_of(parent);
+    if (!g || g->exiting) return -LINUX_EINVAL;
+    if (parent->cr3 != g->cr3) return -LINUX_EINVAL;
+    if (parent_rip == 0 || !linux_fs_addr_is_user_canonical(parent_rip))
+        return -LINUX_EINVAL;
+    if (g->live_threads >= LINUX_THREADS_MAX) return -LINUX_EAGAIN;
+
+    /* Re-run the pure validator against the parent's LIVE base, not against
+     * whatever a caller put in the plan: the TLS inherittance and the stack
+     * bounds are security-relevant, so the create re-checks its own copy. */
+    struct LinuxClonePlan check;
+    if (linux_clone_plan(plan->flags, plan->child_stack, plan->tls,
+                         plan->ctid, parent->fs_base, &check) != 0)
+        return -LINUX_EINVAL;
+    if (check.flags != plan->flags || check.fs_base != plan->fs_base ||
+        check.ctid != plan->ctid)
+        return -LINUX_EINVAL;
+
+    struct ProcessDescriptor* child = 0;
+    for (int i = 0; i < PROC_MAX; i++) {
+        if (!proc_table[i].active) { child = &proc_table[i]; break; }
+    }
+    if (!child) return -LINUX_EAGAIN;
+
+    uint64_t sstop = alloc_proc_syscall_stack(parent->partition_id);
+    if (!sstop) return -LINUX_EAGAIN;
+
+    /* A reused slot must not inherit anything: this is a new thread, and
+     * every field below is re-stamped explicitly rather than trusted. */
+    for (int i = 0; i < (int)sizeof(*child); i++) ((uint8_t*)child)[i] = 0;
+    /* Same allocator as every sidecar and SLS process: a Linux thread can
+     * never reuse a live PID, because no allocator path advances a separate
+     * sequence. */
+    child->pid          = alloc_pid();
+    pr_strcpy(child->name, parent->name, PROC_NAME_LEN);
+    child->object_id    = parent->object_id;
+    child->cr3          = g->cr3;          /* the group's one root */
+    child->fs_base      = plan->fs_base;   /* per-thread TLS */
+    child->linux_clear_tid = plan->ctid;   /* I5: cleared at this thread's
+                                            * own exit, then futex-woken  */
+    child->user_rip     = parent_rip;
+    child->user_rsp     = plan->child_stack;
+    child->owner_uid    = parent->owner_uid;
+    child->parent_pid   = parent->pid;
+    child->partition_id = parent->partition_id;
+    child->priority     = PROC_PRIO_NORMAL;
+    child->personality  = PROC_PERSONALITY_LINUX;
+    child->syscall_stack_top = sstop;
+    child->waiting_chan = CAP_NONE;
+    child->group_index  = LINUX_GROUP_NONE;
+    linux_clone_build_context(&child->ring3_ctx, parent_rip, plan->child_stack);
+    /* Linux clone returns the PARENT's register state to the child, not a
+     * zeroed frame: Go's runtime.clone keeps mstart in R12, the m pointer in
+     * R13 and the g pointer in R9 across the syscall, then enters mstart via
+     * CALL R12. With the zeroed context the child called address 0 (observed
+     * live: clone TID joins, then [FAULT] rip=0). Read the still-live entry
+     * scratch, as the park path does, and overwrite everything the child
+     * must inherit; rax stays 0 and rsp/rsi become the child stack. */
+    {
+        struct CapParkCtx p;
+        proc_capture_entry_regs(&p);
+        child->ring3_ctx.r15 = p.r15;
+        child->ring3_ctx.r14 = p.r14;
+        child->ring3_ctx.r13 = p.r13;
+        child->ring3_ctx.r12 = p.r12;
+        child->ring3_ctx.r11 = p.r11;
+        child->ring3_ctx.r10 = p.linux_args[3];
+        child->ring3_ctx.r9  = p.linux_args[5];
+        child->ring3_ctx.r8  = p.linux_args[4];
+        child->ring3_ctx.rbp = p.rbp;
+        child->ring3_ctx.rdi = p.linux_args[0];
+        child->ring3_ctx.rsi = plan->child_stack;
+        child->ring3_ctx.rdx = p.linux_args[2];
+        child->ring3_ctx.rcx = parent_rip;
+        child->ring3_ctx.rbx = p.rbx;
+        child->ring3_ctx.rflags = p.r11;
+    }
+
+    if (linux_group_join_thread(g, child) != 0) {
+        proc_free_syscall_stack(child);
+        for (int i = 0; i < (int)sizeof(*child); i++)
+            ((uint8_t*)child)[i] = 0;
+        return -LINUX_EAGAIN;
+    }
+
+    /* Only now is the slot visible: active + a schedulable resume shape. */
+    child->has_ring3_ctx = 1;
+    child->state         = PROC_SUSPENDED;
+    child->active        = 1;
+    proc_count++;
+
+    *out_tid = child->tid;
+    kernel_serial_printf(
+        "[E7] clone: TID %u joins group %u (leader %u) "
+        "rip=0x%lx stack=0x%lx tls=0x%lx\n",
+        child->tid, g->group_id, g->leader_pid,
+        (unsigned long)parent_rip, (unsigned long)plan->child_stack,
+        (unsigned long)plan->fs_base);
+    return 0;
+}
+
+/* TG-2d: one sibling the replay's create could not finish. The descriptor is
+ * still private to this function (never scheduled, never in a run queue), so
+ * its stack and group admission are the only resources to return. */
+static void proc_discard_restored_sibling(struct ProcessDescriptor* pd) {
+    if (!pd || !pd->active) return;
+    struct LinuxThreadGroup* g = linux_group_of(pd);
+    proc_free_syscall_stack(pd);
+    if (g) (void)linux_group_leave_thread(g);
+    linux_group_clear_identity(pd);
+    pd->active = 0;
+    if (proc_count) proc_count--;
+}
+
+int linux_restore_group_siblings(struct ProcessDescriptor* leader,
+                                 const uint16_t* thread_indexes,
+                                 uint32_t n) {
+    if (!leader || !thread_indexes || n == 0) return -1;
+    if (leader->personality != PROC_PERSONALITY_LINUX) return -1;
+    if (!leader->active || !leader->restore_held) return -1;
+    struct LinuxThreadGroup* g = linux_group_of(leader);
+    if (!g || g->exiting || leader->cr3 != g->cr3) return -1;
+    if (n > (uint32_t)LINUX_THREADS_MAX - 1u) return -1;
+    if ((uint32_t)g->live_threads + n > (uint32_t)LINUX_THREADS_MAX)
+        return -1;
+
+    uint32_t free_slots = 0;
+    for (int i = 0; i < PROC_MAX; i++)
+        if (!proc_table[i].active) free_slots++;
+    if (free_slots < n) return -1;
+
+    /* The recorded indexes are identity, not hints: a duplicate or index 0
+     * would make two payload tasks resolve to one descriptor. */
+    for (uint32_t i = 0; i < n; i++) {
+        if (thread_indexes[i] == 0 ||
+            thread_indexes[i] >= LINUX_THREADS_MAX) return -1;
+        for (uint32_t j = 0; j < i; j++)
+            if (thread_indexes[i] == thread_indexes[j]) return -1;
+        for (int j = 0; j < PROC_MAX; j++) {
+            if (!proc_table[j].active) continue;
+            if (linux_group_of(&proc_table[j]) != g) continue;
+            if (proc_table[j].thread_index == thread_indexes[i]) return -1;
+        }
+    }
+
+    /* Allocate the whole set first. A stack refusal then leaves the process
+     * table untouched, which is the same refusal-over-partial rule the pour
+     * uses. */
+    uint64_t stacks[LINUX_THREADS_MAX];
+    uint32_t allocated = 0;
+    for (; allocated < n; allocated++) {
+        stacks[allocated] = alloc_proc_syscall_stack(leader->partition_id);
+        if (!stacks[allocated]) break;
+    }
+    if (allocated != n) {
+        for (uint32_t i = 0; i < allocated; i++) {
+            struct ProcessDescriptor tmp;
+            for (uint32_t b = 0; b < (uint32_t)sizeof(tmp); b++)
+                ((uint8_t*)&tmp)[b] = 0;
+            tmp.syscall_stack_top = stacks[i];
+            proc_free_syscall_stack(&tmp);
+        }
+        return -1;
+    }
+
+    struct ProcessDescriptor* made[LINUX_THREADS_MAX];
+    uint32_t n_made = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        struct ProcessDescriptor* child = 0;
+        for (int s = 0; s < PROC_MAX; s++) {
+            if (!proc_table[s].active) { child = &proc_table[s]; break; }
+        }
+        if (!child) goto rollback;
+        for (uint32_t b = 0; b < (uint32_t)sizeof(*child); b++)
+            ((uint8_t*)child)[b] = 0;
+        child->pid          = alloc_pid();
+        pr_strcpy(child->name, leader->name, PROC_NAME_LEN);
+        child->object_id    = leader->object_id;
+        child->cr3          = g->cr3;
+        child->owner_uid    = leader->owner_uid;
+        child->parent_pid   = leader->pid;
+        child->partition_id = leader->partition_id;
+        child->priority     = PROC_PRIO_NORMAL;
+        child->personality  = PROC_PERSONALITY_LINUX;
+        child->syscall_stack_top = stacks[i];
+        stacks[i] = 0;   /* the descriptor owns it from here */
+        child->waiting_chan = CAP_NONE;
+        child->group_index  = LINUX_GROUP_NONE;
+        child->state        = PROC_HELD;
+        child->restore_held = 1;
+        child->has_ring3_ctx = 0;
+        child->active       = 1;
+        if (linux_group_join_restored_thread(g, child,
+                                             thread_indexes[i]) != 0) {
+            proc_free_syscall_stack(child);
+            for (uint32_t b = 0; b < (uint32_t)sizeof(*child); b++)
+                ((uint8_t*)child)[b] = 0;
+            goto rollback;
+        }
+        made[n_made++] = child;
+        proc_count++;
+        kernel_serial_printf(
+            "[SIDECAR] PID %u '%s' HELD sibling for restore group=%u "
+            "thread=%u (leader %u)\n",
+            child->pid, child->name, g->group_id,
+            (unsigned)child->thread_index, g->leader_pid);
+    }
+    kernel_serial_printf(
+        "[SIDECAR] restore group %u: created %u held sibling(s) on one root\n",
+        g->group_id, n);
+    return 0;
+
+rollback:
+    while (n_made > 0)
+        proc_discard_restored_sibling(made[--n_made]);
+    for (uint32_t i = 0; i < n; i++) {
+        struct ProcessDescriptor tmp;
+        for (uint32_t b = 0; b < (uint32_t)sizeof(tmp); b++)
+            ((uint8_t*)&tmp)[b] = 0;
+        if (stacks[i]) {
+            tmp.syscall_stack_top = stacks[i];
+            proc_free_syscall_stack(&tmp);
+        }
+    }
+    return -1;
+}
+
 // ─── process_exit ────────────────────────────────────────────────────────────
 // Called from SYS_SLS_EXIT dispatch.  Finds the running Ring-3 process,
 // marks it ZOMBIE, restores the kernel's RSP and CR3 saved by
@@ -800,6 +1100,289 @@ static void linux_stack_hwm_report(struct ProcessDescriptor *pd, const char *whe
 static void linux_stack_maybe_report(struct ProcessDescriptor *pd, const char *where) {
     if (pd && pd->personality == PROC_PERSONALITY_LINUX && pd->linux_stack_poison)
         linux_stack_hwm_report(pd, where);
+}
+
+/* ─── E7 TG-1 I2: thread/group lifecycle ─────────────────────────────────
+ * The group owns the address space, cap table and sidecar row; a departing
+ * thread owns only its syscall stack, register/trap state and descriptor
+ * identity. So one thread's exit NEVER frees cr3 or the cap table. The last
+ * live thread is what triggers the group's one destroy.
+ *
+ * The leader is v1's named exception (the TG-1 plan's decision 3): if it
+ * exits while siblings live, its descriptor stays ACTIVE-but-ZOMBIE so the
+ * sidecar's name -> pid lookup (`sidecar_pid(PROBE_NAME)`) keeps resolving
+ * until group teardown; it is never scheduled again. That costs one slot,
+ * deliberately, and linux_group_release_all() reclaims it at teardown.
+ *
+ * Returns 1 when this was the group's last live thread (destroy owed), 0
+ * otherwise, including a group-less descriptor. */
+static int linux_descriptor_release(struct ProcessDescriptor* pd) {
+    struct LinuxThreadGroup* g = linux_group_of(pd);
+    int last;
+
+    /* E7 TG-1 I5b: EVERY dying Linux thread clears its TID word and walks its
+     * robust list, exactly as Linux's do_exit does — not only the ones that
+     * called exit(60). This is the funnel every descriptor-level death passes
+     * through (exit(60) and the deferred-kill sweep), and it runs before
+     * proc_clear_resume_state() zeroes the very words being honoured. The
+     * group's root is still alive: a non-last thread leaves it to the group,
+     * and a last thread destroys it after linux_group_release_all(). */
+    linux_thread_exit_glue(pd);
+    linux_stack_maybe_report(pd, "exit");
+    proc_clear_resume_state(pd);
+    /* E7 TG-1 I3: a departing thread cannot still be a futex waiter. A block
+     * is only reachable while the descriptor is BLOCKED, so this is the
+     * teardown net (a kill that lands on a waiter), not the normal path. */
+    linux_futex_wait_cancel(pd->tid);
+    /* E7 TG-1 I4: a departing thread is neither a lease waiter (its bit would
+     * otherwise be granted to a descriptor that can never restart) nor an
+     * owner that may keep the group's only forward slot forever. The owner's
+     * release runs the normal grant path, so a sibling parked behind it is
+     * restarted here rather than at some later release that never comes. */
+    if (g) {
+        linux_group_fwd_cancel_wait(g, (uint32_t)(pd - proc_table));
+        if (g->fwd_busy && g->fwd_owner_tid == pd->tid)
+            linux_forward_lease_release(pd);
+    }
+    proc_free_syscall_stack(pd);
+    pd->state  = PROC_ZOMBIE;
+
+    if (!g) {
+        pd->active = 0;
+        if (pd->pid != 0 && proc_count) proc_count--;
+        linux_group_clear_identity(pd);
+        return 0;
+    }
+
+    last = linux_group_leave_thread(g);
+    if (pd->is_group_leader && !last) {
+        /* The reserved leader: identity (tid/tgid/group index) stays valid
+         * for the sidecar row, but the descriptor can never run again. */
+        pd->active = 1;
+        return 0;
+    }
+    if (last) {
+        /* Stay ACTIVE until linux_group_release_all() has destroyed the
+         * group: cap_table_teardown() unmaps through cap_proc_cr3(), which
+         * requires the cap owner's descriptor to be active. */
+        return 1;
+    }
+    linux_group_clear_identity(pd);
+    pd->active = 0;
+    if (pd->pid != 0 && proc_count) proc_count--;
+    return 0;
+}
+
+/* ─── E7 TG-1 I5: the thread-exit glue ────────────────────────────────────
+ * Linux's do_exit does two things this shim must do too, because both are
+ * WHY a joiner ever wakes: it writes 0 into the dying thread's
+ * clear_child_tid word and wakes that futex (pthread_join's whole mechanism),
+ * and it walks the thread's robust list, marking every mutex it still owns as
+ * FUTEX_OWNER_DIED|tid and waking that mutex's waiter (pthread_mutex_lock's
+ * EOWNERDEAD path).
+ *
+ * Both halves are privileged here for the same reason futex is kernel-local:
+ * the words live in the GROUP's page table, which the sidecar does not have,
+ * and the waiter is a descriptor this scheduler parks. Every user access is a
+ * validated copy (the P4 rule extended to writes), so a word the task
+ * unmapped is a console line and never a ring-0 fault; every walk is bounded
+ * by LINUX_ROBUST_LIST_LIMIT and stops at the head or on the first unreadable
+ * entry, so a forged list cannot spin the kernel.
+ *
+ * What it does NOT do, by name: `list_op_pending` (a mutex being locked at the
+ * instant of death is not marked — Linux's own hard case), and any clear on
+ * the exit_group path (a whole-group exit leaves no joiner; every member's
+ * descriptor goes through the group teardown instead). Both are §10.23. */
+static uint64_t linux_get_u64(const uint8_t* p) {
+    uint64_t v = 0;
+    for (int i = 0; i < 8; i++) v |= (uint64_t)p[i] << (8 * i);
+    return v;
+}
+
+static void linux_put_u32(uint8_t* p, uint32_t v) {
+    for (int i = 0; i < 4; i++) p[i] = (uint8_t)(v >> (8 * i));
+}
+
+void linux_thread_exit_glue(struct ProcessDescriptor* pd) {
+    struct LinuxThreadGroup* g;
+    uint64_t ctid = 0, head = 0;
+    uint32_t tid, gid;
+
+    if (!pd) return;
+    g    = linux_group_of(pd);
+    tid  = pd->tid;
+    gid  = g ? g->group_id : 0;
+    /* I5b: the words are TAKEN, not read — a Linux thread can die through two
+     * funnels (its own exit and the group teardown that follows the last
+     * one), and both run this. Taking them here is what makes the second call
+     * a no-op instead of a second clear under a joiner. */
+    if (!linux_thread_take_exit_words(pd, &ctid, &head)) return;
+
+    if (ctid != 0 && linux_ctid_ok(ctid)) {
+        static const uint8_t zero[4] = { 0, 0, 0, 0 };
+        if (linux_user_copy_in(zero, pd->cr3, ctid, 4) == 0) {
+            uint32_t woken = 0;
+            /* The wake's count is logged, not assumed: on a group's own
+             * teardown it is 1 only because linux_group_release_all() runs
+             * this before forget_group (see there), and a line that claimed a
+             * joiner without saying how many were woken would hide exactly
+             * that ordering bug. */
+            if (g) woken = (uint32_t)linux_futex_wake_threads(gid, ctid, 1);
+            kernel_serial_printf(
+                "[E7] clear-TID: TID %u word 0x%lx cleared, joiner woken "
+                "(n=%u)\n", tid, (unsigned long)ctid, woken);
+        } else {
+            kernel_serial_printf(
+                "[E7] clear-TID: TID %u word 0x%lx is not a writable user "
+                "page; nothing cleared, no joiner wake\n",
+                tid, (unsigned long)ctid);
+        }
+    }
+
+    if (head != 0 && g &&
+        linux_robust_list_ok(head, LINUX_ROBUST_LIST_HEAD_BYTES)) {
+        uint8_t hb[LINUX_ROBUST_LIST_HEAD_BYTES];
+        uint64_t entry;
+        int64_t  off;
+        uint32_t walked = 0, released = 0;
+
+        if (linux_user_copy_out(hb, pd->cr3, head,
+                                LINUX_ROBUST_LIST_HEAD_BYTES) != 0) {
+            kernel_serial_printf(
+                "[E7] robust list: TID %u head 0x%lx unreadable; no walk\n",
+                tid, (unsigned long)head);
+            return;
+        }
+        entry = linux_get_u64(hb);          /* head->list.next            */
+        off   = (int64_t)linux_get_u64(hb + 8);  /* head->futex_offset    */
+
+        while (entry != 0 && entry != head && walked < LINUX_ROBUST_LIST_LIMIT) {
+            uint8_t nb[8], wb[4];
+            uint64_t next, waddr;
+            uint32_t word, died;
+
+            /* The next pointer is read BEFORE the word is touched: the entry
+             * is the task's own memory and the walk must not depend on what
+             * this kernel just wrote into one of its futexes. */
+            if (linux_user_copy_out(nb, pd->cr3, entry, 8) != 0) break;
+            next = linux_get_u64(nb);
+            walked++;
+            if (linux_robust_word_addr(entry, off, &waddr) != 0) break;
+            if (linux_user_copy_out(wb, pd->cr3, waddr, 4) != 0) {
+                entry = next;
+                continue;
+            }
+            word = (uint32_t)wb[0] | ((uint32_t)wb[1] << 8) |
+                   ((uint32_t)wb[2] << 16) | ((uint32_t)wb[3] << 24);
+            died = linux_robust_died_word(word, tid);
+            if (died != 0) {
+                uint8_t out[4];
+                linux_put_u32(out, died);
+                if (linux_user_copy_in(out, pd->cr3, waddr, 4) == 0) {
+                    released++;
+                    (void)linux_futex_wake_threads(gid, waddr, 1);
+                }
+            }
+            entry = next;
+        }
+        kernel_serial_printf(
+            "[E7] robust list: TID %u walked %u entries, released %u "
+            "(FUTEX_OWNER_DIED|%u)\n",
+            tid, walked, released, tid);
+    }
+}
+
+/* Group-fatal teardown: every member descriptor first, then the group's ONE
+ * cap-table/page-table destroy. Used by the fault path, a kill that lands on
+ * any member, and the last thread's departure. */
+static void linux_group_release_all(struct LinuxThreadGroup* g) {
+    uint32_t gi;
+    if (!g || !g->used || g->exiting) return;
+    gi = (uint32_t)(g - linux_group_table);
+    /* E7 TG-1 I5b: every member's clear and robust walk runs FIRST, while the
+     * group's root is alive and its futex waiters are still registered — so a
+     * sibling parked on a dying thread's TID word is really woken, the order
+     * Linux's do_exit gives (clear, wake, then the rest of the group). This is
+     * what makes the fault and exit_group paths wake a joiner at all: run
+     * after forget_group they would clear the word and find nobody. Nothing
+     * is scheduled between this loop and the release pass below — the whole
+     * teardown runs inside the fault/kill/exit dispatch with IF=0 — so a
+     * woken member cannot execute before it is released. */
+    for (int i = 0; i < PROC_MAX; i++) {
+        struct ProcessDescriptor* pd = &proc_table[i];
+        if (!pd->active) continue;
+        if (pd->group_index != gi) continue;
+        linux_thread_exit_glue(pd);
+    }
+    /* E7 TG-1 I3: no waiter of this group survives its teardown. AFTER the
+     * glue loop, so its wakes find the group's waiters and report them, and
+     * before the release pass, so no descriptor is ZOMBIE with a live waiter
+     * and a deadline tick between here and the destroy cannot resume one
+     * whose syscall stack is about to be freed. */
+    linux_futex_forget_group(g->group_id);
+    /* First pass: stop every member, free only its per-thread stack. Keep
+     * the descriptors ACTIVE and their identity intact — the group's cap
+     * teardown resolves cap_proc_cr3(cap_owner_pid), so the owner must be
+     * active until after the destroy. */
+    for (int i = 0; i < PROC_MAX; i++) {
+        struct ProcessDescriptor* pd = &proc_table[i];
+        if (!pd->active) continue;
+        if (pd->group_index != gi) continue;
+        /* The words were spent in the glue loop above; a member released
+         * through linux_descriptor_release() spent them even earlier, which
+         * is the no-op the consumption rule buys. */
+        linux_stack_maybe_report(pd, "exit");
+        proc_clear_resume_state(pd);
+        proc_free_syscall_stack(pd);
+        pd->state = PROC_ZOMBIE;
+    }
+    kernel_serial_printf(
+        "[E7] group exit: group %u (leader %u) torn down once\n",
+        g->group_id, g->leader_pid);
+    linux_group_destroy(g);
+    /* Second pass: the shared resources are gone; release every descriptor
+     * that belonged to the group (including the reserved leader). */
+    for (int i = 0; i < PROC_MAX; i++) {
+        struct ProcessDescriptor* pd = &proc_table[i];
+        if (!pd->active || pd->group_index != gi) continue;
+        linux_group_clear_identity(pd);
+        pd->active = 0;
+        if (pd->pid != 0 && proc_count) proc_count--;
+    }
+}
+
+/* Linux exit(60), from the dispatcher. The caller is RUNNING on the syscall
+ * stack being freed, so this never returns: it picks the next runnable
+ * descriptor and hands it the CPU, exactly like the async-exit path. The
+ * freed frames stay physically intact until that switch (single CPU, IF=0),
+ * the same argument process_exit() relies on. */
+__attribute__((noreturn))
+void linux_thread_exit(struct ProcessDescriptor* pd, uint32_t exit_code) {
+    struct LinuxThreadGroup* g = linux_group_of(pd);
+    uint32_t tid = pd ? pd->tid : 0;
+    uint32_t gid = g ? g->group_id : 0;
+
+    /* E7 TG-1 I5b: the glue moved into linux_descriptor_release(), which every
+     * descriptor-level death goes through, so this path and the deferred-kill
+     * sweep share one call site instead of one each. */
+    int last = pd ? linux_descriptor_release(pd) : 0;
+    struct ProcessDescriptor* next;
+
+    kernel_serial_printf(
+        "[E7] thread exit: TID %u group %u code=%u%s\n",
+        tid, gid, exit_code,
+        last ? " (last thread: group teardown)" : "");
+    if (last) linux_group_release_all(g);
+
+    next = pick_next_runnable();
+    if (!next) {
+        kernel_serial_print(
+            "[E7] thread exit: no runnable process left; halting.\n");
+        for (;;) __asm__ volatile("hlt");
+    }
+    kernel_serial_printf("[E7] thread exit: switching to PID %u '%s'\n",
+                         next->pid, next->name);
+    kernel_switch_next(next);
 }
 
 void process_exit(uint32_t exit_code) {
@@ -826,6 +1409,16 @@ void process_exit(uint32_t exit_code) {
          * and the poison identity is still set; proc_clear_resume_state()
          * below is what drops it. */
         linux_stack_maybe_report(pd, "exit");
+
+        /* E7 TG-1 I5b: the FAULT path's own clear runs here, before
+         * proc_clear_resume_state() zeroes the very words it honours — the
+         * measured bug this line exists for: a thread that died of a #PF had
+         * its ctid and robust head dropped in that call, so the group
+         * teardown below found nothing to clear and its joiner stayed parked.
+         * The pages are still mapped (the phase-2 destroy is further down) and
+         * the glue consumes the words, so the group teardown that follows is
+         * the no-op. */
+        linux_thread_exit_glue(pd);
 
         /* Phase 2: resume/teardown flags on a process that exits normally
          * are moot — the full teardown below reclaims everything anyway.
@@ -854,12 +1447,27 @@ void process_exit(uint32_t exit_code) {
          * pd->active stays 1 until after step 1 because
          * cap_proc_cr3(pid) (used by the teardown's unmap walk) requires
          * an active descriptor. */
-        cap_table_teardown(pd->pid);
-        user_destroy_page_table(pd->cr3);
-        proc_free_syscall_stack(pd);
-
-        pd->active = 0;
-        proc_count--;
+        /* E7 TG-1 I2: a Linux group member's fault/exit is GROUP-fatal —
+         * the cap table and page table are shared, so there is no safe
+         * per-thread teardown. Every member goes, then the group's one
+         * destroy. A non-Linux descriptor keeps the historical path, and a
+         * LINUX descriptor with no group has already had its one group
+         * teardown (a sibling exit landed here) so it frees nothing again. */
+        {
+            struct LinuxThreadGroup* lg = linux_group_of(pd);
+            if (lg) {
+                linux_group_release_all(lg);
+            } else {
+                if (pd->personality != PROC_PERSONALITY_LINUX) {
+                    cap_table_teardown(pd->pid);
+                    user_destroy_page_table(pd->cr3);
+                }
+                proc_free_syscall_stack(pd);
+                linux_group_clear_identity(pd);
+                pd->active = 0;
+                proc_count--;
+            }
+        }
 
         /* Seed Kernel Phase 1.5: three resume shapes now exist.
          *
@@ -929,6 +1537,7 @@ void process_exit(uint32_t exit_code) {
                      * use. */
                     per_cpu_data[0].kernel_rsp =
                         proc_table[j].syscall_stack_top;
+                    tss_set_rsp0(proc_table[j].syscall_stack_top);
                     break;
                 }
             }
@@ -1206,6 +1815,13 @@ static int pick_next_process_in_partition(uint32_t partition_id, int exclude_idx
 //    continues exactly where it left off.
 //  - otherwise:        iretq to the process's saved ring-3 context.
 static void proc_build_resume_frame(struct ProcessDescriptor* next, uint64_t* f) {
+    /* The CPL-3 entry point (timer IRQ, fault, syscall gate) must not land on
+     * the static low .bss interruption_stack: a low-linked ET_EXEC's text can
+     * cover that address, so the CPU would write an interrupt frame over the
+     * task's code. Point RSP0 at the task's own kernel syscall stack, which
+     * is supervisor-mapped in every user page table. */
+    if (next->syscall_stack_top != 0)
+        tss_set_rsp0(next->syscall_stack_top);
     /* E7 §5.3 (the plan's increment 4): FSBASE follows the task being
      * switched IN to — one wrmsr at the single frame-builder every switch
      * path honours (timer schedule_ring3, kernel_switch_next, the control-
@@ -1523,11 +2139,25 @@ static void proc_deferred_teardown(struct ProcessDescriptor* pd) {
     kernel_serial_printf(
         "[PROC] PID %u '%s' deferred teardown (killed while running)\n",
         pd->pid, pd->name);
+    /* E7 TG-1 I2: a deferred kill on any group member is group-fatal. Each
+     * member is released as the sweep reaches it; the last one destroys the
+     * shared resources exactly once. */
+    {
+        struct LinuxThreadGroup* lg = linux_group_of(pd);
+        if (lg) {
+            if (linux_descriptor_release(pd))
+                linux_group_release_all(lg);
+            return;
+        }
+    }
     linux_stack_maybe_report(pd, "exit");
     proc_clear_resume_state(pd);
-    cap_table_teardown(pd->pid);
-    user_destroy_page_table(pd->cr3);
+    if (pd->personality != PROC_PERSONALITY_LINUX) {
+        cap_table_teardown(pd->pid);
+        user_destroy_page_table(pd->cr3);
+    }
     proc_free_syscall_stack(pd);
+    linux_group_clear_identity(pd);
     pd->active = 0;
     proc_count--;
 }
@@ -1671,6 +2301,26 @@ struct ProcessDescriptor* process_find_current(void) {
      * scheduler picks it up on its next tick — one tick of handoff
      * latency in exchange for the machine staying alive. */
     if (!smp_on_bsp()) return 0;
+    /* E7 TG-1 I4: a GROUP can have more than one RUNNING thread (the leader
+     * spins in ring 3 while a sibling is inside a syscall), so "first
+     * RUNNING" is not "the caller" — it returned the leader for a sibling's
+     * trap, which made that sibling's cap_maybe_handoff read the LEADER's
+     * park_syscall (0), hand the CPU away mid-forward, and leave the reply
+     * queued with nobody parked to wake. The per-CPU syscall-stack top is
+     * written by both switches (schedule_ring3 and kernel_switch_next) to
+     * the descriptor they are entering and stays fixed for the whole
+     * syscall, so it names the executing THREAD exactly. Stacks are
+     * per-descriptor, so the match is unique. The scan below stays as the
+     * fallback for kernel-context callers and stacks that predate the
+     * field. */
+    for (int i = 0; i < PROC_MAX; i++) {
+        if (proc_table[i].is_control_plane) continue;
+        if (!proc_table[i].active || proc_table[i].state != PROC_RUNNING)
+            continue;
+        if (proc_table[i].syscall_stack_top != 0 &&
+            proc_table[i].syscall_stack_top == per_cpu_data[0].kernel_rsp)
+            return &proc_table[i];
+    }
     for (int i = 0; i < PROC_MAX; i++) {
         /* E1: the control plane is NOT a Ring-3 process. It is excluded here
          * deliberately, so every "who is asking?" caller keeps its pre-E1
@@ -1809,30 +2459,37 @@ static void proc_capture_entry_regs(struct CapParkCtx* ctx) {
         "movq %%gs:0x40, %6\n\t"
         "movq %%gs:0x48, %7\n\t"
         "movq %%gs:0, %8\n\t"
-        /* The argument half: read through ONE scratch register (rax),
-         * stored to memory outputs — 15 register outputs here would be
-         * impossible constraints at -O0 (a fixed rbp leaves 14 for 15),
-         * which is exactly how the three host tests that #include
-         * process.c caught the first attempt. */
+        /* The argument half: read through ONE scratch register (rax) and
+         * stored through ONE explicit pointer (%9) — 15 register outputs
+         * here would be impossible constraints at -O0 (a fixed rbp leaves 14
+         * for 15), which is exactly how the three host tests that #include
+         * process.c caught the first attempt. The stores go through the
+         * pointer rather than `=m` operands because at -O0 gcc formed the
+         * memory addresses from ctx in %rdx and %rcx, then reused those two
+         * registers for the captured values — the last two stores landed at
+         * (captured gs value + 0x60/0x68) and faulted. The outputs are
+         * early-clobber (`=&r`) so the pointer's register cannot be one of
+         * them: without it gcc took the input is read before any output is
+         * written, put the pointer in %rdx, and then loaded %gs:0x0 into that
+         * same %rdx — the stores went to (captured user RSP + offset) and
+         * faulted at address 0. */
         "movq %%gs:0x50, %%rax\n\t"
-        "movq %%rax, %9\n\t"
+        "movq %%rax, 0(%9)\n\t"
         "movq %%gs:0x58, %%rax\n\t"
-        "movq %%rax, %10\n\t"
+        "movq %%rax, 8(%9)\n\t"
         "movq %%gs:0x60, %%rax\n\t"
-        "movq %%rax, %11\n\t"
+        "movq %%rax, 16(%9)\n\t"
         "movq %%gs:0x68, %%rax\n\t"
-        "movq %%rax, %12\n\t"
+        "movq %%rax, 24(%9)\n\t"
         "movq %%gs:0x70, %%rax\n\t"
-        "movq %%rax, %13\n\t"
+        "movq %%rax, 32(%9)\n\t"
         "movq %%gs:0x78, %%rax\n\t"
-        "movq %%rax, %14\n\t"
-        : "=r"(ctx->r11), "=r"(ctx->rcx), "=r"(ctx->r15), "=r"(ctx->r14),
-          "=r"(ctx->r13), "=r"(ctx->r12), "=r"(ctx->rbx), "=r"(ctx->rbp),
-          "=r"(ctx->user_rsp), "=m"(ctx->linux_args[0]),
-          "=m"(ctx->linux_args[1]), "=m"(ctx->linux_args[2]),
-          "=m"(ctx->linux_args[3]), "=m"(ctx->linux_args[4]),
-          "=m"(ctx->linux_args[5])
-        : : "rax", "memory");
+        "movq %%rax, 40(%9)\n\t"
+        : "=&r"(ctx->r11), "=&r"(ctx->rcx), "=&r"(ctx->r15), "=&r"(ctx->r14),
+          "=&r"(ctx->r13), "=&r"(ctx->r12), "=&r"(ctx->rbx), "=&r"(ctx->rbp),
+          "=&r"(ctx->user_rsp)
+        : "r"(ctx->linux_args)
+        : "rax", "memory");
 }
 
 /* Shared park capture: snapshot the current process's syscall-entry
@@ -1878,6 +2535,275 @@ int cap_wait_chan(uint32_t chan_id, void* recv_req) {
                          next->pid, next->name);
     kernel_switch_next(next);   /* noreturn */
     return 1;   /* unreachable */
+}
+
+/* ─── E7 TG-1 I3: futex wait/wake, the privileged halves ─────────────────
+ * The table arithmetic is kernel/linux_futex.c (host-tested); these three
+ * functions are the parts that need a descriptor, the scheduler and the
+ * caller's page-table root.
+ *
+ * A futex waiter does not re-run its trap on wake. It already read the word,
+ * compared it and enqueued; the answer is just the syscall's return value. So
+ * the resume reuses proc_gate_stop_at_sysret's mapping — park_ctx holds the
+ * ENTRY registers captured at the park, and rebuilding the 20-word ring-3
+ * frame from it returns to the instruction after `syscall` with rax set. That
+ * is deliberately NOT resume_kernel: nothing is executed on the way back, so
+ * there is no second wait and no sidecar forward. */
+/* Build a "return to ring 3 from a park" frame: the entry registers the park
+ * captured, `rax` as the syscall's result, `rip` as where ring 3 resumes.
+ * I3's futex wake uses rip = the instruction after `syscall`; I4's lease grant
+ * uses rip = the `syscall` instruction itself (a Linux syscall restart), so
+ * the same frame shape serves both and neither re-runs kernel code. */
+static void linux_park_return_frame(struct ProcessDescriptor* pd, uint64_t rax,
+                                    uint64_t rip) {
+    const struct CapParkCtx* p = &pd->park_ctx;
+    uint64_t* c = (uint64_t*)&pd->ring3_ctx;
+
+    c[0]  = p->r15;  c[1]  = p->r14;  c[2]  = p->r13;  c[3]  = p->r12;
+    c[4]  = p->r11;                        /* r11 (the syscall's rflags) */
+    c[5]  = p->linux_args[3];              /* r10 */
+    c[6]  = p->linux_args[5];              /* r9  */
+    c[7]  = p->linux_args[4];              /* r8  */
+    c[8]  = p->rbp;
+    c[9]  = p->linux_args[0];              /* rdi */
+    c[10] = p->linux_args[1];              /* rsi */
+    c[11] = p->linux_args[2];              /* rdx */
+    c[12] = p->rcx;                        /* rcx: the sysret target */
+    c[13] = p->rbx;
+    c[14] = rax;
+    c[15] = rip;
+    c[16] = 0x23;                          /* ring-3 code */
+    c[17] = p->r11;                        /* rflags */
+    c[18] = p->user_rsp;
+    c[19] = 0x1B;                          /* ring-3 data */
+
+    pd->has_ring3_ctx = 1;
+    pd->user_rip      = rip;
+    pd->user_rsp      = p->user_rsp;
+}
+
+static int linux_futex_resume_thread(uint32_t tid, int32_t result) {
+    for (int i = 0; i < PROC_MAX; i++) {
+        struct ProcessDescriptor* pd = &proc_table[i];
+
+        if (!pd->active || pd->tid != tid) continue;
+        if (pd->state != PROC_BLOCKED) return 0;
+        if (pd->park_syscall != SYS_LINUX_FUTEX_RESUME) return 0;
+
+        linux_park_return_frame(pd, (uint64_t)(int64_t)result,
+                                pd->park_ctx.rcx);
+        pd->park_syscall  = 0;
+        pd->park_req      = 0;
+        pd->state         = PROC_SUSPENDED;
+        return 1;
+    }
+    return 0;
+}
+
+int linux_futex_wake_threads(uint32_t group_id, uint64_t uaddr,
+                            uint32_t count) {
+    uint32_t tids[LINUX_FUTEX_WAITERS];
+    int found, woken = 0;
+
+    if (count > LINUX_FUTEX_WAITERS) count = LINUX_FUTEX_WAITERS;
+    found = linux_futex_wake_collect(group_id, uaddr, count, tids,
+                                     LINUX_FUTEX_WAITERS);
+    for (int i = 0; i < found; i++) {
+        if (linux_futex_resume_thread(tids[i], 0))
+            woken++;
+        else
+            kernel_serial_printf(
+                "[E7] futex wake: group %u uaddr=0x%lx waiter TID %u has no "
+                "parked descriptor\n",
+                group_id, (unsigned long)uaddr, tids[i]);
+    }
+    if (woken > 0)
+        kernel_serial_printf(
+            "[E7] futex wake: group %u uaddr=0x%lx woken=%d\n",
+            group_id, (unsigned long)uaddr, woken);
+    return woken;
+}
+
+/* Block the CALLING thread on a futex. Returns a negative errno only when it
+ * did not park: the table is full (-ENOMEM) or no other descriptor is
+ * runnable (-EAGAIN). On success it never returns — the waker or the deadline
+ * tick delivers the result into rax through linux_futex_resume_thread.
+ *
+ * The enqueue happens INSIDE this syscall, with interrupts off, before the
+ * switch: a wake from another thread cannot run between the caller's word
+ * check and this record, so the wake either misses (the waiter then sees the
+ * changed word and answers EAGAIN itself) or finds this record and resumes a
+ * thread that is already committed to parking. */
+int linux_futex_block(struct ProcessDescriptor* cur, uint32_t group_id,
+                      uint64_t uaddr, uint64_t deadline) {
+    struct ProcessDescriptor* next;
+
+    if (!cur) return -LINUX_EINVAL;
+    if (linux_futex_wait_enqueue(group_id, uaddr, cur->tid, deadline) != 0)
+        return -LINUX_ENOMEM;
+
+    proc_capture_entry_regs(&cur->park_ctx);
+    cur->park_req     = 0;
+    cur->park_syscall = SYS_LINUX_FUTEX_RESUME;
+    cur->state        = PROC_BLOCKED;
+
+    next = pick_next_runnable();
+    if (!next) {
+        /* The same posture cap_wait_chan takes: a lone runnable thread has
+         * nobody to switch to, so it cannot block. The waiter is withdrawn
+         * and told EAGAIN rather than left in the table forever. */
+        linux_futex_wait_cancel(cur->tid);
+        cur->park_syscall = 0;
+        cur->state        = PROC_RUNNING;
+        kernel_serial_printf(
+            "[E7] futex wait: TID %u group %u is the only runnable task — "
+            "EAGAIN\n",
+            cur->tid, group_id);
+        return -LINUX_EAGAIN;
+    }
+
+    /* TG-2d: the gate's deterministic capture point for a thread group. The
+     * marker is printed only when EVERY live member is blocked on this same
+     * barrier word — the checkpoint request that follows then captures a
+     * coherent futex stop, not a race with one thread still running. */
+    struct LinuxThreadGroup* fg = linux_group_find(group_id);
+    if (fg && !fg->barrier_reported) {
+        uint32_t live = linux_group_futex_barrier_complete(fg, uaddr);
+        if (live >= 2) {
+            struct ProcessDescriptor* leader = 0;
+            for (int i = 0; i < PROC_MAX; i++) {
+                if (proc_table[i].active &&
+                    proc_table[i].pid == fg->leader_pid) {
+                    leader = &proc_table[i];
+                    break;
+                }
+            }
+            if (leader && leader->gate_profile) {
+                fg->barrier_reported = 1;
+                kernel_serial_printf(
+                    "[E7-GATE] group barrier: group=%u threads=%u "
+                    "uaddr=0x%lx all futex waiters\n",
+                    fg->group_id, live, (unsigned long)uaddr);
+            }
+        }
+    }
+
+    kernel_serial_printf(
+        "[E7] futex wait: TID %u group %u uaddr=0x%lx deadline=%lu parked\n",
+        cur->tid, group_id, (unsigned long)uaddr,
+        (unsigned long)deadline);
+    kernel_switch_next(next);   /* noreturn */
+    return -LINUX_EAGAIN;       /* unreachable */
+}
+
+/* ─── E7 TG-1 I4: the per-thread forward lease, the descriptor half ───────
+ * A group has one channel pair, so only one forward may be in flight. A
+ * sibling that finds the lease held records its slot and parks WITHOUT
+ * posting: no request was described for it yet, nothing is owed, and no
+ * sidecar state names it. When the owner's reply is applied (or its forward
+ * is refused, or it exits), the release hands the lease to the lowest valid
+ * waiter and resumes it with a RESTART frame: rax = its Linux syscall number
+ * and rip = the `syscall` instruction (rip -= 2). Ring 3 reissues the trap,
+ * the first trap runs again with the same registers, and this time it owns
+ * the lease. That is Linux's own syscall-restart shape, not a kernel
+ * continuation, so no abandoned C frame is ever resumed. */
+int linux_forward_lease_wait(struct ProcessDescriptor* cur, uint32_t num) {
+    struct LinuxThreadGroup* g = linux_group_of(cur);
+    struct ProcessDescriptor* next;
+    uint32_t slot;
+
+    if (!cur || !g) return -LINUX_EINVAL;
+    slot = (uint32_t)(cur - proc_table);
+    if (linux_group_fwd_wait(g, slot) != 0) return -LINUX_EAGAIN;
+
+    proc_capture_entry_regs(&cur->park_ctx);
+    cur->park_req     = num;
+    cur->park_syscall = SYS_LINUX_LEASE_RESUME;
+    cur->state        = PROC_BLOCKED;
+
+    next = pick_next_runnable();
+    if (!next) {
+        linux_group_fwd_cancel_wait(g, slot);
+        cur->park_syscall = 0;
+        cur->state        = PROC_RUNNING;
+        return -LINUX_EAGAIN;
+    }
+    kernel_serial_printf(
+        "[E7] forward lease: TID %u group %u waits (owner %u, syscall %u)\n",
+        cur->tid, g->group_id, g->fwd_owner_tid, num);
+    kernel_switch_next(next);   /* noreturn */
+    return -LINUX_EAGAIN;       /* unreachable */
+}
+
+/* Resume a granted waiter at its `syscall` instruction, or answer EAGAIN when
+ * the two bytes below the return RIP are not a syscall (a caller shape this
+ * kernel will not rewind). */
+static void linux_forward_lease_restart(struct ProcessDescriptor* pd) {
+    uint64_t num = pd->park_req;
+    uint64_t rip = pd->park_ctx.rcx;
+    uint8_t  op[2];
+
+    pd->park_syscall = 0;
+    pd->park_req     = 0;
+    if (rip >= 2 &&
+        linux_user_copy_out(op, pd->cr3, rip - 2, 2) == 0 &&
+        op[0] == 0x0F && op[1] == 0x05) {
+        linux_park_return_frame(pd, num, rip - 2);
+    } else {
+        kernel_serial_printf(
+            "[E7] forward lease: TID %u grant cannot restart at 0x%llx (not "
+            "a syscall) — EAGAIN\n",
+            pd->tid, (unsigned long long)rip);
+        linux_park_return_frame(pd,
+                                (uint64_t)(int64_t)(-LINUX_EAGAIN), rip);
+    }
+    pd->state = PROC_SUSPENDED;
+}
+
+/* The owner is done: clear the lease, then walk the wait list until a slot
+ * names a live lease-parked descriptor. A waiter killed before its turn was
+ * already cancelled; this skip covers the slot reused between cancellation
+ * and the walk, so the lease can never be parked on a descriptor that has no
+ * restart state. */
+void linux_forward_lease_release(struct ProcessDescriptor* cur) {
+    struct LinuxThreadGroup* g = linux_group_of(cur);
+
+    if (!cur || !g) return;
+    if (linux_group_fwd_release(g, cur->tid) != 0) return;
+    for (;;) {
+        uint32_t slot = linux_group_fwd_next_waiter(g);
+        struct ProcessDescriptor* pd;
+        if (slot >= PROC_MAX) return;
+        pd = &proc_table[slot];
+        if (!pd->active || pd->state != PROC_BLOCKED ||
+            pd->park_syscall != SYS_LINUX_LEASE_RESUME)
+            continue;
+        if (linux_group_fwd_grant(g, pd->tid) != 0) return;
+        kernel_serial_printf(
+            "[E7] forward lease: group %u granted to TID %u\n",
+            g->group_id, pd->tid);
+        linux_forward_lease_restart(pd);
+        return;
+    }
+}
+
+/* The timer ISR's deadline hook (called beside cap_park_deadline_tick, on the
+ * same BSP, before schedule_ring3). Expired waiters are resumed ETIMEDOUT;
+ * this is a pure state flip plus the frame rebuild above, no lock. */
+void linux_futex_deadline_tick(void) {
+    uint32_t tids[LINUX_FUTEX_WAITERS];
+    int n = linux_futex_expire(kernel_tick_counter, tids, LINUX_FUTEX_WAITERS);
+
+    for (int i = 0; i < n; i++) {
+        if (linux_futex_resume_thread(tids[i], -LINUX_ETIMEDOUT))
+            kernel_serial_printf(
+                "[E7] futex timeout: TID %u resumed with -ETIMEDOUT\n",
+                tids[i]);
+        else
+            kernel_serial_printf(
+                "[E7] futex timeout: TID %u has no parked descriptor\n",
+                tids[i]);
+    }
 }
 
 /* Strong override of cap.c's weak hook: the Phase-5 wait-aware park — a
@@ -2304,6 +3230,180 @@ void cap_sysret_resume(struct ProcessDescriptor* pd) {
     __builtin_unreachable();
 }
 
+/* ─── E7 increment 28 (P1-C's wire-up): the delivery's return half ────────
+ * A handler's entry is not a return value: the task must appear back in
+ * ring 3 AT THE HANDLER, with rsp pointing at the frame the builder wrote
+ * and rdi holding the signo. The return path rebuilds its frame from
+ * park_ctx (cap_recv_resume's own asm and cap_sysret_resume's), so
+ * installing the entry context there IS the jump — and this function is
+ * cap_sysret_resume's push-and-sysret with two differences that matter:
+ *
+ *   no swapgs — we are already in the kernel view (this runs inside
+ *   do_syscall, called from the resume's asm), so repeating the entry
+ *   path's swap would put GS_BASE back at 0 with a kernel view live;
+ *
+ *   no do_syscall — the syscall has been ANSWERED (the reply's delivery),
+ *   and re-running it would forward tkill a second time.
+ *
+ * The push order and the [gs:0x50..0x80) re-stamp are copied verbatim from
+ * cap_sysret_resume, which is the code the boots have already validated;
+ * a different order here is the mirror-bug that once sysret'd to the
+ * user's stack (process.c's own history, above). */
+__attribute__((noreturn))
+void cap_resume_linux_sig(struct ProcessDescriptor* pd) {
+    uint64_t* p   = (uint64_t*)&pd->park_ctx;
+    uint64_t  top = pd->syscall_stack_top;
+
+    /* .syscall_return does `mov rsp,[gs:0]` — the user RSP is the FRAME's,
+     * as installed below, not the syscall's. */
+    per_cpu_data[0].user_rsp = p[8];
+
+    __asm__ volatile(
+        "mov %0, %%rsp\n\t"
+        "pushq 56(%1)\n\t"   /* rbp */
+        "pushq 48(%1)\n\t"   /* rbx */
+        "pushq 40(%1)\n\t"   /* r12 */
+        "pushq 32(%1)\n\t"   /* r13 */
+        "pushq 24(%1)\n\t"   /* r14 */
+        "pushq 16(%1)\n\t"   /* r15 */
+        "pushq 8(%1)\n\t"    /* rcx — the HANDLER's address (sysret target) */
+        "pushq 0(%1)\n\t"    /* r11 — user RFLAGS */
+        "movq 72(%1), %%rax\n\t"
+        "movq %%rax, %%gs:0x50\n\t"   /* rdi = signo */
+        "movq 80(%1), %%rax\n\t"
+        "movq %%rax, %%gs:0x58\n\t"   /* rsi = &siginfo (SA_SIGINFO) */
+        "movq 88(%1), %%rax\n\t"
+        "movq %%rax, %%gs:0x60\n\t"   /* rdx = &ucontext (SA_SIGINFO) */
+        "movq 96(%1), %%rax\n\t"
+        "movq %%rax, %%gs:0x68\n\t"   /* r10 */
+        "movq 104(%1), %%rax\n\t"
+        "movq %%rax, %%gs:0x70\n\t"   /* r8 */
+        "movq 112(%1), %%rax\n\t"
+        "movq %%rax, %%gs:0x78\n\t"   /* r9 */
+        /* E7 increment 29: RAX comes from the context too — 0 for a fresh
+         * delivery (nothing was returned), the interrupted value for an
+         * rt_sigreturn (the returning syscall owes its caller that value). */
+        "movq 120(%1), %%rax\n\t"
+        "jmp syscall_return_path\n\t"
+        :
+        : "r"(top), "r"(p)
+        : "rax", "memory");
+    __builtin_unreachable();
+}
+
+/* The reply arm: the sidecar said "run this handler" and chan.c's
+ * LINUX_STAGE_SIGFRAME branch handed the 80 bytes here. Everything is a
+ * refusal until the frame is on the user's stack: a request that does not
+ * parse, a park context that cannot be read, a builder refusal (-EINVAL),
+ * a stack ring 3 could not write (-EFAULT) — each returns normally with
+ * the task's memory untouched and the park still intact, so the caller
+ * answers the syscall with an errno rather than jumping into a handler
+ * that was never installed. On success this function does not return. */
+int linux_sig_reply_apply(struct ProcessDescriptor* pd, const uint8_t* pay,
+                          uint32_t n) {
+    struct LinuxSigDeliverReq req;
+    struct LinuxSigRegs ctx, entry;
+    uint64_t mask = 0;
+    uint64_t* w;
+    int r;
+
+    if (!pd || !pay) return -LINUX_EINVAL;
+    r = linux_sig_deliver_req_parse(pay, n, &req);
+    if (r != 0) return r;
+
+    w = (uint64_t*)(void*)&pd->park_ctx;
+    r = linux_sig_park_read(w, LINUX_PARK_WORDS, &ctx);
+    if (r != 0) return r;
+
+    /* cr2: the fault address a SIGSEGV names. 0 until the page-fault path
+     * records it (named gap, §10.18) — a software-sent signal carries its
+     * addr in the request and never reads this. */
+    r = linux_sig_deliver(pd->cr3, &req, &ctx, pd->linux_cr2, &entry, &mask);
+    if (r != 0) return r;
+
+    r = linux_sig_park_install(w, LINUX_PARK_WORDS, &entry);
+    if (r != 0) return r;
+    pd->linux_sig_mask   = mask;
+    pd->linux_sig_active = 1;
+    /* E7 increment 32: the frame's address, recorded rather than inferred.
+     * linux_sig_park_install() above put the same value in park_ctx[8] (the
+     * asm's own rsp), so the tkill return reads the identical address — but
+     * only this field exists for a frame the park never saw. */
+    pd->linux_sig_frame_rsp = entry.r[LINUX_SIGREG_RSP];
+    pd->linux_sig_fault_active = 0;   /* the sidecar entered this one */
+
+    kernel_serial_printf(
+        "[E7] sig %u (code %u) -> handler %lx, frame %lx, mask %lx\n",
+        (unsigned)req.signo, (unsigned)req.code,
+        (unsigned long)entry.r[LINUX_SIGREG_RIP],
+        (unsigned long)entry.r[LINUX_SIGREG_RSP],
+        (unsigned long)mask);
+    cap_resume_linux_sig(pd);
+}
+
+/* ─── E7 increment 29: the return trip (rt_sigreturn) ────────────────────
+ * The handler's last instruction is its restorer's `mov $15, %eax; syscall`.
+ * The number is classified (tools/linux_rt_sigreturn_census.txt measured a
+ * handler returning) and forwarded like the rest of the sig class — the
+ * sidecar owns the mask and restores its own copy — but the FRAME is not
+ * the sidecar's to read: only this kernel can walk the task's page tables,
+ * and the frame address is whatever rsp the handler was entered with
+ * (park_ctx.user_rsp, set by the delivery). So this arm runs after the
+ * reply: read 440 bytes through the validated copy, restore the registers
+ * and the PRE-handler mask out of uc_sigmask, install them, and resume into
+ * the interrupted context — which is, from ring 3's side, exactly the
+ * handler having returned. */
+int linux_sig_return_apply(struct ProcessDescriptor* pd) {
+    uint8_t frame[LINUX_SIGFRAME_SIZE];
+    struct LinuxSigRegs regs;
+    uint64_t mask = 0;
+    uint64_t* w;
+    int r;
+
+    if (!pd) return -LINUX_EINVAL;
+    if (!pd->linux_sig_active) return -LINUX_EINVAL;   /* no frame was built:
+                                                        * Linux's own answer
+                                                        * here is a fault, but
+                                                        * an errno is the
+                                                        * honest one for a
+                                                        * shim that never
+                                                        * pushes a frame it
+                                                        * cannot account for */
+
+    /* The frame sits at the rsp the handler was entered with. The copy is
+     * the read direction of the same two-phase walker the write used: a
+     * frame the task unmapped or made read-only refuses -EFAULT, never a
+     * ring-0 fault. */
+    r = linux_user_copy_out(frame, pd->cr3, pd->linux_sig_frame_rsp,
+                            LINUX_SIGFRAME_SIZE);
+    if (r != 0) return r;
+
+    r = linux_sig_frame_restore(frame, LINUX_SIGFRAME_SIZE, &regs, &mask);
+    if (r != 0) return r;      /* cs != 0x33 or a short frame: a forged or
+                                * clobbered frame is refused by name */
+
+    w = (uint64_t*)(void*)&pd->park_ctx;
+    r = linux_sig_park_install(w, LINUX_PARK_WORDS, &regs);
+    if (r != 0) return r;
+
+    pd->linux_sig_mask   = mask;   /* the pre-handler mask, from uc_sigmask */
+    pd->linux_sig_active = 0;
+    /* E7 increment 32: the return obligation is discharged, whichever
+     * delivery created it — a stale frame_rsp or fault flag on a task that
+     * is no longer in a handler would let the NEXT 15 restore a frame that
+     * is already behind it. */
+    pd->linux_sig_frame_rsp    = 0;
+    pd->linux_sig_fault_active = 0;
+
+    kernel_serial_printf(
+        "[E7] rt_sigreturn: restored rip %lx rsp %lx rax %lx mask %lx\n",
+        (unsigned long)regs.r[LINUX_SIGREG_RIP],
+        (unsigned long)regs.r[LINUX_SIGREG_RSP],
+        (unsigned long)regs.r[LINUX_SIGREG_RAX],
+        (unsigned long)mask);
+    cap_resume_linux_sig(pd);
+}
+
 /* SYS_SLS_YIELD (300): voluntarily give up the CPU. The entry frame stays
  * on this process's syscall stack; we mark it resume_sysret and switch to
  * the next runnable process. On its next schedule it resumes at
@@ -2459,6 +3559,30 @@ void process_kill(uint32_t pid) {
     for (int i = 0; i < PROC_MAX; i++) {
         if (!proc_table[i].active || proc_table[i].pid != pid) continue;
         kernel_serial_printf("[PROC] PID %u terminated.\n", pid);
+        /* E7 TG-1 I2: a Linux member's kill is a GROUP kill. If a member is
+         * running, defer every member so the scheduler sweep releases them
+         * with a saved context and the last one destroys the group once. */
+        {
+            struct LinuxThreadGroup* lg = linux_group_of(&proc_table[i]);
+            if (lg) {
+                if (proc_table[i].state == PROC_RUNNING) {
+                    for (int j = 0; j < PROC_MAX; j++) {
+                        if (proc_table[j].active &&
+                            linux_group_of(&proc_table[j]) == lg)
+                            proc_table[j].pending_teardown = 1;
+                    }
+                    kernel_serial_printf(
+                        "[PROC] group %u kill deferred (member %u running) — "
+                        "teardown at next schedule\n", lg->group_id, pid);
+                    return;
+                }
+                kernel_serial_printf(
+                    "[PROC] group %u terminated (member %u)\n",
+                    lg->group_id, pid);
+                linux_group_release_all(lg);
+                return;
+            }
+        }
         if (proc_table[i].state == PROC_RUNNING) {
             /* Self-kill (SYS_SLS_PROC_KILL with one's own pid) or any
              * hypothetical cross-CPU kill: the target is executing RIGHT
@@ -2495,9 +3619,17 @@ void process_kill(uint32_t pid) {
          * reused slot never inherits the killed process's stale
          * resume_sysret/park_ctx (caught live — see proc_clear_resume_state). */
         proc_clear_resume_state(&proc_table[i]);
-        cap_table_teardown(proc_table[i].pid);
-        user_destroy_page_table(proc_table[i].cr3);
+        {
+            struct LinuxThreadGroup* lg = linux_group_of(&proc_table[i]);
+            if (lg) {
+                linux_group_destroy(lg);
+            } else if (proc_table[i].personality != PROC_PERSONALITY_LINUX) {
+                cap_table_teardown(proc_table[i].pid);
+                user_destroy_page_table(proc_table[i].cr3);
+            }
+        }
         proc_free_syscall_stack(&proc_table[i]);
+        linux_group_clear_identity(&proc_table[i]);
         proc_table[i].active = 0;
         proc_count--;
         return;

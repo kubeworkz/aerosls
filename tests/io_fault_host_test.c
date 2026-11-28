@@ -30,6 +30,12 @@
  * which is exactly what happened above. The control exists to make the smoke
  * meaningful; the eight unchecked call sites in persist.c, rowstore.c,
  * vecstore.c and qemu_sls_tcache.c are what it is for.
+ *
+ * Build and run:
+ *   gcc -Wall -Wextra -std=c11 -D_GNU_SOURCE -I tests -I kernel -I . \
+ *       -o /tmp/io_fault_host_test \
+ *       tests/io_fault_host_test.c tests/fake_nvme.c kernel/tls_store.c
+ *   /tmp/io_fault_host_test
  */
 
 #include <stdio.h>

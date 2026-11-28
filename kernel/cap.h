@@ -200,6 +200,13 @@
 #define CAP_ERANGE      (-9)
 #define CAP_ENOSYS      (-10)
 #define CAP_ECONFLICT   (-11)
+#define CAP_EINTR       (-33)   /* a parked forward was interrupted by a
+                                 * signal whose handler runs without
+                                 * SA_RESTART (E7 increment 27): the one
+                                 * code whose whole meaning is "retry me".
+                                 * -33, not -21: M1's network family took
+                                 * -21..-32 above, and the sidecar's E_INTR
+                                 * is the same number on the wire. */
 #define CAP_EPERM       (-12)   /* caller lacks authority for the operation
                                  * (e.g. a non-sidecar process calling
                                  * SYS_SLS_CREATE_SIDECAR — POSIX-Environments E2) */
@@ -1062,6 +1069,22 @@ struct SidecarManifest {
  * image's tenants stay byte-identical. */
 #define SIDECAR_MANIFEST_FLAG_GATE 0x0002u
 #define SIDECAR_BIB_FLAG_GATE      0x4u
+
+/* POSIX-Environments E3: the E3 profile. The E3 init sets this manifest
+ * bit on its system POSIX manifest when it was built with e3_envs, and the
+ * create copies it into the BIB (BOOT_INFO_FLAG_E3_PROFILE,
+ * user/proto/src/bootinfo.rs). It is a profile selector, not a grant: the
+ * system sidecar uses it to skip the E7 census workload (native probes and
+ * the first-user measurement) on an image whose boot already carries
+ * tenant environments, so that work cannot compete with tenant boot for
+ * the drop-proof wire. The plain E7 image never sets it, so its census
+ * still runs. */
+#define SIDECAR_MANIFEST_FLAG_E3_PROFILE 0x0004u
+/* The live Go gate's fixed arena (user/proto FLAG_GO_ARENA): a Linux ELF
+ * child's stack sits just below 0xc000000000 and its heap starts there,
+ * matching Go 1.25.1's first arena hint. No authority; a layout selector. */
+#define SIDECAR_MANIFEST_FLAG_GO_ARENA 0x0008u
+#define SIDECAR_BIB_FLAG_E3_PROFILE      0x8u
 
 /* E6: the sidecar's OWN identity, the third thing a sidecar cannot otherwise
  * observe. Until now a sidecar could not learn what the kernel called it: the

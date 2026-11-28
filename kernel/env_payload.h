@@ -56,8 +56,9 @@ struct EnvCkptRecord;
  *      process's own page-table frames.
  *   3. Only image/stack-window and private-region pages are captured at
  *      all — plus, for a Linux task, the pages inside its OWN image span
- *      (`linux_image_lo..hi`, a linked ET_EXEC's segments) and its budget
- *      span (`linux_heap_base..limit`, where brk and anonymous maps land).
+ *      (`linux_group_image_lo..hi`, a linked ET_EXEC's segments) and its
+ *      group's budget span (`linux_group_heap_base..limit`, where brk and
+ *      anonymous maps land).
  *      Shared-arena and lazily-granted frames belong to their owners and
  *      are restored fresh by them; capturing them here would both miss
  *      their restore path and risk writing another tenant's memory.
@@ -91,8 +92,9 @@ struct EnvCkptRecord;
  * refused as identity in env_ckpt.h); it does not snapshot anything outside
  * the environment's own tasks (the two sidecars and, E7 increment 20, their
  * Linux tenant — no kernel state, that is checkpoint_mgr's sixteen regions);
- * it does not carry a parked Linux task's queued request (B9: the gate's
- * restorable form is USER); and it does not claim cross-node restore (P3).
+ * it does not carry a Linux task's queued forward request (B9: the
+ * restorable forms are USER, ENTRY and a FORM_FUTEX wait with no request in
+ * flight); and it does not claim cross-node restore (P3).
  */
 
 /* Directory + blob format. Bumped by the WRITER whenever the layout
@@ -102,8 +104,25 @@ struct EnvCkptRecord;
  * (12 -> 16 bytes per entry, EP_PAGE_PERM_* below) and EnvPayloadTask
  * carries the Linux task's full context, fs_base, cursors and page range.
  * A v1 blob is refused, not misread: the reader's layout walk would place
- * every page entry 4 bytes early and pour the wrong frame's bytes. */
-#define ENV_PAYLOAD_REC_VERSION 2u
+ * every page entry 4 bytes early and pour the wrong frame's bytes.
+ *
+ * v3 (E7 §10.15): the permission word gains EP_PAGE_PERM_SOFT for a
+ * PRESENT, supervisor-only soft-protected leaf. The page entry stays 16
+ * bytes.
+ *
+ * v4 (TG-2b): EnvPayloadTask gains the group id, thread index and leader
+ * flag, and every group thread gets its own task entry/context. Only the
+ * leader carries the group's image/heap cursors and owns its shared page
+ * block; siblings carry no duplicate shared pages. The task stride changed
+ * (408 -> 416 bytes), so a v3 blob is REFUSED, not misread: walking it with
+ * this struct would read each task and page block 8 bytes late.
+ *
+ * v5 (TG-2c): EnvPayloadTask gains the futex barrier's key and remaining
+ * timeout at the end (416 -> 432 bytes). FORM_FUTEX is a wait, not a
+ * runnable context, so an older blob cannot be given its semantics by
+ * accident; v4 is refused by the same task-stride rule. */
+#define ENV_PAYLOAD_REC_VERSION      5u
+#define ENV_PAYLOAD_REC_VERSION_PREV 4u   /* the last non-futex layout: refused by name */
 #define ENV_PAYLOAD_DIR_MAGIC   0x534C53504C4F4131ULL  /* "SLSPLOA1" */
 #define ENV_PAYLOAD_BLOB_MAGIC  0x534C5350424C4F31ULL  /* "SLSPBLO1" */
 
@@ -146,6 +165,17 @@ struct EnvCkptRecord;
                                        * the workload's own fourth 64 KiB read
                                        * (src_off=196608), instead of hoping a
                                        * pause lands between a reply and a trap. */
+#define ENV_PAYLOAD_FORM_FUTEX   4u   /* TG-2c: the task is BLOCKED in
+                                       * FUTEX_WAIT with the word already read and
+                                       * compared. The payload carries the wait
+                                       * key, expected word, remaining timeout and
+                                       * the entry park frame. Restore re-enqueues
+                                       * every such task before the group is
+                                       * released; a FUTEX form is never resumed
+                                       * as a runnable context. A group's members
+                                       * must all name the same barrier key, or the
+                                       * restore refuses the whole group by name
+                                       * (EP_REFUSE_BARRIER). */
 
 /* Per-page permission bits (the page index's fourth word). Decoded from the
  * LIVE PTE at capture (pt_perm_from_pte in env_payload.c), so the blob says
@@ -155,8 +185,9 @@ struct EnvCkptRecord;
  * reserved. */
 #define EP_PAGE_PERM_WRITE 0x1u   /* PTE.W — writable */
 #define EP_PAGE_PERM_EXEC  0x2u   /* !PTE.NX — executable */
-#define EP_PAGE_PERM_USER  0x4u   /* PTE.U — user-accessible (always set here) */
-#define EP_PAGE_PERM_MASK  0x7u
+#define EP_PAGE_PERM_USER  0x4u   /* PTE.U — user-accessible */
+#define EP_PAGE_PERM_SOFT  0x8u   /* PTE bit 9 — PRESENT, U=0, soft PROT_NONE */
+#define EP_PAGE_PERM_MASK  0xfu
 #define EP_PAGE_ENTRY_BYTES 16u   /* { vaddr u64, crc u32, perm u32 } */
 
 /* Refusal reasons. A code plus operands, the same contract env_ckpt.h
@@ -178,6 +209,9 @@ struct EnvCkptRecord;
 #define EP_REFUSE_PERM       13  /* a=task index, b=page index; the live PTE's permissions are not the captured ones */
 #define EP_REFUSE_FORM       14  /* a=task index, b=form; a Linux task whose captured form this blob cannot resume (parked/queued) */
 #define EP_REFUSE_SHAPE      15  /* a=task index; a captured task's kind is not what its slot claims (Linux vs sidecar) */
+#define EP_REFUSE_GROUP      16  /* a=task index, b=group id; group id/index/leader fields are incoherent */
+#define EP_REFUSE_DUP        17  /* a=first page, b=duplicate page; same vaddr+root with different bytes or permissions */
+#define EP_REFUSE_BARRIER    18  /* a=task index, b=rule; a futex-barrier group is mixed, keyed differently, has no wait room, or its live word changed */
 
 struct EnvPayloadRefusal {
     uint32_t code;
@@ -267,6 +301,25 @@ struct EnvPayloadTask {
     uint64_t stack_top;
     uint64_t image_lo;      /* the linked ET_EXEC image's page span */
     uint64_t image_hi;
+    /* ── TG-2b: group identity. Zero for every sidecar and for a legacy
+     * ungrouped Linux task. A group's leader is index 0; siblings are
+     * 1..ENV_CKPT_MAX_THREADS-1. A sibling carries only its per-thread
+     * registers, fs_base and optional private stack; `brk_cur`, `mmap_top`,
+     * `heap_base`, `heap_limit`, `image_lo` and `image_hi` are zero there
+     * because those spans belong to the leader and are captured once. */
+    uint32_t group_id;
+    uint16_t thread_index;
+    uint8_t  leader;
+    uint8_t  _group_pad;
+    /* ── TG-2c: FORM_FUTEX only. Zero for every other form. `futex_ticks`
+     * is the remaining timeout at capture (0 = forever), never the
+     * boot-local absolute deadline the waiter table holds. `futex_val` is
+     * the word the waiter compared against before it parked; every member
+     * of a barrier must carry the same value, and restore refuses a group
+     * whose keys disagree before it pours. */
+    uint64_t futex_uaddr;
+    uint32_t futex_val;
+    uint32_t futex_ticks;
 };
 
 /* ─── Public API ────────────────────────────────────────────────────────────*/

@@ -58,7 +58,8 @@
  *       tests/env_catalog_host_test.c kernel/cap.c \
  *       kernel/env_catalog.c kernel/kernel_io.c kernel/console.c \
  *       kernel/linux_abi.c kernel/elf64_load.c kernel/entropy.c \
- *       kernel/sha256.c kernel/sql_parser.c kernel/predicate.c
+ *       kernel/sha256.c kernel/sql_parser.c kernel/predicate.c \
+ *           tests/e7_group_stubs.c
  *   /tmp/env_catalog_host_test
  */
 #include "kernel/cap.h"

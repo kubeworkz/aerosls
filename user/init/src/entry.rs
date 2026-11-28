@@ -20,6 +20,7 @@ use crate::heap::Bump;
 use crate::posix_manifest;
 use crate::ramdisk_manifest;
 use crate::net_manifest;
+use crate::serial::serial_log;
 use aerosls_proto::bootinfo::BootInfo;
 use aerosls_proto::kabi::{Kernel, RealKernel, SendCap, CAP_CHAN, CAP_CHAN_W, CAP_MEM, CAP_NONE};
 
@@ -160,6 +161,21 @@ macro_rules! log_fmt {
         let mut w = StackBuf::<256>::new();
         let _ = core::write!(&mut w, $fmt $(, $arg)*);
         log($console, w.as_str());
+    }};
+}
+
+/* `serial_log` (SYS_SLS_SERIAL_WRITE, 165) is imported from `crate::serial`,
+ * the one module that carries that asm for both builds. E3's storage evidence
+ * rides it because the console channel coalesces sidecar messages and can drop
+ * a line entirely, while the kernel's serial TX lock (with loopback deferral)
+ * is the drop-proof one — the same path the tenants' own `[POSIX] aero state=`
+ * lines use. */
+macro_rules! serial_log_fmt {
+    ($fmt:literal $(, $arg:expr)* $(,)?) => {{
+        use core::fmt::Write as _;
+        let mut w = StackBuf::<256>::new();
+        let _ = core::write!(&mut w, $fmt $(, $arg)*);
+        $crate::serial::serial_log(w.as_str());
     }};
 }
 
@@ -780,6 +796,14 @@ fn spawn_e3_tenant_envs(
             "[INIT] E3 env {}: {} storage @ 0x{:x}, {} heap @ 0x{:x}",
             i, rd_name, rd_storage, px_name, px_heap
         );
+        // The same fact on the drop-proof serial path. The console copy
+        // above is for a human reading the boot; tests/e3_multi_env_boot_check.sh
+        // parses THIS line, because console coalescing can drop the copy
+        // while the tenants themselves are healthy.
+        serial_log_fmt!(
+            "[E3-ENV] env {}: {} storage @ 0x{:x}, {} heap @ 0x{:x}\n",
+            i, rd_name, rd_storage, px_name, px_heap
+        );
 
         // Tenant ramdisk: its own name + private R|W storage (0x3).
         let rd_manifest = ramdisk_manifest::build_ramdisk_manifest_named(
@@ -824,6 +848,10 @@ fn spawn_e3_tenant_envs(
         }
     }
     log(console, "[INIT] E3: tenant environments spawned.");
+    // The console copy above is for a human reading the boot; the check reads
+    // THIS one, because the console path can drop the copy while every tenant
+    // spawned. Same drop-proof serial path as the [E3-ENV] storage lines.
+    serial_log("[E3-ENV] done: tenant environments spawned.\n");
 }
 
 /// Spawn the network driver through the real kernel path (`SYS_SLS_CREATE_SIDECAR`).

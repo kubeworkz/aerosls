@@ -15,7 +15,8 @@
  * Build and run:
  *   gcc -std=c11 -Wall -Wextra -I . -I kernel \
  *       -o /tmp/boot_image_host_test \
- *       tests/boot_image_host_test.c kernel/boot_image.c
+ *       tests/boot_image_host_test.c kernel/boot_image.c \
+ *           tests/e7_group_stubs.c
  *   /tmp/boot_image_host_test
  */
 #include "kernel/boot_image.h"

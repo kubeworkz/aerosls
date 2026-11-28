@@ -38,8 +38,10 @@
 #include "env_console.h"
 #include "persist.h"
 #include "process.h"
+#include "linux_thread.h"
 #include "cap.h"            /* CAP_NONE, SYS_SLS_CAP_RECV, SYS_SLS_CHAN_WAIT */
 #include "linux_abi.h"      /* E7 increment 20: SYS_LINUX_TRAP_RESUME, the park the Linux form reads */
+#include "linux_futex.h"     /* TG-2c: the futex waiter table and its resume sentinel */
 #include "../drivers/nvme_io.h"
 #include "kernel_io.h"
 #include "timer.h"          /* kernel_tick_counter */
@@ -69,14 +71,17 @@ __attribute__((weak)) int env_replica_push(const struct EnvCkptRecord* rec) {
 #define EP_MAX_PAGES     2048u
 /* The index zone's frame ceiling. Six frames was the sidecar-only shape;
  * E7 increment 20's live gate capture measured 31,012 index bytes — three
- * tasks (the Linux tenant's EnvPayloadTask is 408 bytes), ~1,845 page
- * entries at 16 bytes and the console — so six frames refused an
- * environment that fits the band. Sixteen frames keeps the ceiling above
+ * tasks (the Linux tenant's EnvPayloadTask is 432 bytes in TG-2c's v5),
+ * ~1,845 page entries at 16 bytes and the console — so six frames refused
+ * an environment that fits the band. Sixteen frames keeps the ceiling above
  * the slot's own limit: a 16-frame index leaves 2,031 data pages in an
  * 8 MiB slot, and the slot check below refuses a larger capture by name
  * before the index can grow past this buffer. */
 #define EP_STAGE_BYTES   (4096u * 16u)
-#define EP_MAX_TASKS     4u
+#define EP_MAX_TASKS     ENV_CKPT_MAX_TASKS
+_Static_assert(sizeof(struct EnvPayloadTask) == 432u,
+               "EnvPayloadTask is the v5 shape; a layout change must bump "
+               "ENV_PAYLOAD_REC_VERSION");
 /* EP_WAIT_TICKS / EP_WAIT_CEIL_TICKS live in env_payload.h: the wait's two
  * bounds are part of its contract now, and the host test asserts WHICH of the
  * two answered (a stall is a wedged environment, a ceiling is one that never
@@ -190,6 +195,9 @@ void env_payload_refusal_text(const struct EnvPayloadRefusal* r,
     case EP_REFUSE_PERM:       t = "a captured page's live permissions are not the captured ones"; break;
     case EP_REFUSE_FORM:       t = "the Linux task was captured parked (queued state this blob does not carry)"; break;
     case EP_REFUSE_SHAPE:      t = "a captured task's kind does not match the slot it was filed under"; break;
+    case EP_REFUSE_GROUP:      t = "a captured thread group's id, index or leader fields are incoherent"; break;
+    case EP_REFUSE_DUP:        t = "one address maps twice with different captured bytes or permissions"; break;
+    case EP_REFUSE_BARRIER:    t = "the futex group barrier is mixed, keyed differently, full, or its live word changed"; break;
     default:                   t = "unknown payload refusal"; break;
     }
     uint32_t i = 0;
@@ -247,6 +255,13 @@ static union {
 static uint8_t  ep_tnum[EP_MAX_PAGES];              /* capture: task index per page */
 static uint32_t ep_crcs[EP_MAX_PAGES];              /* capture: per-page crc, staged into the index */
 static uint32_t ep_perms[EP_MAX_PAGES];             /* capture: per-page PTE perms (EP_PAGE_PERM_*) */
+/* Restore-side duplicate index: a shared root may not receive one vaddr
+ * twice unless both records describe the same bytes and grant. Kept apart
+ * from ep_scratch because `dest` is filled in the same pass. */
+static uint64_t ep_seen_vaddr[EP_MAX_PAGES];
+static uint64_t ep_seen_cr3[EP_MAX_PAGES];
+static uint32_t ep_seen_crc[EP_MAX_PAGES];
+static uint32_t ep_seen_perm[EP_MAX_PAGES];
 #if E7G_TOOTH
 /* E7 increment 22: the pages a `descriptor` tooth leaves out of the pour.
  * File-static because a restore is one straight-line pass; the tooth's
@@ -285,12 +300,13 @@ static int ep_dir_read(struct EnvPayloadDirHead* h,
     if (nvme_read_sync(PERSIST_ENV_PAYLOAD_HDR_LBA, ep_stage) != 0) return -1;
     ep_copy(h, ep_stage, (uint32_t)sizeof(*h));
     if (h->magic != ENV_PAYLOAD_DIR_MAGIC ||
-        h->version != ENV_PAYLOAD_REC_VERSION ||
         h->rec_size != (uint32_t)sizeof(struct EnvPayloadDirEntry)) {
         /* A directory this build cannot read is an ABSENT payload, never a
          * half-read one. */
         return -1;
     }
+    if (h->version != ENV_PAYLOAD_REC_VERSION)
+        return -2;   /* a recognised directory with an old task stride */
     if (nvme_read_sync(PERSIST_ENV_PAYLOAD_ENT_LBA, ep_stage) != 0) return -1;
     uint32_t n = h->count;
     if (n > ENV_PAYLOAD_MAX) n = ENV_PAYLOAD_MAX;
@@ -353,6 +369,10 @@ static uint32_t ep_perm_of(uint64_t e) {
     if (e & (1ull << 1))  p |= EP_PAGE_PERM_WRITE;
     if (!(e & (1ull << 63))) p |= EP_PAGE_PERM_EXEC;
     if (e & (1ull << 2))  p |= EP_PAGE_PERM_USER;
+    /* E7 §10.15: a present 4 KiB leaf with U=0 and the software bit is a
+     * soft PROT_NONE page. It is neither USER nor WRITE nor EXEC; the
+     * frame is still owned and the capture must carry its bytes. */
+    if (e & (1ull << 9))  p |= EP_PAGE_PERM_SOFT;
     return p;
 }
 
@@ -385,7 +405,8 @@ static int ep_resolve_ex(uint64_t cr3, uint64_t vaddr, uint64_t* out_phys,
         return 1;
     }
     uint64_t* pt = (uint64_t*)(uintptr_t)(pd[i2] & 0x000ffffffffff000ull);
-    if (!(pt[i1] & 1ull) || !(pt[i1] & (1ull << 2))) return 0;
+    if (!(pt[i1] & 1ull)) return 0;
+    if (!(pt[i1] & (1ull << 2)) && !(pt[i1] & (1ull << 9))) return 0;
     *out_phys = (pt[i1] & 0x000ffffffffff000ull) + (vaddr & 0xfffull);
     if (out_perm) *out_perm = ep_perm_of(pt[i1]);
     return 1;
@@ -419,25 +440,43 @@ static int ep_in_image_window(uint64_t vaddr) {
  * duplicates of them) under the child. The child's pages are exactly the
  * three ranges the create itself decided:
  *
- *   - the linked ET_EXEC image's page span (`linux_image_lo..hi`, stamped
- *     from the mapper's own PT_LOAD extent — a static musl image lives at
- *     0x400000, not in the window at all),
+ *   - the linked ET_EXEC image's page span (`linux_group_image_lo..hi`,
+ *     stamped from the mapper's own PT_LOAD extent — a static musl image
+ *     lives at 0x400000, not in the window at all),
  *   - the user stack the create mapped for it (`stack_bottom..top`, the
  *     record's own bounds — the child's, not the parent's),
- *   - the budget span `linux_heap_base..limit`, which holds BOTH brk growth
- *     (up from the base) and anonymous maps (down from the limit).
+ *   - the group's budget span (`linux_group_heap_base..limit`), which holds
+ *     BOTH brk growth (up from the base) and anonymous maps (down from the
+ *     limit).
  *
  * A PROT_NONE guard has no frame, so the walk never sees it: the payload
- * carries the pages that exist, not the ranges that were reserved. */
+ * carries the pages that exist, not the ranges that were reserved.
+ *
+ * TG-2b ownership: the group's image and budget spans are SHARED, so the
+ * leader is their one owner. A sibling's page walk may still see those
+ * mappings through the group root; they are skipped even when the clone's
+ * own stack address happens to fall inside the heap (Go's g0 stacks do).
+ * The sibling owns only a stack range outside the shared spans, which is
+ * zero for this kernel's clone, so its page block is normally empty. */
 static int ep_linux_page(const struct EnvCkptRecord* rec, uint32_t t,
                          const struct ProcessDescriptor* pd, uint64_t vaddr) {
     const struct EnvCkptTask* tk = &rec->tasks[t];
+    if (tk->group_id != 0 && !tk->leader) {
+        if (linux_group_image_lo(pd) && vaddr >= linux_group_image_lo(pd) &&
+            vaddr < linux_group_image_hi(pd)) return 0;
+        if (linux_group_heap_base(pd) &&
+            vaddr >= linux_group_heap_base(pd) &&
+            vaddr < linux_group_heap_limit(pd)) return 0;
+        if (tk->stack_bottom && vaddr >= tk->stack_bottom &&
+            vaddr < tk->stack_top) return 1;
+        return 0;
+    }
     if (tk->stack_bottom && vaddr >= tk->stack_bottom &&
         vaddr < tk->stack_top) return 1;
-    if (pd->linux_image_lo && vaddr >= pd->linux_image_lo &&
-        vaddr < pd->linux_image_hi) return 1;
-    if (pd->linux_heap_base && vaddr >= pd->linux_heap_base &&
-        vaddr < pd->linux_heap_limit) return 1;
+    if (linux_group_image_lo(pd) && vaddr >= linux_group_image_lo(pd) &&
+        vaddr < linux_group_image_hi(pd)) return 1;
+    if (linux_group_heap_base(pd) && vaddr >= linux_group_heap_base(pd) &&
+        vaddr < linux_group_heap_limit(pd)) return 1;
     return 0;
 }
 
@@ -453,6 +492,64 @@ static int ep_proc_parked(const struct ProcessDescriptor* pd) {
            (pd->waiting_chan != CAP_NONE || pd->waiting_nchans > 0);
 }
 
+/* TG-2c: a futex waiter is BLOCKED in FUTEX_WAIT, not parked on a channel.
+ * The resume sentinel is the distinction the descriptor carries; the waiter
+ * table is where the key and deadline live. */
+static int ep_proc_futex_waiting(const struct ProcessDescriptor* pd) {
+    return pd->active && pd->state == PROC_BLOCKED &&
+           pd->park_syscall == SYS_LINUX_FUTEX_RESUME;
+}
+
+static int ep_read_user_u32(uint64_t cr3, uint64_t uaddr, uint32_t* out) {
+    uint64_t phys = 0;
+    if (!out || !cr3 || (uaddr & 3ull) != 0) return 0;
+    if (!ep_resolve_ex(cr3, uaddr, &phys, (uint32_t*)0)) return 0;
+    *out = *(const volatile uint32_t*)(uintptr_t)phys;
+    return 1;
+}
+
+/* Fill one FORM_FUTEX task from the descriptor and the waiter table. The
+ * entry park frame is the same one linux_futex_resume_thread rebuilds from;
+ * the word's value is read through the task's own root, and the relative
+ * timeout is carried because an absolute boot tick means nothing after a
+ * restore. Returns 0 when the descriptor and table disagree, which the
+ * caller records as the named RUNNING refusal rather than inventing a key. */
+static int ep_fill_futex_task(const struct ProcessDescriptor* pd,
+                              struct EnvPayloadTask* tk) {
+    struct LinuxFutexWaitInfo info;
+    uint32_t value = 0;
+    if (!ep_proc_futex_waiting(pd) || !tk) return 0;
+    if (!linux_futex_waiter_info(pd->tid, &info)) return 0;
+    if (info.tid != pd->tid || info.group_id == 0 || info.uaddr == 0)
+        return 0;
+    if (pd->tgid != 0 && info.group_id != pd->tgid) return 0;
+    if (!ep_read_user_u32(pd->cr3, info.uaddr, &value)) return 0;
+
+    tk->form = ENV_PAYLOAD_FORM_FUTEX;
+    tk->futex_uaddr = info.uaddr;
+    tk->futex_val = value;
+    tk->futex_ticks = info.deadline == 0
+                          ? 0
+                          : (info.deadline > kernel_tick_counter
+                                 ? (uint32_t)(info.deadline - kernel_tick_counter)
+                                 : 1u);
+    tk->park[0] = pd->park_ctx.r11;
+    tk->park[1] = pd->park_ctx.rcx;
+    tk->park[2] = pd->park_ctx.r15;
+    tk->park[3] = pd->park_ctx.r14;
+    tk->park[4] = pd->park_ctx.r13;
+    tk->park[5] = pd->park_ctx.r12;
+    tk->park[6] = pd->park_ctx.rbx;
+    tk->park[7] = pd->park_ctx.rbp;
+    tk->park[8] = pd->park_ctx.user_rsp;
+    tk->user_rip = pd->park_ctx.rcx;
+    tk->user_rsp = pd->park_ctx.user_rsp;
+    tk->waiting_nchans = 0;
+    for (uint32_t a = 0; a < 6; a++)
+        tk->linux_args[a] = pd->park_ctx.linux_args[a];
+    return 1;
+}
+
 static struct ProcessDescriptor* ep_find_proc(const char* name) {
     for (int i = 0; i < PROC_MAX; i++) {
         if (!proc_table[i].active) continue;
@@ -463,6 +560,48 @@ static struct ProcessDescriptor* ep_find_proc(const char* name) {
         if (match && *a == '\0' && *b == '\0') return &proc_table[i];
     }
     return 0;
+}
+
+static int ep_name_eq(const char* a, const char* b) {
+    for (uint32_t i = 0; i < ENV_CKPT_NAME_LEN; i++) {
+        if (a[i] != b[i]) return 0;
+        if (a[i] == '\0') return 1;
+    }
+    return 1;
+}
+
+/* A group's members share their name, so the name-only lookup cannot tell
+ * which sibling a record entry names. TG-2b's identity is the stable
+ * (group id, thread index) pair the group layer assigned at clone. */
+static struct ProcessDescriptor* ep_find_group_member(const char* name,
+                                                      uint16_t thread_index,
+                                                      uint8_t leader) {
+    if (!name) return 0;
+    for (int i = 0; i < PROC_MAX; i++) {
+        struct ProcessDescriptor* pd = &proc_table[i];
+        if (!pd->active || !linux_group_of(pd)) continue;
+        if (!ep_name_eq(pd->name, name)) continue;
+        if (pd->thread_index != thread_index) continue;
+        if (pd->is_group_leader != leader) continue;
+        return pd;
+    }
+    return 0;
+}
+
+static struct ProcessDescriptor* ep_find_ckpt_task(
+        const struct EnvCkptTask* tk) {
+    if (tk->kind == ENV_CKPT_TASK_LINUX && tk->group_id != 0)
+        return ep_find_group_member(tk->name, tk->thread_index,
+                                    tk->leader);
+    return ep_find_proc(tk->name);
+}
+
+static struct ProcessDescriptor* ep_find_payload_task(
+        const struct EnvPayloadTask* tk) {
+    if (tk->kind == ENV_CKPT_TASK_LINUX && tk->group_id != 0)
+        return ep_find_group_member(tk->name, tk->thread_index,
+                                    tk->leader);
+    return ep_find_proc(tk->name);
 }
 
 /* ─── The image-window list, shared with the migrate path (P3) ────────────
@@ -594,7 +733,7 @@ uint32_t env_payload_capture_all(void) {
         int missing = 0;
         const char* missing_name = "";
         for (uint32_t t = 0; t < rec->n_tasks && t < ENV_CKPT_MAX_TASKS; t++) {
-            struct ProcessDescriptor* pd = ep_find_proc(rec->tasks[t].name);
+            struct ProcessDescriptor* pd = ep_find_ckpt_task(&rec->tasks[t]);
             if (!pd) { missing = 1; missing_name = rec->tasks[t].name; break; }
             pds[np++] = pd;
         }
@@ -606,6 +745,62 @@ uint32_t env_payload_capture_all(void) {
                 missing ? "named task has no live process" : "no tasks",
                 missing ? missing_name : "");
             continue;
+        }
+
+        uint64_t barrier_page = 0;
+        int barrier_page_required = 0;
+
+        /* TG-2c: a futex stop is a GROUP posture. If any member is waiting,
+         * every member must be waiting on the same (address, expected value)
+         * barrier. Capturing one waiter plus one runnable sibling would be a
+         * half-stopped group whose restore can never release coherently, so
+         * it is skipped by name rather than written as a mixed blob. A group
+         * with no futex waiter is the ordinary FORM_USER/ENTRY path. */
+        {
+            uint32_t group_tasks = 0, futex_tasks = 0;
+            uint64_t barrier_uaddr = 0;
+            uint32_t barrier_val = 0;
+            int barrier_bad = 0;
+            for (uint32_t t = 0; t < np; t++) {
+                if (rec->tasks[t].kind != ENV_CKPT_TASK_LINUX ||
+                    rec->tasks[t].group_id == 0)
+                    continue;
+                group_tasks++;
+                if (!ep_proc_futex_waiting(pds[t])) continue;
+                struct LinuxFutexWaitInfo info;
+                uint32_t val = 0;
+                if (!linux_futex_waiter_info(pds[t]->tid, &info) ||
+                    info.group_id != rec->tasks[t].group_id ||
+                    !ep_read_user_u32(pds[t]->cr3, info.uaddr, &val)) {
+                    barrier_bad = 1;
+                    continue;
+                }
+                if (futex_tasks == 0) {
+                    barrier_uaddr = info.uaddr;
+                    barrier_val = val;
+                } else if (info.uaddr != barrier_uaddr || val != barrier_val) {
+                    barrier_bad = 1;
+                }
+                futex_tasks++;
+            }
+            if (futex_tasks > 0 &&
+                (barrier_bad || futex_tasks != group_tasks)) {
+                kernel_serial_printf(
+                    "[ENV_PAYLOAD] capture skipped for partition=%u index=%u: "
+                    "futex barrier is %s (%u of %u group threads wait on "
+                    "0x%llx value=0x%x)\n",
+                    (unsigned)rec->partition_id, (unsigned)rec->index,
+                    barrier_bad ? "keyed differently or unreadable"
+                                : "not entered by every group thread",
+                    (unsigned)futex_tasks, (unsigned)group_tasks,
+                    (unsigned long long)barrier_uaddr,
+                    (unsigned)barrier_val);
+                continue;
+            }
+            if (futex_tasks > 0) {
+                barrier_page = barrier_uaddr & ~0xfffull;
+                barrier_page_required = 1;
+            }
         }
 
         /* Collect the pages: image/stack window + private regions, per
@@ -650,7 +845,9 @@ uint32_t env_payload_capture_all(void) {
                         }
                         uint64_t* pt = (uint64_t*)(uintptr_t)(pd[i2] & 0x000ffffffffff000ull);
                         for (uint64_t i1 = 0; i1 < 512; i1++) {
-                            if (!(pt[i1] & 1ull) || !(pt[i1] & (1ull << 2))) continue;
+                            if (!(pt[i1] & 1ull)) continue;
+                            if (!(pt[i1] & (1ull << 2)) &&
+                                !(pt[i1] & (1ull << 9))) continue;
                             uint64_t v = vbase2m | (i1 << 12);
                             if (!ep_task_page(rec, t, pds[t], v)) continue;
                             if (n_pages >= EP_MAX_PAGES) { overflow = 1; break; }
@@ -666,11 +863,27 @@ uint32_t env_payload_capture_all(void) {
         if (overflow || n_pages == 0) {
             kernel_serial_printf(
                 "[ENV_PAYLOAD] capture refused for partition=%u index=%u: "
-                "%s (%u pages)\n", (unsigned)rec->partition_id,
+                "%s (%u pages)\n",
+                (unsigned)rec->partition_id,
                 (unsigned)rec->index,
                 overflow ? "more pages than the blob ceiling" : "nothing mapped",
                 (unsigned)n_pages);
             continue;
+        }
+        if (barrier_page_required) {
+            int carried = 0;
+            for (uint32_t pi = 0; pi < n_pages; pi++)
+                if ((ep_scratch.vaddr[pi] & ~0xfffull) == barrier_page)
+                    carried = 1;
+            if (!carried) {
+                kernel_serial_printf(
+                    "[ENV_PAYLOAD] capture skipped for partition=%u index=%u: "
+                    "the futex barrier page 0x%llx is not in the captured "
+                    "page set\n",
+                    (unsigned)rec->partition_id, (unsigned)rec->index,
+                    (unsigned long long)barrier_page);
+                continue;
+            }
         }
 
         /* Console snapshot: the not-yet-drained output, non-destructively. */
@@ -782,6 +995,9 @@ uint32_t env_payload_capture_all(void) {
             ep_memset(&tk, 0, (uint32_t)sizeof(tk));
             ep_copy(tk.name, rec->tasks[t].name, ENV_CKPT_NAME_LEN);
             tk.kind = rec->tasks[t].kind;
+            tk.group_id = rec->tasks[t].group_id;
+            tk.thread_index = rec->tasks[t].thread_index;
+            tk.leader = rec->tasks[t].leader;
             tk.n_pages = task_npages[t];
             const struct ProcessDescriptor* pd = pds[t];
             if (tk.kind == ENV_CKPT_TASK_LINUX) {
@@ -813,6 +1029,13 @@ uint32_t env_payload_capture_all(void) {
                     tk.linux_args[5] = c[6];
                     tk.user_rip = pd->user_rip;
                     tk.user_rsp = pd->user_rsp;
+                } else if (ep_proc_futex_waiting(pd)) {
+                    /* TG-2c: the task is inside FUTEX_WAIT, with its entry
+                     * frame and the waiter table's key. The form is a wait,
+                     * not a resumable user context; restore re-enqueues it
+                     * before the group's release. */
+                    if (!ep_fill_futex_task(pd, &tk))
+                        tk.form = ENV_PAYLOAD_FORM_RUNNING;
                 } else if (ep_proc_parked(pd) &&
                     pd->park_syscall == SYS_LINUX_TRAP_RESUME) {
                     tk.form = ENV_PAYLOAD_FORM_PARKED;
@@ -857,14 +1080,20 @@ uint32_t env_payload_capture_all(void) {
                     tk.form = ENV_PAYLOAD_FORM_RUNNING;
                 }
                 tk.fs_base     = pd->fs_base;
-                tk.brk_cur     = pd->linux_brk_cur;
-                tk.mmap_top    = pd->linux_mmap_top;
-                tk.heap_base   = pd->linux_heap_base;
-                tk.heap_limit  = pd->linux_heap_limit;
                 tk.stack_bottom = rec->tasks[t].stack_bottom;
                 tk.stack_top    = rec->tasks[t].stack_top;
-                tk.image_lo    = pd->linux_image_lo;
-                tk.image_hi    = pd->linux_image_hi;
+                /* TG-2b: the group's image/heap cursors live once, on the
+                 * leader. A sibling's copy would be the same numbers filed
+                 * per-thread, and the restore would apply the last one over
+                 * the group's one set. */
+                if (tk.group_id == 0 || tk.leader) {
+                    tk.brk_cur     = linux_group_brk(pd);
+                    tk.mmap_top    = linux_group_mmap_top(pd);
+                    tk.heap_base   = linux_group_heap_base(pd);
+                    tk.heap_limit  = linux_group_heap_limit(pd);
+                    tk.image_lo    = linux_group_image_lo(pd);
+                    tk.image_hi    = linux_group_image_hi(pd);
+                }
             } else if (ep_proc_parked(pd)) {
                 tk.form = ENV_PAYLOAD_FORM_PARKED;
                 tk.park_syscall = pd->park_syscall;
@@ -884,14 +1113,16 @@ uint32_t env_payload_capture_all(void) {
                 tk.form = ENV_PAYLOAD_FORM_RUNNING;
             }
             kernel_serial_printf(
-                "[ENV_PAYLOAD] capture: task %u '%s' kind=%u form=%u "
-                "park_syscall=%u nchans=%u user_rip=0x%llx user_rsp=0x%llx "
-                "fs_base=0x%llx\n",
-                (unsigned)t, tk.name, (unsigned)tk.kind, (unsigned)tk.form,
+                "[ENV_PAYLOAD] capture: task %u '%s' kind=%u group=%u "
+                "thread=%u leader=%u form=%u park_syscall=%u nchans=%u "
+                "user_rip=0x%llx user_rsp=0x%llx fs_base=0x%llx pages=%u\n",
+                (unsigned)t, tk.name, (unsigned)tk.kind,
+                (unsigned)tk.group_id, (unsigned)tk.thread_index,
+                (unsigned)tk.leader, (unsigned)tk.form,
                 (unsigned)tk.park_syscall, (unsigned)tk.waiting_nchans,
                 (unsigned long long)tk.user_rip,
                 (unsigned long long)tk.user_rsp,
-                (unsigned long long)tk.fs_base);
+                (unsigned long long)tk.fs_base, (unsigned)tk.n_pages);
             task_form[t] = tk.form;
             ep_copy(ep_stage + used, &tk, (uint32_t)sizeof(tk));
             used += (uint32_t)sizeof(tk);
@@ -998,10 +1229,10 @@ uint32_t env_payload_capture_all(void) {
                 rec->tasks[t].name, (unsigned)task_npages[t],
                 (unsigned)n_rx, (unsigned)n_rw, (unsigned)n_other,
                 (unsigned)task_form[t],
-                (unsigned long long)pds[t]->linux_image_lo,
-                (unsigned long long)pds[t]->linux_image_hi,
-                (unsigned long long)pds[t]->linux_heap_base,
-                (unsigned long long)pds[t]->linux_heap_limit);
+                (unsigned long long)linux_group_image_lo(pds[t]),
+                (unsigned long long)linux_group_image_hi(pds[t]),
+                (unsigned long long)linux_group_heap_base(pds[t]),
+                (unsigned long long)linux_group_heap_limit(pds[t]));
         }
         kernel_serial_printf(
             "[ENV_PAYLOAD] captured partition=%u index=%u tasks=%u pages=%u "
@@ -1268,6 +1499,7 @@ int env_payload_restore(uint32_t partition, uint32_t index,
     struct EnvPayloadDirHead h;
     struct EnvPayloadDirEntry e[ENV_PAYLOAD_MAX];
     int n = ep_dir_read(&h, e);
+    if (n == -2) { ep_refuse(EP_REFUSE_FORMAT, 0, 0); return EP_REFUSE_FORMAT; }
     if (n <= 0) { ep_refuse(EP_REFUSE_ABSENT, 0, 0); return EP_REFUSE_ABSENT; }
 #if E7G_TOOTH
     ep_memset(ep_skip, 0, sizeof(ep_skip));
@@ -1387,6 +1619,17 @@ int env_payload_restore(uint32_t partition, uint32_t index,
      * the tenant is refused here, by name, rather than poured over). */
     struct ProcessDescriptor* pds[EP_MAX_TASKS];
     uint8_t task_kind[EP_MAX_TASKS];
+    uint32_t task_group[EP_MAX_TASKS];
+    uint32_t group_id = 0;
+    uint32_t ungrouped_linux = 0;
+    uint32_t group_tasks = 0;
+    uint32_t group_futex_tasks = 0;
+    uint32_t futex_tasks = 0;
+    uint32_t futex_bad_at = 0;
+    uint64_t futex_uaddr = 0;
+    uint32_t futex_val = 0;
+    int futex_bad = 0;
+    int group_leader_t = -1;
     {
         uint32_t u = 3u * (uint32_t)sizeof(struct EnvPayloadRegion);
         for (uint32_t t = 0; t < head.n_tasks; t++) {
@@ -1406,6 +1649,65 @@ int env_payload_restore(uint32_t partition, uint32_t index,
                 if (bn != tk.n_pages) {
                     ep_refuse(EP_REFUSE_FORMAT, t, bn);
                     return EP_REFUSE_FORMAT;
+                }
+            }
+            task_group[t] = tk.group_id;
+            if (tk.kind == ENV_CKPT_TASK_LINUX && tk.group_id != 0)
+                group_tasks++;
+            if (tk.form == ENV_PAYLOAD_FORM_FUTEX) {
+                /* A wait record is only meaningful with an aligned user
+                 * word. The barrier key is group-wide: a group whose members
+                 * name different words (or different expected values) is
+                 * not one stop, and is refused before the pour. */
+                if (tk.futex_uaddr == 0 || (tk.futex_uaddr & 3ull) != 0) {
+                    futex_bad = 1;
+                    futex_bad_at = t;
+                } else if (tk.group_id != 0) {
+                    if (group_futex_tasks == 0) {
+                        futex_uaddr = tk.futex_uaddr;
+                        futex_val = tk.futex_val;
+                    } else if (tk.futex_uaddr != futex_uaddr ||
+                               tk.futex_val != futex_val) {
+                        futex_bad = 1;
+                        futex_bad_at = t;
+                    }
+                    group_futex_tasks++;
+                }
+                futex_tasks++;
+            } else if (tk.futex_uaddr || tk.futex_val || tk.futex_ticks) {
+                ep_refuse(EP_REFUSE_FORMAT, t, 8);
+                return EP_REFUSE_FORMAT;
+            }
+            if (tk.kind != ENV_CKPT_TASK_LINUX) {
+                if (tk.group_id != 0 || tk.thread_index != 0 || tk.leader != 0) {
+                    ep_refuse(EP_REFUSE_GROUP, t, tk.group_id);
+                    return EP_REFUSE_GROUP;
+                }
+            } else if (tk.group_id == 0) {
+                if (tk.thread_index != 0 || tk.leader != 0) {
+                    ep_refuse(EP_REFUSE_GROUP, t, 0);
+                    return EP_REFUSE_GROUP;
+                }
+                ungrouped_linux++;
+            } else {
+                if (tk.leader > 1 ||
+                    tk.thread_index >= ENV_CKPT_MAX_THREADS ||
+                    (tk.leader && tk.thread_index != 0) ||
+                    (!tk.leader && tk.thread_index == 0)) {
+                    ep_refuse(EP_REFUSE_GROUP, t, tk.group_id);
+                    return EP_REFUSE_GROUP;
+                }
+                if (group_id == 0) group_id = tk.group_id;
+                else if (group_id != tk.group_id) {
+                    ep_refuse(EP_REFUSE_GROUP, t, tk.group_id);
+                    return EP_REFUSE_GROUP;
+                }
+                if (tk.leader) {
+                    if (group_leader_t >= 0) {
+                        ep_refuse(EP_REFUSE_GROUP, t, tk.group_id);
+                        return EP_REFUSE_GROUP;
+                    }
+                    group_leader_t = (int)t;
                 }
             }
             task_kind[t] = tk.kind;
@@ -1429,19 +1731,21 @@ int env_payload_restore(uint32_t partition, uint32_t index,
                 continue;
             }
 #endif
-            struct ProcessDescriptor* pd = ep_find_proc(tk.name);
+            struct ProcessDescriptor* pd = ep_find_payload_task(&tk);
             if (!pd) { ep_refuse(EP_REFUSE_NO_PROCESS, t, 0); return EP_REFUSE_NO_PROCESS; }
             int is_linux = tk.kind == ENV_CKPT_TASK_LINUX;
             if (is_linux) {
-                /* E7 increment 21: two resumable forms, one install path.
-                 * USER is a task the pause caught in ring 3; ENTRY is the
-                 * gate's deterministic stop at a `syscall` it has not run.
-                 * Both carry the whole state as ring3_ctx (linux_regs), so
-                 * both are poured by the same arm below. PARKED is still the
-                 * named refusal: a forwarded request is queued state this
-                 * blob does not carry (B9). */
+                /* E7 increment 21 plus TG-2c: three restorable forms. USER
+                 * is a task the pause caught in ring 3; ENTRY is the gate's
+                 * deterministic stop at a `syscall` it has not run; FUTEX is
+                 * a blocked wait with no request in flight. USER/ENTRY carry
+                 * the whole state as ring3_ctx (linux_regs); FUTEX carries
+                 * its park frame and is re-enqueued instead of resumed.
+                 * PARKED is still the named refusal: a forwarded request is
+                 * queued state this blob does not carry (B9). */
                 if (tk.form != ENV_PAYLOAD_FORM_USER &&
-                    tk.form != ENV_PAYLOAD_FORM_ENTRY) {
+                    tk.form != ENV_PAYLOAD_FORM_ENTRY &&
+                    tk.form != ENV_PAYLOAD_FORM_FUTEX) {
                     /* PARKED is a queued request this blob does not carry;
                      * RUNNING is a capture that never had a restorable
                      * instant. Both are refused by their own name. */
@@ -1456,9 +1760,18 @@ int env_payload_restore(uint32_t partition, uint32_t index,
                  * of its own — the blob's context is what it will run. A task
                  * that is running, parked, or otherwise live-with-context is
                  * the OLD shape and is refused by name: a pour into it would
-                 * overwrite a task that already executed _start. */
-                if (ep_proc_parked(pd) || pd->state == PROC_RUNNING ||
-                    (!pd->restore_held && !pd->has_ring3_ctx)) {
+                 * overwrite a task that already executed _start. A FUTEX task
+                 * must be one of those held creates too: re-enqueueing a wait
+                 * for a descriptor that still has a runnable context would
+                 * leave two states for one task. */
+                if (tk.form == ENV_PAYLOAD_FORM_FUTEX) {
+                    if (!pd->restore_held || ep_proc_parked(pd) ||
+                        pd->state == PROC_RUNNING) {
+                        ep_refuse(EP_REFUSE_NOT_PARKED, t, pd->park_syscall);
+                        return EP_REFUSE_NOT_PARKED;
+                    }
+                } else if (ep_proc_parked(pd) || pd->state == PROC_RUNNING ||
+                           (!pd->restore_held && !pd->has_ring3_ctx)) {
                     ep_refuse(EP_REFUSE_NOT_PARKED, t, pd->park_syscall);
                     return EP_REFUSE_NOT_PARKED;
                 }
@@ -1491,6 +1804,57 @@ int env_payload_restore(uint32_t partition, uint32_t index,
             }
             pds[t] = pd;
         }
+
+        if (ungrouped_linux > 1 || (ungrouped_linux != 0 && group_id != 0) ||
+            (group_id != 0 && group_leader_t < 0)) {
+            ep_refuse(EP_REFUSE_GROUP, 0, group_id);
+            return EP_REFUSE_GROUP;
+        }
+        if (futex_bad ||
+            (group_futex_tasks > 0 && group_futex_tasks != group_tasks)) {
+            ep_refuse(EP_REFUSE_BARRIER,
+                      futex_bad ? futex_bad_at : (uint32_t)group_leader_t, 1);
+            return EP_REFUSE_BARRIER;
+        }
+        if (futex_tasks > linux_futex_free_slots()) {
+            ep_refuse(EP_REFUSE_BARRIER, 0, 2);
+            return EP_REFUSE_BARRIER;
+        }
+        if (group_id != 0) {
+            uint32_t base = 3u * (uint32_t)sizeof(struct EnvPayloadRegion);
+            struct EnvPayloadTask leader;
+            ep_copy(&leader, ep_stage + base +
+                    (uint32_t)group_leader_t * (uint32_t)sizeof(leader),
+                    (uint32_t)sizeof(leader));
+            for (uint32_t t = 0; t < head.n_tasks; t++) {
+                if (task_group[t] != group_id) continue;
+                struct EnvPayloadTask tk;
+                ep_copy(&tk, ep_stage + base +
+                        t * (uint32_t)sizeof(tk), (uint32_t)sizeof(tk));
+                if (!ep_name_eq(tk.name, leader.name)) {
+                    ep_refuse(EP_REFUSE_GROUP, t, group_id);
+                    return EP_REFUSE_GROUP;
+                }
+                if (!tk.leader &&
+                    (tk.brk_cur || tk.mmap_top || tk.heap_base ||
+                     tk.heap_limit || tk.image_lo || tk.image_hi)) {
+                    /* The group's spans live once, on the leader. A sibling
+                     * carrying its own copy is a blob that would apply one
+                     * task's numbers over the group's shared cursors. */
+                    ep_refuse(EP_REFUSE_GROUP, t, group_id);
+                    return EP_REFUSE_GROUP;
+                }
+                if (pds[t] && pds[group_leader_t]) {
+                    struct LinuxThreadGroup* lg =
+                        linux_group_of(pds[group_leader_t]);
+                    if (!lg || linux_group_of(pds[t]) != lg ||
+                        pds[t]->cr3 != pds[group_leader_t]->cr3) {
+                        ep_refuse(EP_REFUSE_GROUP, t, group_id);
+                        return EP_REFUSE_GROUP;
+                    }
+                }
+            }
+        }
     }
 
     /* Every destination, before a byte is written: identity for region
@@ -1502,6 +1866,7 @@ int env_payload_restore(uint32_t partition, uint32_t index,
      * before the first byte, like every other destination fault. */
     {
         uint32_t pi = 0;
+        uint32_t seen_pages = 0;
         for (uint32_t t = 0; t < head.n_tasks; t++) {
             uint32_t u = block_off[t];
             uint32_t np = (uint32_t)ep_stage[u] |
@@ -1528,6 +1893,10 @@ int env_payload_restore(uint32_t partition, uint32_t index,
                 uint64_t v = 0;
                 for (uint32_t b = 0; b < 8; b++)
                     v |= ((uint64_t)ep_stage[u + b]) << (8u * b);
+                uint32_t want_crc = (uint32_t)ep_stage[u + 8] |
+                                    ((uint32_t)ep_stage[u + 9] << 8) |
+                                    ((uint32_t)ep_stage[u + 10] << 16) |
+                                    ((uint32_t)ep_stage[u + 11] << 24);
                 uint32_t want_perm = (uint32_t)ep_stage[u + 12] |
                                      ((uint32_t)ep_stage[u + 13] << 8) |
                                      ((uint32_t)ep_stage[u + 14] << 16) |
@@ -1540,6 +1909,34 @@ int env_payload_restore(uint32_t partition, uint32_t index,
                 if ((want_perm & ~EP_PAGE_PERM_MASK) != 0) {
                     ep_refuse(EP_REFUSE_FORMAT, 7, pi);
                     return EP_REFUSE_FORMAT;
+                }
+                /* E7 §10.15: SOFT is its own state, never a decoration on
+                 * a normal grant. USER|SOFT is contradictory; W or X on a
+                 * soft page would make PROT_NONE a lie. A v2 writer never
+                 * emitted the bit, so a v2 blob claiming it is malformed. */
+                if ((want_perm & EP_PAGE_PERM_SOFT) &&
+                    ((want_perm & (EP_PAGE_PERM_USER |
+                                   EP_PAGE_PERM_WRITE |
+                                   EP_PAGE_PERM_EXEC)) != 0)) {
+                    ep_refuse(EP_REFUSE_FORMAT, 8, pi);
+                    return EP_REFUSE_FORMAT;
+                }
+                /* TG-2b: a group's shared root must not receive one vaddr
+                 * twice with different bytes or grants. Two entries that
+                 * agree are the same page written twice (allowed); two that
+                 * disagree are a corrupt shared-page index, refused before
+                 * the first byte. Different roots are different address
+                 * spaces and are not duplicates. */
+                for (uint32_t q = 0; q < seen_pages; q++) {
+                    if (ep_seen_cr3[q] != pds[t]->cr3 ||
+                        ep_seen_vaddr[q] != v) continue;
+                    if (ep_seen_crc[q] != want_crc ||
+                        (ep_seen_perm[q] & EP_PAGE_PERM_MASK) !=
+                            (want_perm & EP_PAGE_PERM_MASK)) {
+                        ep_refuse(EP_REFUSE_DUP, q, pi);
+                        return EP_REFUSE_DUP;
+                    }
+                    break;
                 }
                 uint64_t phys = 0;
                 uint32_t live_perm = 0;
@@ -1575,6 +1972,7 @@ int env_payload_restore(uint32_t partition, uint32_t index,
                     if (want_perm & EP_PAGE_PERM_WRITE) flags |= USER_PTE_WRITE;
                     if (want_perm & EP_PAGE_PERM_EXEC)  flags |= USER_PTE_EXEC;
                     else                                flags |= USER_PTE_NOEXEC;
+                    if (want_perm & EP_PAGE_PERM_SOFT)  flags |= USER_PTE_SOFT_NONE;
                     user_map_page((uint64_t*)(uintptr_t)pds[t]->cr3, v,
                                   (uint64_t)(uintptr_t)frame, flags);
                     phys = (uint64_t)(uintptr_t)frame;
@@ -1592,6 +1990,11 @@ int env_payload_restore(uint32_t partition, uint32_t index,
                     return EP_REFUSE_PERM;
                 }
                 ep_scratch.dest[pi] = phys;
+                ep_seen_vaddr[seen_pages] = v;
+                ep_seen_cr3[seen_pages]   = pds[t]->cr3;
+                ep_seen_crc[seen_pages]   = want_crc;
+                ep_seen_perm[seen_pages]  = want_perm & EP_PAGE_PERM_MASK;
+                seen_pages++;
             }
         }
     }
@@ -1672,6 +2075,8 @@ int env_payload_restore(uint32_t partition, uint32_t index,
      * resume sees the break the workload had actually reached. */
     {
         uint32_t u = 3u * (uint32_t)sizeof(struct EnvPayloadRegion);
+        uint32_t futex_enqueued[EP_MAX_TASKS];
+        uint32_t n_futex_enqueued = 0;
         for (uint32_t t = 0; t < head.n_tasks; t++) {
             struct EnvPayloadTask tk;
             ep_copy(&tk, ep_stage + u, (uint32_t)sizeof(tk));
@@ -1734,13 +2139,66 @@ int env_payload_restore(uint32_t partition, uint32_t index,
                 }
 #endif
                 uint64_t* c = (uint64_t*)&pd->ring3_ctx;
-                for (uint32_t r = 0; r < 20; r++) c[r] = tk.linux_regs[r];
-                pd->has_ring3_ctx  = 1;
+                if (tk.form == ENV_PAYLOAD_FORM_FUTEX) {
+                    /* The wait is not a user context: ring3_ctx at the block
+                     * is the pre-trap context, not the state the wake returns
+                     * to. Leave it unset; linux_futex_resume_thread rebuilds
+                     * the frame from park_ctx when the barrier releases it. */
+                    pd->has_ring3_ctx = 0;
+                } else {
+                    for (uint32_t r = 0; r < 20; r++) c[r] = tk.linux_regs[r];
+                    pd->has_ring3_ctx = 1;
+                }
                 pd->user_rip       = tk.user_rip;
                 pd->user_rsp       = tk.user_rsp;
                 pd->fs_base        = adopted_fs;
-                pd->linux_brk_cur  = tk.brk_cur;
-                pd->linux_mmap_top = tk.mmap_top;
+                /* TG-2b: one shared cursor pair per group. The leader (or a
+                 * legacy ungrouped task) owns it; a sibling must not apply
+                 * its zeroed copy over what the leader just restored. */
+                if (tk.group_id == 0 || tk.leader) {
+                    linux_group_set_brk(pd, tk.brk_cur);
+                    linux_group_set_mmap_top(pd, tk.mmap_top);
+                }
+                /* TG-2c: re-enqueue the captured wait before the group is
+                 * released. Capacity and the group key were validated before
+                 * the pour, so this cannot strand half a barrier; the page
+                 * that holds the word is part of the same blob. `futex_ticks`
+                 * is relative; the absolute deadline is this boot's tick
+                 * counter plus the remainder. */
+                if (tk.form == ENV_PAYLOAD_FORM_FUTEX) {
+                    /* The group id in the blob is the OLD boot's leader pid;
+                     * the waiter table is keyed by this boot's group. The
+                     * barrier identity is (uaddr, value), not that pid. */
+                    uint32_t fgid = pd->tgid;
+                    uint64_t deadline = tk.futex_ticks
+                                            ? kernel_tick_counter + tk.futex_ticks
+                                            : 0;
+                    if (linux_futex_wait_enqueue(fgid, tk.futex_uaddr, pd->tid,
+                                                 deadline) != 0) {
+                        for (uint32_t q = 0; q < n_futex_enqueued; q++)
+                            linux_futex_wait_cancel(futex_enqueued[q]);
+                        ep_refuse(EP_REFUSE_BARRIER, t, 3);
+                        return EP_REFUSE_BARRIER;
+                    }
+                    futex_enqueued[n_futex_enqueued++] = pd->tid;
+                    pd->park_ctx.r11      = tk.park[0];
+                    pd->park_ctx.rcx      = tk.park[1];
+                    pd->park_ctx.r15      = tk.park[2];
+                    pd->park_ctx.r14      = tk.park[3];
+                    pd->park_ctx.r13      = tk.park[4];
+                    pd->park_ctx.r12      = tk.park[5];
+                    pd->park_ctx.rbx      = tk.park[6];
+                    pd->park_ctx.rbp      = tk.park[7];
+                    pd->park_ctx.user_rsp = tk.park[8];
+                    for (uint32_t a = 0; a < 6; a++)
+                        pd->park_ctx.linux_args[a] = tk.linux_args[a];
+                    pd->park_req       = 0;
+                    pd->park_syscall   = SYS_LINUX_FUTEX_RESUME;
+                    pd->waiting_chan   = CAP_NONE;
+                    pd->waiting_nchans = 0;
+                    pd->waiting_deadline = 0;
+                    pd->state          = PROC_BLOCKED;
+                }
                 /* E7 increment 21: the stop is ONE-SHOT, and FORM_ENTRY is
                  * its aftermath. The replay's create is built from the same
                  * FLAG_GATE manifest, so the fresh descriptor came back with
@@ -1765,15 +2223,18 @@ int env_payload_restore(uint32_t partition, uint32_t index,
                  * release, so a later "second _start" cannot be mistaken
                  * for what this arm did. */
                 kernel_serial_printf(
-                    "[ENV_PAYLOAD] linux task '%s' adopted at rip=0x%llx "
-                    "rsp=0x%llx fs_base=0x%llx brk=0x%llx mtop=0x%llx "
-                    "form=%u held=%u stop=%s\n",
+                    "[ENV_PAYLOAD] linux task '%s' adopted at "
+                    "rip=0x%llx rsp=0x%llx fs_base=0x%llx brk=0x%llx "
+                    "mtop=0x%llx group=%u thread=%u leader=%u form=%u "
+                    "held=%u stop=%s\n",
                     tk.name, (unsigned long long)tk.user_rip,
                     (unsigned long long)tk.user_rsp,
                     (unsigned long long)pd->fs_base,
                     (unsigned long long)tk.brk_cur,
                     (unsigned long long)tk.mmap_top,
-                    (unsigned)tk.form, (unsigned)pd->restore_held,
+                    (unsigned)tk.group_id, (unsigned)tk.thread_index,
+                    (unsigned)tk.leader, (unsigned)tk.form,
+                    (unsigned)pd->restore_held,
                     pd->gate_profile ? "armed" : "spent");
                 continue;
             }

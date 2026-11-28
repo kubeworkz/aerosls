@@ -1,0 +1,125 @@
+//! e7_thread_probe.rs — E7 TG-1 increment I2's native two-thread probe.
+//!
+//! The companion of `e7_probe.rs`: this sidecar spawns a second
+//! Linux-personality child through the REAL create path (SYS_SLS_LINUX_SPAWN,
+//! 328) and the child's own `clone` (56) creates one sibling. Between them the
+//! live boot exercises getpid/getpid identity, a shared-address-space write,
+//! thread-local `exit` (60) and group `exit_group` (231) — the I2 exit
+//! criteria's "native two-thread probe".
+//!
+//! Payload placement is `e7_probe.rs`'s, deliberately: the flat image is
+//! embedded in this binary and planted at the budget region's last 64 KiB
+//! before the spawn, so it stays out of the boot image and every manifest but
+//! its own. The child's table is minted from a manifest with no capability
+//! records — its only pair is the messenger channel the create inserts.
+
+use aerosls_proto::manifest::{
+    build_manifest, crc32, ArgEnv, Bootstrap, Budget, Cpu, Image, Limits,
+    Manifest, ManifestCap, HEADER_LEN, MAX_MANIFEST_CAPS,
+};
+use crate::linux::LINUX_DEFAULT_ENV;
+
+/// `fixtures/e7_thread_probe.S`, built to a one-.text flat image whose
+/// `_start` is at file offset 0. The committed .flat is the byte-exact output
+/// of fixtures/build_thread_probe.sh.
+static PROBE: &[u8] = include_bytes!("../fixtures/e7_thread_probe.flat");
+
+/// The child's name — registered at create and resolved by the sidecar's
+/// exit_group reap through `k.sidecar_pid(name, partition)`.
+pub const PROBE_NAME: &str = "e7.thread.probe.0";
+
+/// Reserve at the TOP of the budget region (page-aligned: budget_base is
+/// 4 KiB-aligned from the manifest's MEM cap, budget_len is a MiB count).
+pub const PROBE_RESERVE: u64 = 64 * 1024;
+
+/// The child's layout, mirrored from the kernel's create-side layout
+/// (kernel/cap.c steps 5-6) and from the manifest THIS file authors — the
+/// §5.4 budget span is three numbers both sides derive from one record.
+const IMAGE_VBASE: u64 = 0x4000_0000_0000; /* USER_PROC_CODE_BASE */
+const HEAP_GUARD_BYTES: u64 = 4096;        /* cap.c: one guard page */
+const MEM_BUDGET_BYTES: u64 = 64 * 1024;   /* the BUDGET record's mem_bytes */
+const STACK_BUDGET_BYTES: u64 = 16 * 1024; /* stack_bytes; kernel floor 4096 */
+
+/// The caller's channel endpoints and the child's §5.4 span, as `linux::track`
+/// wants them.
+pub struct Spawned {
+    pub ch_r: u32,
+    pub ch_w: u32,
+    pub heap_base: u64,
+    pub heap_limit: u64,
+}
+
+pub fn spawn<K: aerosls_proto::kabi::Kernel>(
+    k: &K,
+    budget_base: u64,
+    budget_len: u64,
+) -> Result<Spawned, i32> {
+    if budget_len < PROBE_RESERVE + 0x1000 {
+        return Err(-1);
+    }
+    let tail = budget_base + budget_len - PROBE_RESERVE;
+    if PROBE.len() as u64 > PROBE_RESERVE {
+        return Err(-1);
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(PROBE.as_ptr(), tail as *mut u8, PROBE.len());
+    }
+
+    let caps: [Option<ManifestCap<'_>>; MAX_MANIFEST_CAPS] =
+        [None; MAX_MANIFEST_CAPS];
+    let m = Manifest {
+        version_major: 1,
+        version_minor: 0,
+        flags: 0,
+        name: Some(PROBE_NAME),
+        personality: Some("e7.linux.v1"),
+        image: Some(Image {
+            offset: 0,
+            size: PROBE.len() as u32,
+            entry: 0,
+        }),
+        budget: Some(Budget {
+            mem_bytes: MEM_BUDGET_BYTES,
+            stack_bytes: STACK_BUDGET_BYTES as u32,
+            heap_initial: 0,
+        }),
+        cpu: Some(Cpu {
+            share: 10,
+            preemptible: true,
+        }),
+        limits: Some(Limits {
+            max_tasks: 1,
+            max_fds: 0,
+            max_channels: 2,
+            max_open_files: 0,
+            chan_queue_depth: 4,
+        }),
+        caps,
+        n_caps: 0,
+        bootstrap: Some(Bootstrap {
+            console: None,
+            debug: None,
+            log_level: 1,
+        }),
+        flags_value: Some(0),
+        argenv: Some(ArgEnv::new(&[PROBE_NAME], LINUX_DEFAULT_ENV)),
+        signature: None,
+    };
+
+    let mut blob = build_manifest(&m);
+    blob.extend_from_slice(&tail.to_le_bytes());
+    let total = blob.len() as u32;
+    blob[16..20].copy_from_slice(&total.to_le_bytes());
+    let crc = crc32(&blob[HEADER_LEN..]);
+    blob[20..24].copy_from_slice(&crc.to_le_bytes());
+
+    let (ch_r, ch_w) = k.linux_spawn(&blob, 0)?;
+
+    let n_img_pages = (PROBE.len() as u64 + 4095) / 4096;
+    let stack_base = IMAGE_VBASE + n_img_pages * 4096 + HEAP_GUARD_BYTES;
+    let stk_pages = (STACK_BUDGET_BYTES + 4095) / 4096;
+    let heap_base = stack_base + stk_pages * 4096;
+    let heap_limit = heap_base + ((MEM_BUDGET_BYTES + 4095) / 4096) * 4096;
+
+    Ok(Spawned { ch_r, ch_w, heap_base, heap_limit })
+}

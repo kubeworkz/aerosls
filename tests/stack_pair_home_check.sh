@@ -81,6 +81,11 @@ done
 # ─── sweep: every definition site in the tree ──────────────────────────────
 # vendor/ is excluded for the same reason script_conventions_check.sh
 # excludes it: vendored code is verified by provenance, not by house style.
+# .freebuff/ is git-ignored Freebuff working state containing other checkouts;
+# scanning it would inspect someone else's tree and can take minutes on a
+# bind-mounted host. It is not part of this checkout's source.
+# The pattern is a C definition, so only C-family source files can contain a
+# definition site; docs, logs and asm are not definition sites.
 viol=0
 while IFS=: read -r file line rest; do
     file="${file#./}"    # grep -r prints ./-prefixed paths; allowlist is bare
@@ -89,7 +94,9 @@ while IFS=: read -r file line rest; do
     esac
     bad "$file:$line defines the pair: $rest"
     viol=$((viol+1))
-done < <(grep -rnE -I --exclude-dir=.git --exclude-dir=vendor "$PAT" . 2>/dev/null)
+done < <(grep -rnE -I --include='*.c' --include='*.h' --include='*.inc' \
+    --exclude-dir=.git --exclude-dir=vendor \
+    --exclude-dir=.freebuff "$PAT" . 2>/dev/null)
 
 if [ "$viol" -eq 0 ]; then
     ok "*** no definition outside the shared header (and its one named exception) ***"

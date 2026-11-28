@@ -66,7 +66,15 @@ for f in kernel/linux_abi.h kernel/linux_abi.c kernel/process.h kernel/process.c
          user/sidecar/src/e7_firstuser.rs user/proto/src/manifest.rs \
          arch/x86/fpu_enable.h arch/x86/lazy_fpu.c arch/x86/idt.c \
          arch/x86/interrupt.asm arch/x86/switch_lazy.asm \
-         kernel/kernel.c kernel/stubs.c tests/fpu_enable_host_test.c; do
+         kernel/kernel.c kernel/stubs.c tests/fpu_enable_host_test.c \
+         tests/user_map_identity_host_test.c tests/linux_clone_host_test.c \
+         tests/linux_fault_return_host_test.c tests/linux_sig_mask_host_test.c \
+         tests/linux_fault_reveal_check.sh \
+         user/sidecar/fixtures/e7_fault_reveal_probe.S \
+         user/sidecar/fixtures/e7_fault_reveal_probe.flat \
+         tests/linux_fault_abandon_check.sh \
+         user/sidecar/fixtures/e7_fault_abandon_probe.S \
+         user/sidecar/fixtures/e7_fault_abandon_probe.flat; do
     if [ ! -f "$f" ]; then
         echo "ABORT: $f missing — the guard cannot be evaluated at all." >&2
         exit 2
@@ -103,8 +111,20 @@ ISRA=arch/x86/interrupt.asm
 SWLA=arch/x86/switch_lazy.asm
 KERC=kernel/kernel.c
 STUB=kernel/stubs.c
+# P (increment 26, the signal frame) reads these: the frame's host test, and
+# the table test that carries the "15 is not in the table yet" absence.
+SIGFRAME_HUT=tests/linux_sigframe_host_test.c
+SYSTAB=tests/linux_syscall_table_host_test.c
+# P5–P8 (increment 27, the delivery) read these: the delivery's host test, the
+# sidecar source (its park-interrupt rule and E_INTR code) and the CAP map.
+SIGDELIVER_HUT=tests/linux_sigdeliver_host_test.c
+LINUXRS=user/sidecar/src/linux.rs
+CAPH=kernel/cap.h
 FHUT=tests/fpu_enable_host_test.c
 PHUT=tests/linux_personality_host_test.c
+HUMAP=tests/user_map_identity_host_test.c
+LTHH=kernel/linux_thread.h
+LTHC=kernel/linux_thread.c
 
 # ─── B. The sibling per-CPU block, at the offsets the asm addresses ────────
 # The struct side is pinned by static asserts (a C reorder is a BUILD
@@ -488,7 +508,8 @@ if grep -qF 'const E_BADF: i32 = -2;' "$LRS" && \
    grep -qF '1 => match fd_kind(fds, args[0]) {' "$LRS" && \
    grep -qF 'None => Answer::Reply(0, E_BADF),' "$LRS" && \
    grep -qF 'fds: [FdSlot; LINUX_MAX_FDS],' "$LRS" && \
-   grep -qF 't.fds = [FdSlot { used: false, kind: 0, vfs_fd: 0, flags: 0 }; LINUX_MAX_FDS];' "$LRS" && \
+   grep -qF 't.fds = [FdSlot { used: false, kind: 0, vfs_fd: 0, flags: 0,' "$LRS" && \
+   grep -qF 'members: 0, sum: 0xFFFF_FFFF, sum_len: 0 };' "$LRS" && \
    grep -qF 't.fds.iter_mut().take(3)' "$LRS"; then
     ok "M5. the sidecar's fd table exists per task (console slots plus step 4's File kind carrying the VFS fd and flags), is born with console stdio (0/1/2), and an unknown descriptor is EBADF — CAP_EBADF pinned at -2 so §5.7 delivers 9"
 else
@@ -528,15 +549,14 @@ if grep -q 'struct LinuxMemBrkVerdict' "$LABH" && \
 else
     bad "N. a mem-class contract is gone from linux_abi.h/.c — the brk apply has no verdict to consult (a grant would be trusted about the address it asks the kernel to map), the W|X refusal has no predicate, and the unwind has no read-back"
 fi
-if grep -q 'pd->linux_heap_base = 0;' "$PDC" && \
-   grep -q 'pd->linux_heap_limit = 0;' "$PDC" && \
-   grep -q 'pd->linux_brk_cur = 0;' "$PDC" && \
+if grep -q 'g->brk_cur = 0;' "$LTHC" && \
+   grep -q 'pd->group_index = LINUX_GROUP_NONE;' "$LTHC" && \
    grep -q 'pd->mem_stage_valid = 0;' "$PDC"; then
-    ok "N1. proc_clear_resume_state() zeroes the heap span AND the staged brk — a reused slot inherits neither its predecessor's pages-to-be nor an unanswered grant"
+    ok "N1. the group's destroy zeroes the shared cursors and the identity clear drops the index, while the descriptor still zeroes the staged brk — a reused slot inherits neither its predecessor's pages-to-be nor an unanswered grant"
 else
-    bad "N1. the mem state's slot-reuse clear is gone from process.c — the next occupant of a reused slot is handed its predecessor's brk_cur (whose grants map pages at a break it never asked for) and its live brk stage"
+    bad "N1. the group's slot-reuse clear is gone — the next occupant of a reused slot can resolve its predecessor's group (whose brk_cur maps pages at a break it never asked for), or the live brk stage survives"
 fi
-span_line="$(grep -nF 'pd->linux_heap_base  = stack_base + (uint64_t)stk_pages * 4096;' "$CAPC" | cut -d: -f1)"
+span_line="$(grep -nF 'group_heap_base  = stack_base + (uint64_t)stk_pages * 4096;' "$CAPC" | cut -d: -f1)"
 # The personality check is bound to the STAMP SITE (the line above the
 # stamp), not to the bare pattern: increment 7 added other
 # PROC_PERSONALITY_LINUX blocks to cap.c, and a free-standing pattern
@@ -544,16 +564,19 @@ span_line="$(grep -nF 'pd->linux_heap_base  = stack_base + (uint64_t)stk_pages *
 if [ -n "$span_line" ] && \
    sed -n "$((span_line - 1))p" "$CAPC" | grep -qF 'if (personality == PROC_PERSONALITY_LINUX) {' && \
    grep -qF '((m.budget_mem_bytes + 4095ULL) / 4096ULL)' "$CAPC" && \
+   grep -qF 'linux_group_stamp_memory(pd, group_heap_base, group_heap_limit,' "$CAPC" && \
    grep -qF 'const IMAGE_VBASE: u64 = 0x4000_0000_0000;' "$LPRO" && \
    grep -qF 'const MEM_BUDGET_BYTES: u64 = 64 * 1024;' "$LPRO" && \
    grep -qF 'let heap_base = stack_base + stk_pages * 4096;' "$LPRO"; then
-    ok "N2. the span is stamped inside the create, for LINUX only, from the manifest's BUDGET record — and the sidecar's ledger derives the same three numbers from the same record (one truth, mirrored)"
+    ok "N2. the span is computed inside the create for LINUX only and stamped onto the GROUP, from the manifest's BUDGET record — and the sidecar's ledger derives the same three numbers from the same record (one truth, mirrored)"
 else
     bad "N2. the span's stamp or its twin is gone — the kernel would map brk pages against a span the manifest never declared (or stamp one onto every SLS slot), or the sidecar's ledger would be born at a base the kernel's pages never reach: the two halves silently disagree and every denial-echo check lies"
 fi
-if grep -qF 'linux_mprotect_refuses_wx(largs[2]))' "$DISP" && \
-   grep -qF '(uint64_t)(int64_t)(-LINUX_EPERM);' "$DISP" && \
-   grep -qF 'if args[2] & 0x2 != 0 && args[2] & 0x4 != 0 {' "$LRS" && \
+if grep -qF 'mref = linux_mem_mprotect_refusal(&mreq,' "$DISP" && \
+   grep -qF 'if (mref) {' "$DISP" && \
+   grep -qF 'mref == -LINUX_EPERM' "$DISP" && \
+   grep -qF 'linux_mprotect_refuses_wx(req->prot)' "$LABC" && \
+   grep -qF 'if prot & 0x2 != 0 && prot & 0x4 != 0 {' "$LRS" && \
    grep -qF 'const E_PERM: i32 = -12;' "$LRS"; then
     ok "N3. W|X is refused at BOTH ends: the first trap refuses -EPERM before any post, and the sidecar's arm carries the same refusal (CAP_EPERM pinned at -12 so §5.7 delivers 1)"
 else
@@ -563,14 +586,14 @@ stage_line6=$(grep -n 'cur->mem_stage_valid = 1;' "$DISP" | head -1 | cut -d: -f
 arm_line6=$(grep -n 'cur->park_syscall = SYS_LINUX_TRAP_RESUME;' "$DISP" | head -1 | cut -d: -f1)
 verdict_line=$(grep -n 'linux_mem_brk_verdict(' "$DISP" | head -1 | cut -d: -f1)
 deliver_line6=$(grep -n 'k_linux_deliver(cur->pid, ch_r' "$DISP" | head -1 | cut -d: -f1)
-map_line=$(grep -n 'cur->linux_brk_cur = v.new_cur;' "$DISP" | head -1 | cut -d: -f1)
+map_line=$(grep -n 'linux_group_set_brk(cur, v.new_cur);' "$DISP" | head -1 | cut -d: -f1)
 if [ -n "$stage_line6" ] && [ -n "$arm_line6" ] && [ -n "$verdict_line" ] && \
    [ -n "$deliver_line6" ] && [ -n "$map_line" ] && \
    [ "$stage_line6" -lt "$arm_line6" ] && \
    [ "$verdict_line" -gt "$deliver_line6" ] && [ "$map_line" -gt "$verdict_line" ] && \
    grep -qF 'if (v.malformed) {' "$DISP" && \
-   grep -qF 'cur->linux_brk_cur = v.new_cur;' "$DISP"; then
-    ok "N4. the brk seam holds: staged BEFORE the arm, the verdict consulted only AFTER the reply is delivered, malformed grants refused before any map, and the break recorded only on a fully-mapped grant"
+   grep -qF 'linux_group_set_brk(cur, v.new_cur);' "$DISP"; then
+    ok "N4. the brk seam holds: staged BEFORE the arm, the verdict consulted only AFTER the reply is delivered, malformed grants refused before any map, and the group's break recorded only on a fully-mapped grant"
 else
     bad "N4. the stage/apply seam is broken — a grant mapped without the verdict's span re-check (the reply would decide what the kernel maps), a stage that survives past its own reply, or a break that moves without pages behind it: a silent lie to ring-3 about its own heap"
 fi
@@ -830,12 +853,14 @@ if grep -qF 'LINUX_RT_SIGACTION => {' "$LRS" && \
 else
     bad "R4. an arm or the SignalKill convergence is gone — raise(SIGABRT) would refuse or reply successfully, abort() would walk on into its hlt, and the boot would show [FAULT] at 0x805260c again (§10.13's step-1 wall)"
 fi
-if grep -qF 'E_NOSYS), /* handler install not landed' "$LRS" && \
+if grep -qF 'sig.act[args[0] as usize] = act;' "$LRS" && \
+   grep -qF 'dispo(sig, args[1]) == DISPO_HANDLER {' "$LRS" && \
+   grep -qF 'dispo(sig, sig_no as u64) == DISPO_HANDLER {' "$LRS" && \
    grep -qF 'if sig.tid == 0 || args[0] as u32 != sig.tid as u32 {' "$LRS" && \
    grep -qF 'sig.pending |= 1u64 << (args[1] - 1);' "$LRS"; then
-    ok "R5. the seam's honesty lines hold: a handler install refuses ENOSYS by name BEFORE any mutation (v1 has no signal frames to deliver one on), tkill's tid is the set_tid_address echo at u32 width (ESRCH otherwise — never silently re-targeted), and a blocked signal PENDS so the unblock arm is where it delivers"
+    ok "R5. the seam's honesty lines hold: rt_sigaction RECORDS the whole 32-byte act — handler address, flags, mask and restorer, returned verbatim by oldact — but never invokes it, tkill's own delivery and the unblock reveal both refuse a handler disposition ENOSYS by name BEFORE any action (no signal frame/rt_sigreturn exists), tkill's tid is the set_tid_address echo at u32 width (ESRCH otherwise — never silently re-targeted), and a blocked signal PENDS so the unblock arm is where it delivers"
 else
-    bad "R5. one of the seam's honesty lines is gone — a handler install would record a disposition this shim can never invoke (every later delivery a coin flip), a tid mismatch could kill a task that never asked, or a blocked raise() would be lost outright instead of pending"
+    bad "R5. one of the seam's honesty lines is gone — a recorded handler could be invoked with no frame to return through (or silently turned into a default kill the caller never asked for), a tid mismatch could kill a task that never asked, or a blocked raise() would be lost outright instead of pending"
 fi
 if grep -qF 'linux_sig_copy_plan(' "$PHUT" && \
    grep -qF 'p.refuse == -LINUX_EINVAL && p.len == 0' "$PHUT"; then
@@ -853,11 +878,22 @@ fi
 
 if grep -qF 'fmt_sig_line(&mut ex, b" write ok len=",' "$LRS" && \
    grep -qF 'for &b in payload[..len].iter().take(24)' "$LRS" && \
-   grep -qF 'push_bytes(&mut ex, 0, b" -> ENOSYS mmap(len="' "$LRS" && \
-   grep -qF 'off = dec_into(&mut ex, off, args[1]);' "$LRS"; then
+   grep -qF 'fn fmt_mmap_refusal_line' "$LRS" && \
+   grep -qF 'b"ENOSYS mmap(len="' "$LRS" && \
+   grep -qF 'E_NOSYS, args[1], args[2], args[3]' "$LRS"; then
     ok "R8. the SIGABRT reading's instrument holds: the workload's own console bytes ride its write lines (len + a 24-byte excerpt, child-attributed) and mmap refusals carry their request (len/prot/flags) — 'alloc failed after ENOSYS' is read off the E7 stream, never inferred from a merged console drain whose order is the flush, not the writer"
 else
     bad "R8. the attribution is gone — the alloc-failure text would exist only in the merged console drain (any child of the environment could have written it) and the mmap refusal goes back to a bare ENOSYS with no request to name (the proven chain becomes an inference again)"
+fi
+if ! grep -qF 'cmp rax, 131' "$ASM" && \
+   ! grep -qF '.do_sls_svc_crash' "$ASM" && \
+   grep -qF '131 (sigaltstack in the Linux census) is deliberately NOT routed here.' "$ASM" && \
+   grep -qF 'case SYS_SLS_SVC_CRASH:' "$DISP" && \
+   grep -qF 'LINUX_SIGALTSTACK => {' "$LRS" && \
+   grep -qF 'SS_DISABLE' "$LRS"; then
+    ok "R9. sigaltstack (131) is NOT in the asm number chain — the personality branch, not the number alone, decides it: the real firstuser's query reaches the sidecar's 131 arm (old stack_t = SS_DISABLE), its install is a no-op, and Rust std falls through to the guard-page mmap+mprotect; SLS still reaches SYS_SLS_SVC_CRASH through do_syscall's own arm"
+else
+    bad "R9. the asm fast path claims 131 again (or the sidecar's SS_DISABLE answer/SLS arm is gone) — a Linux sigaltstack(NULL,&old) would become an SLS svc_crash, the old stack_t would stay zeroed, std would skip the guard-page mmap+mprotect, and every other clause could stay green while the real firstuser's guard call silently vanished"
 fi
 
 # ─── S. poll (7) — readiness and timed wakeups (E7 increment 24) ───────────
@@ -973,8 +1009,10 @@ if [ -n "$deliver_buf" ] && \
 else
     bad "T3. a shape arm is gone — a payload would be copied for a number that staged none, beyond the clamp, past a refusal, or with a ret its number contradicts (the one-truth rule with bytes attached)"
 fi
-if grep -qF 'int require_rw)' "$LABC" && \
+if grep -qF 'int require_rw, int accept_soft)' "$LABC" && \
    grep -qF 'if (require_rw && !(e & LAB_PTE_RW)) return -LINUX_EFAULT;' "$LABC" && \
+   grep -qF 'static int lab_walk_leaf_rw(' "$LABC" && \
+   grep -qF 'return lab_walk_leaf(root, va, leaf_out, 1, 0);' "$LABC" && \
    grep -qF '#define LAB_PTE_RW' "$LABC" && \
    grep -qF 'Phase 1 — validate the WHOLE span' "$LABC" && \
    grep -qF 'Phase 2 — write.' "$LABC"; then
@@ -1039,9 +1077,9 @@ else
     ok "U1. the return path never touches RAX — the syscall's result survives the restore"
 fi
 
-capfn="$(awk '/^static void proc_capture_entry_regs/{f=1} f{print} f&&/^}/{exit}' "$PDC")"
+capfn="$(awk '/^static void proc_capture_entry_regs\(struct CapParkCtx\* ctx\) \{/{f=1} f{print} f&&/^}/{exit}' "$PDC")"
 if printf '%s\n' "$capfn" | grep -qF '%%gs:0x50' && \
-   printf '%s\n' "$capfn" | grep -qF 'ctx->linux_args[5]'; then
+   printf '%s\n' "$capfn" | grep -qF 'ctx->linux_args)'; then
     ok "U2. proc_capture_entry_regs snapshots the six argument registers into park_ctx beside the pushed set — a parked task's registers outlive the per-CPU block every later entry overwrites"
 else
     bad "U2. the entry capture no longer reads [gs:0x50..0x80) into park_ctx — a parked task loses its argument registers to the next trap on that core, and every resume after it restores someone else's"
@@ -1062,8 +1100,9 @@ else
 fi
 
 if grep -qF 'offsetof(struct CapParkCtx, linux_args) == 72' "$CCT" && \
-   grep -qF 'sizeof(struct CapParkCtx) == 120' "$CCT"; then
-    ok "U5. the host test pins the layout the resume asm indexes by byte — linux_args at 72 (p[9]), the full ctx 120 — so a reordered field is a red host test, not a boot that sysrets misaligned registers"
+   grep -qF 'offsetof(struct CapParkCtx, rax) == 120' "$CCT" && \
+   grep -qF 'sizeof(struct CapParkCtx) == 128' "$CCT"; then
+    ok "U5. the host test pins the layout the resume asm indexes by byte — linux_args at 72 (p[9]), the increment-29 rax at 120, the full ctx 128 — so a reordered field is a red host test, not a boot that sysrets misaligned registers"
 else
     bad "U5. the cap_create host test no longer pins CapParkCtx's layout — the resume asm's 72(%1)…112(%1) offsets would be argued from these greps alone"
 fi
@@ -1108,9 +1147,9 @@ else
 fi
 mmap_v=$(grep -nF 'v = linux_mem_mmap_verdict(' "$DISP" | head -1 | cut -d: -f1)
 if [ -n "$mmap_v" ] && \
-   sed -n "$((mmap_v - 3)),$((mmap_v + 6))p" "$DISP" | grep -qF 'cur->linux_mmap_top' && \
-   grep -qF 'v.new_mmap_top;' "$DISP" && \
-   grep -qF 'cur->linux_mmap_top,' "$DISP" && \
+   sed -n "$((mmap_v - 3)),$((mmap_v + 6))p" "$DISP" | grep -qF 'linux_group_mmap_top(cur)' && \
+   grep -qF 'v.new_mmap_top);' "$DISP" && \
+   grep -qF 'linux_group_mmap_top(cur), &mreq, rax);' "$DISP" && \
    grep -qF '(-LINUX_ENOMEM);' "$DISP" && \
    grep -qxF '                        } else if (snum == LINUX_MMAP) {' "$DISP" && \
    ! grep -qF '                            } else if (snum == LINUX_MMAP) {' "$DISP"; then
@@ -1129,12 +1168,12 @@ if [ -n "$inv_upc" ] && \
 else
     bad "V3. the replace walk, the frame return or the invlpg is gone — a replace would leak the old frame and zero live bytes, or ring-3 would keep running on the stale translation the guard page replaced"
 fi
-if grep -qF 'pd->linux_mmap_top   = pd->linux_heap_limit;' "$CAPC" && \
-   grep -qF 'pd->linux_mmap_top = 0;' "$PDC" && \
-   grep -qF 'uint64_t   linux_mmap_top;' "$PDH"; then
-    ok "V4. both cursors are stamped and cleared where the heap span is — the create births linux_mmap_top at the span's limit beside brk_cur, slot reuse zeroes it beside the other three, and the descriptor declares it"
+if grep -qF 'g->mmap_top = heap_limit;' "$LTHC" && \
+   grep -qF 'g->mmap_top = 0;' "$LTHC" && \
+   grep -qF 'uint64_t mmap_top;' "$LTHH"; then
+    ok "V4. both cursors are stamped and cleared on the GROUP — the stamp births mmap_top at the span's limit beside brk_cur, destroy zeroes it beside the other fields, and linux_thread.h declares it"
 else
-    bad "V4. the kernel cursor's stamp, clear or field is gone — a reused slot would inherit its predecessor's cursor (a grant landing on a page the last occupant's map owned) or a LINUX task would have no cursor to cap brk by"
+    bad "V4. the group cursor's stamp, clear or field is gone — a reused group would inherit its predecessor's cursor (a grant landing on a page the last occupant's map owned) or a LINUX task would have no cursor to cap brk by"
 fi
 mmap_arm=$(grep -nF '        9 => {' "$LRS" | head -1 | cut -d: -f1)
 if [ -n "$mmap_arm" ] && \
@@ -1170,8 +1209,9 @@ else
 fi
 if grep -qF 'fn hex_into' "$LRS" && \
    grep -qF ' ok mmap -> 0x' "$LRS" && \
-   grep -qF 'EPERM mmap(len=' "$LRS" && \
-   grep -qF ' -> ENOSYS mmap(len=' "$LRS"; then
+   grep -qF 'fn fmt_mmap_refusal_line' "$LRS" && \
+   grep -qF 'b"EPERM mmap(len="' "$LRS" && \
+   grep -qF 'b"ENOSYS mmap(len="' "$LRS"; then
     ok "V8. the instrument carries every mmap answer — a grant shows the address the ledger gave (hex: an address is unreadable in decimal), every refusal shows the request's words with the errno it became, and the increment-15 ENOSYS line is unchanged behind it"
 else
     bad "V8. an mmap answer line is gone — the run's proof would be a reconstruction again (the increment-14/15 instrument rule)"
@@ -1183,7 +1223,9 @@ fi
 # clauses hold the three halves that make the tenant checkpointable — the
 # identity the manager names, the kernel facts the spawn stamps, and the
 # bytes + permissions the capture files — plus the one form the blob can
-# honestly resume (USER), refused by name otherwise.
+# honestly resume (USER), refused by name otherwise. The host-test clause
+# also holds the v2 replay and the corrupt soft-permission refusals that
+# keep old blobs readable without admitting v3-only states.
 EPH=kernel/env_payload.h
 EPC=kernel/env_payload.c
 ECKH=kernel/env_ckpt.h
@@ -1192,8 +1234,9 @@ IEM=user/init/src/env_manager.rs
 ENVP=user/proto/src/env_proto.rs
 EPHUT=tests/env_payload_host_test.c
 ECKHUT=tests/env_ckpt_host_test.c
-if grep -qF '#define ENV_PAYLOAD_REC_VERSION 2u' "$EPH" && \
+if grep -qE '#define ENV_PAYLOAD_REC_VERSION[[:space:]]+5u' "$EPH" && \
    grep -qF '#define EP_PAGE_ENTRY_BYTES 16u' "$EPH" && \
+   grep -qE '#define EP_PAGE_PERM_SOFT[[:space:]]+0x8u' "$EPH" && \
    grep -qF 'uint64_t linux_regs[20];' "$EPH" && \
    grep -qF 'uint64_t linux_args[6]; /* rdi, rsi, rdx, r10, r8, r9 at the capture */' "$EPH" && \
    grep -qF 'uint64_t fs_base;' "$EPH" && \
@@ -1202,15 +1245,22 @@ if grep -qF '#define ENV_PAYLOAD_REC_VERSION 2u' "$EPH" && \
    grep -qF 'uint64_t heap_limit;' "$EPH" && \
    grep -qF 'uint64_t stack_bottom;' "$EPH" && \
    grep -qF 'uint64_t image_hi;' "$EPH" && \
-   grep -qF '#define ENV_PAYLOAD_FORM_USER    2u' "$EPH"; then
-    ok "W1. the payload is v2: EnvPayloadTask carries the Linux task's FULL context (20-word TaskContext), its six argument registers, fs_base, both cursors, the heap and stack ranges and the image span, and every page index entry is 16 bytes with a permission word"
+   grep -qF 'uint32_t group_id;' "$EPH" && \
+   grep -qF 'uint16_t thread_index;' "$EPH" && \
+   grep -qF 'uint8_t  leader;' "$EPH" && \
+   grep -qF 'uint64_t futex_uaddr;' "$EPH" && \
+   grep -qF 'uint32_t futex_val;' "$EPH" && \
+   grep -qF 'uint32_t futex_ticks;' "$EPH" && \
+   grep -qF '#define ENV_PAYLOAD_FORM_USER    2u' "$EPH" && \
+   grep -qF '#define ENV_PAYLOAD_FORM_FUTEX   4u' "$EPH"; then
+    ok "W1. the payload is v5: EnvPayloadTask carries the Linux task's FULL context (20-word TaskContext), its six argument registers, fs_base, both cursors, the heap and stack ranges, the image span, its group id/index/leader, and a FORM_FUTEX barrier key/value/remaining timeout; every page index entry is 16 bytes with a permission word including the soft PROT_NONE state"
 else
-    bad "W1. the Linux half of EnvPayloadTask or the permission-carrying page entry is gone — the capture could file pages a restore cannot map, and a v1-shaped blob would be misread entry by entry"
+    bad "W1. the Linux half, group identity or futex-wait half of EnvPayloadTask is gone — the capture could file pages a restore cannot map, two siblings would be indistinguishable, a barrier wait would have no key to re-enqueue, or an older stride would be misread task by task"
 fi
 if grep -qF 'static int ep_linux_page(const struct EnvCkptRecord* rec, uint32_t t,' "$EPC" && \
    grep -qF 'if (tk->stack_bottom && vaddr >= tk->stack_bottom &&' "$EPC" && \
-   grep -qF 'if (pd->linux_image_lo && vaddr >= pd->linux_image_lo &&' "$EPC" && \
-   grep -qF 'if (pd->linux_heap_base && vaddr >= pd->linux_heap_base &&' "$EPC" && \
+   grep -qF 'if (linux_group_image_lo(pd) && vaddr >= linux_group_image_lo(pd) &&' "$EPC" && \
+   grep -qF 'if (linux_group_heap_base(pd) && vaddr >= linux_group_heap_base(pd) &&' "$EPC" && \
    grep -qF 'return ep_in_image_window(vaddr) || ep_in_regions(rec, vaddr);' "$EPC" && \
    grep -qF 'if (!ep_task_page(rec, t, pds[t], v)) continue;' "$EPC" && \
    grep -qF 'static uint32_t ep_perm_of(uint64_t e)' "$EPC" && \
@@ -1220,23 +1270,27 @@ else
     bad "W2. the Linux page predicate or the per-page permission resolve is gone — the walk would either miss the tenant's bytes or capture the PARENT's cloned image pages under the child, and the blob would carry no permissions to check"
 fi
 if [ "$(awk '/^uint32_t env_payload_capture_all\(void\) \{/,/^\}/' "$EPC" | grep -c 'kind == ENV_CKPT_TASK_LINUX) continue')" -eq 0 ] && \
-   grep -qF 'struct ProcessDescriptor* pd = ep_find_proc(rec->tasks[t].name);' "$EPC" && \
+   grep -qF 'struct ProcessDescriptor* pd = ep_find_ckpt_task(&rec->tasks[t]);' "$EPC" && \
+   grep -qF 'static struct ProcessDescriptor* ep_find_group_member' "$EPC" && \
    grep -qF 'missing ? "named task has no live process" : "no tasks"' "$EPC"; then
-    ok "W3. the capture no longer skips the Linux task: every named task must resolve, and a checkpoint taken before the tenant is spawned skips the ENVIRONMENT by name instead of writing a third slot with no bytes"
+    ok "W3. the capture no longer skips the Linux task and resolves a group entry by (group id, thread index), so two siblings with the same name are distinct; every named task must resolve, and a checkpoint taken before the tenant is spawned skips the ENVIRONMENT by name"
 else
-    bad "W3. the capture still skips the Linux kind (or names a missing task without saying so) — a checkpoint of a live gate environment would silently omit its tenant while the record claims three tasks"
+    bad "W3. the capture still skips the Linux kind, or resolves group siblings by name (or names a missing task without saying so) — a checkpoint of a live gate environment would silently omit or overwrite a thread while the record claims it"
 fi
 if grep -qF 'case EP_REFUSE_PERM:' "$EPC" && \
    grep -qF 'case EP_REFUSE_FORM:' "$EPC" && \
    grep -qF 'if ((live_perm & EP_PAGE_PERM_MASK) !=' "$EPC" && \
    grep -qF 'ep_refuse(EP_REFUSE_PERM, t, pi);' "$EPC" && \
    grep -qF 'if (tk.form != ENV_PAYLOAD_FORM_USER &&' "$EPC" && \
-   grep -qF 'tk.form != ENV_PAYLOAD_FORM_ENTRY) {' "$EPC" && \
-   grep -qF 'pd->has_ring3_ctx  = 1;' "$EPC" && \
-   grep -qF 'pd->linux_mmap_top = tk.mmap_top;' "$EPC"; then
-    ok "W4. the restore proves the page's live permissions against the captured ones before a byte moves, resumes only the two resumable Linux forms (the pause's USER and increment 21's held ENTRY stop — PARKED and RUNNING refused by name, their queued/mid-compute state not being in the blob), and carries the captured ring3_ctx with its fs_base and both cursors"
+   grep -qF 'tk.form != ENV_PAYLOAD_FORM_ENTRY &&' "$EPC" && \
+   grep -qF 'tk.form != ENV_PAYLOAD_FORM_FUTEX) {' "$EPC" && \
+   grep -qF 'if (tk.form == ENV_PAYLOAD_FORM_FUTEX) {' "$EPC" && \
+   grep -qF 'linux_futex_wait_enqueue(fgid, tk.futex_uaddr, pd->tid,' "$EPC" && \
+   grep -qF 'pd->has_ring3_ctx = 1;' "$EPC" && \
+   grep -qF 'linux_group_set_mmap_top(pd, tk.mmap_top);' "$EPC"; then
+    ok "W4. the restore proves the page's live permissions against the captured ones before a byte moves, resumes the resumable Linux forms (USER and increment 21's held ENTRY), re-enqueues FORM_FUTEX with its expected word and relative deadline instead of resuming it, refuses PARKED/RUNNING by name, and carries the captured context, fs_base and both cursors onto the group"
 else
-    bad "W4. the restore's Linux arm is gone — a page could be poured into a map with different permissions, a parked task's stale context would be resumed, a non-held task could be poured over, or the task would restart at its entry"
+    bad "W4. the restore's Linux arm is gone — a page could be poured into a map with different permissions, a parked or futex wait's stale context would be resumed, a non-held task could be poured over, or the task would restart at its entry"
 fi
 if grep -qF 'pub const LINUX_TASK_NAME: &str = "e7.gate.user.0";' "$ENVP" && \
    grep -qF 'r.set_task(2, LINUX_TASK_NAME, TASK_LINUX);' "$IEM" && \
@@ -1255,12 +1309,38 @@ fi
 if grep -qF 'LINUX: the gate environment (sidecar + Linux tenant) captures as one payload' "$EPHUT" && \
    grep -qF 'LINUX: the full ring3_ctx — rip, rsp and the six argument registers — is the captured one' "$EPHUT" && \
    grep -qF 'PERM: a captured RX image page that is writable at the destination refuses the whole pour' "$EPHUT" && \
+   grep -qF 'GROUP: a sidecar plus a two-thread Linux group captures as one payload' "$EPHUT" && \
+   grep -qF 'BARRIER: both tasks carry the same address and expected word' "$EPHUT" && \
+   grep -qF 'BARRIER: both waits are re-enqueued before the group is released' "$EPHUT" && \
+   grep -qF 'BARRIER: both descriptors are BLOCKED in the futex resume form, not runnable' "$EPHUT" && \
+   grep -qF 'RELEASE: one call releases both held members of the restored group' "$EPHUT" && \
+   grep -qF 'BARRIER-REFUSE: a mixed futex/runnable group is refused by name before any pour' "$EPHUT" && \
+   grep -qF 'BARRIER-REFUSE: one barrier address with two expected words is refused before any pour' "$EPHUT" && \
+   grep -qF 'uint32_t linux_group_release_restored(uint32_t group_id);' "$LTHH" && \
+   grep -qF 'uint32_t linux_group_release_restored(uint32_t group_id) {' "$LTHC" && \
+   grep -qF 'linux_group_release_restored(' kernel/env_service.c && \
+   grep -qF 'GROUP: the leader is (group 101, index 0), owns the image/stack/heap pages' "$EPHUT" && \
+   grep -qF 'GROUP: the sibling is a distinct (group 101, index 1) with no duplicate shared pages' "$EPHUT" && \
+   grep -qF 'GROUP: both thread contexts are installed into their own descriptors' "$EPHUT" && \
+   grep -qF "GROUP: the leader's shared cursors are restored once, and the sibling does not overwrite them" "$EPHUT" && \
+   grep -qF "CHURN: the exiting clone's record entry is dropped by group/index" "$EPHUT" && \
+   grep -qF 'CHURN: a later capture still succeeds after the cloned thread exits' "$EPHUT" && \
+   grep -qF 'CHURN: the recaptured payload no longer names the dead group thread' "$EPHUT" && \
+   grep -qF 'env_ckpt_linux_group_thread_drop(' "$DISP" && \
+   grep -qF 'DUP: one vaddr twice with different bytes is refused by name, before any pour' "$EPHUT" && \
+   grep -qF 'DUP: the refusal names the first entry and the duplicate' "$EPHUT" && \
+   grep -qF 'V4: a v4 blob is refused by format before any pour (the v5 task stride is not its stride)' "$EPHUT" && \
+   grep -qF 'SOFT+USER: the restore refuses the contradictory permission before a byte moves' "$EPHUT" && \
+   grep -qF 'SOFT+WX: a writable+executable soft page is refused by format, not poured' "$EPHUT" && \
+   grep -qF 'SOFT+USER: the refusal names the permission rule (a=8), not a torn index CRC' "$EPHUT" && \
+   grep -qF 'SOFT+WX: the refusal names the permission rule (a=8), not a torn index CRC' "$EPHUT" && \
+   [ "$(grep -cF 'CHECK(env_payload_last_refusal().a == 8,' "$EPHUT")" -eq 2 ] && \
    grep -qF 'FORM: a parked Linux tenant is refused by name' "$EPHUT" && \
    grep -qF 'the stamp fills the Linux slot' "$ECKHUT" && \
    grep -qF 'a replay whose create names the same three tasks IS the same environment' "$ECKHUT"; then
-    ok "W6. both host tests drive the increment: the payload round trip (bytes, perms, context, the perm and form teeth) and the record layer's stamp/identity clauses — each claim runs against the real kernel file, not a model of it"
+    ok "W6. both host tests drive the increment: the payload round trip (bytes, perms, per-thread group contexts and shared-page ownership), the sibling-exit churn recapture, the futex barrier capture/re-enqueue/release, the duplicate-page refusal, the v4-stride refusal, the corrupt soft-permission refusals with both a=8 operand assertions, and the record layer's stamp/identity clauses — each claim runs against the real kernel file, not a model of it"
 else
-    bad "W6. a host-test clause for increment 20 is missing — the capture, the stamp or the identity comparison would be a claim no test runs"
+    bad "W6. a host-test clause for the Linux payload is missing — the group capture/restore or churn recapture, the futex barrier or coordinated release, the duplicate-page refusal, the v4-stride refusal, a corrupt soft-permission refusal or the record stamp would be a claim no test runs"
 fi
 
 # ─── X. E7 increment 25: munmap, the memory class's last seam ─────────────
@@ -1290,7 +1370,7 @@ fi
 munmap_v=$(grep -nF 'v = linux_mem_munmap_verdict(' kernel/syscall_dispatch.c | head -1 | cut -d: -f1)
 munmap_apply="$(sed -n "$((munmap_v - 3)),$((munmap_v + 70))p" kernel/syscall_dispatch.c)"
 if [ -n "$munmap_v" ] && \
-   grep -qF 'cur->linux_brk_cur' <<< "$munmap_apply" && \
+   grep -qF 'linux_group_brk(cur)' <<< "$munmap_apply" && \
    grep -qF 'linux_user_page_frame(' <<< "$munmap_apply" && \
    grep -qF 'user_unmap_page(pml4, va);' <<< "$munmap_apply" && \
    grep -qF 'user_invlpg(va);' <<< "$munmap_apply" && \
@@ -1333,6 +1413,798 @@ if grep -qF ' ok munmap addr=0x' user/sidecar/src/linux.rs && \
     ok "X6. the run's proof is on the lines: the granted range and its words, the refusal's EINVAL with the range, and the kernel's per-page free count — WHICH range and HOW MANY pages, not reconstructed from which arms ran"
 else
     bad "X6. a munmap instrument line is missing — the seam would run but the log would not name the range it freed (increment 14/15's rule)"
+fi
+
+# ─── Y. E7 §10.15: the soft-protected mprotect transition ─────────────────
+# The contract (Y), the first trap before any post (Y1), the reply's
+# all-pages prewalk and soft apply (Y2), the page-table helper and its owner
+# walk (Y3), the sidecar's 10 twin (Y4), the host tests (Y5), the probe's
+# disposable fault (Y6) and the two instrument lines (Y7): each is a claim
+# the transition rests on. The probe's fault is deliberate; the gate tenant
+# never runs it, so the gate's no-[FAULT] clause is unchanged.
+if grep -qF 'struct LinuxMprotectReq {' "$LABH" && \
+   grep -qF 'int linux_mem_mprotect_refusal(const struct LinuxMprotectReq *req,' "$LABH" && \
+   grep -qF 'struct LinuxMemMprotectVerdict' "$LABH" && \
+   grep -qF 'int linux_mem_mprotect_refusal(const struct LinuxMprotectReq *req,' "$LABC" && \
+   grep -qF 'linux_mem_mprotect_verdict(uint64_t image_lo, uint64_t image_hi,' "$LABC"; then
+    ok "Y. the §10.15 transition is a named pure contract at both ends — the staged request, the first-trap refusal over the task's own image/stack/heap windows, and the reply verdict that re-runs the ladder over the same words"
+else
+    bad "Y. the soft-mprotect contract is missing — the kernel would have no named refusal or verdict, and the transition would be a page-table edit with no policy"
+fi
+mprotect_ref=$(grep -nF 'mref = linux_mem_mprotect_refusal(&mreq,' "$DISP" | head -1 | cut -d: -f1)
+mprotect_first="$(sed -n "$((mprotect_ref - 3)),$((mprotect_ref + 30))p" "$DISP")"
+if [ -n "$mprotect_ref" ] && \
+   grep -qF 'refused before post' <<< "$mprotect_first" && \
+   grep -qF 'return (uint64_t)(int64_t)mref;' <<< "$mprotect_first" && \
+   grep -qF 'cur->mem_stage_a1    = largs[1];' <<< "$mprotect_first" && \
+   grep -qF 'cur->mem_stage_a2    = largs[2];' <<< "$mprotect_first"; then
+    ok "Y1. mprotect's first trap runs before any post: a refusal logs its words and returns its errno on the line, while a pass stages addr/len/prot for the reply's verdict"
+else
+    bad "Y1. the mprotect first trap is gone or no longer precedes the post — a malformed range would reach the channel, or a pass would lose the words the apply re-checks"
+fi
+mprotect_v=$(grep -nF 'v = linux_mem_mprotect_verdict(' "$DISP" | head -1 | cut -d: -f1)
+mprotect_apply="$(sed -n "$((mprotect_v - 3)),$((mprotect_v + 80))p" "$DISP")"
+if [ -n "$mprotect_v" ] && \
+   grep -qF 'linux_user_page_frame(' <<< "$mprotect_apply" && \
+   grep -qF 'user_protect_page(pml4, va,' <<< "$mprotect_apply" && \
+   grep -qF 'user_invlpg(va);' <<< "$mprotect_apply" && \
+   grep -qF 'USER_PTE_SOFT_NONE' <<< "$mprotect_apply" && \
+   grep -qF 'mreq.prot == LINUX_PROT_NONE' <<< "$mprotect_apply" && \
+   grep -qF 'soft-protected (P=1 U=0)' <<< "$mprotect_apply"; then
+    ok "Y2. the reply prewalks every page as a present owned leaf, preserves the frame, installs P|SOFT_NONE|NX (U=0, W=0) for PROT_NONE, invlpg's each change, and names the soft state on the line — no frame is allocated, freed or zeroed"
+else
+    bad "Y2. the soft apply is missing or no longer walks before changing a leaf — an absent page could be half-applied, a frame could be reowned, or the log would only say 'mprotect returned 0'"
+fi
+if grep -qF 'int user_protect_page(uint64_t* pml4, uint64_t vaddr, uint64_t flags);' "$UPH" && \
+   grep -qF 'int user_protect_page(uint64_t* pml4, uint64_t vaddr, uint64_t flags) {' "$UPC" && \
+   grep -qF 'USER_PTE_SOFT_NONE' "$UPH" && \
+   grep -qF 'if (!(e & (USER_PTE_USER | USER_PTE_SOFT_NONE))) return -1;' "$UPC" && \
+   grep -qF 'keep = e & (USER_PTE_FRAME_MASK' "$UPC" && \
+   grep -qF 'if (!(e & USER_PTE_USER) && !(e & USER_PTE_SOFT_NONE))' "$UPC"; then
+    ok "Y3. the page-table helper preserves the live frame/PWT/PCD/A-D/PAT bits, refuses a supervisor-only leaf but accepts a soft one, and the teardown walk still frees a soft leaf exactly once — the frame is never leaked by PROT_NONE"
+else
+    bad "Y3. the soft leaf's helper or teardown exception is gone — mprotect could edit a kernel mapping, or teardown could skip the present-but-U=0 frame and leak it"
+fi
+mprotect_arm=$(grep -nF '        10 => {' "$LRS" | head -1 | cut -d: -f1)
+mprotect_arm_body="$(sed -n "$((mprotect_arm + 1)),$((mprotect_arm + 20))p" "$LRS")"
+if [ -n "$mprotect_arm" ] && \
+   grep -qF 'prot & !0x7u64' <<< "$mprotect_arm_body" && \
+   grep -qF 'prot & 0x2 != 0 && prot & 0x4 != 0' <<< "$mprotect_arm_body" && \
+   grep -qF 'len.checked_add(0xFFF).is_none()' <<< "$mprotect_arm_body" && \
+   grep -qF 'Answer::Reply(0, STATUS_OK)' <<< "$mprotect_arm_body"; then
+    ok "Y4. the sidecar's 10 arm repeats the shape and W|X ladder as its own twin, grants a valid PROT_NONE without choosing an address or moving either MemBrk cursor, and leaves the page-table truth to the kernel"
+else
+    bad "Y4. the sidecar's mprotect arm is gone or no longer mirrors the ladder — a malformed prot could get a fake success, or the policy half would silently disappear"
+fi
+if grep -qF 'linux_mem_mprotect_refusal(&req' "$PHUT" && \
+   grep -qF 'linux_mem_mprotect_verdict(IMG_LO' "$PHUT" && \
+   grep -qF 'v.malformed == 0 && v.va == req.addr && v.pages == 2' "$PHUT" && \
+   grep -qF 'user_protect_page(child, phys,' "$HUMAP" && \
+   grep -qF 'teardown frees the soft leaf' "$HUMAP"; then
+    ok "Y5. the host tests drive both directions: the first-trap refusals and verdict on the personality side, and the frame-preserving soft/normal transitions plus the exactly-once teardown on a fake page table"
+else
+    bad "Y5. a host test no longer drives the transition — every branch above would be reachable only at boot (t83/t117's rule)"
+fi
+if grep -qF 'E7MEM-SOFT-OK' "$FIX" && \
+   grep -qF '.Lsoft:' "$FIX" && \
+   grep -qF 'mov     $10, %eax' "$FIX" && \
+   grep -qF 'lea     0x1000(%r12), %r13' "$FIX" && \
+   grep -qF 'mov     (%r13), %rax' "$FIX" && \
+   grep -qF 'mov     $405, %eax' "$FIX" && \
+   grep -qF 'mov     $406, %eax' "$FIX" && \
+   grep -qF 'jmp     .Lsoft' "$FIX"; then
+    ok "Y6. the probe carries the disposable live case: on its success path it mprotects the second brk page PROT_NONE, writes E7MEM-SOFT-OK through the fd seam, then reads the page and must fault; MARKER 405 (refused) and 406 (read succeeded) are asserted absent"
+else
+    bad "Y6. the probe's soft case is gone or gutted — the boot would prove nothing about the U/S clear, and a regression would read as a quiet run"
+fi
+if grep -qF 'soft-protected (P=1 U=0)' "$DISP" && \
+   grep -qF '[FAULT] Ring-3 #PF  error=0x%lx  addr=0x%016lx' "$STUB"; then
+    ok "Y7. the live evidence has two named lines: the kernel says how many pages it soft-protected, and the Ring-3 #PF line names the faulting address — the transcript can pair them instead of inferring a fault from the task's absence"
+else
+    bad "Y7. one of the two live instrument lines is gone — the boot would not distinguish a real soft fault from a task that simply exited"
+fi
+
+# ─── Z. E7 TG-1 I2: the kernel-local clone (the Go thread shape) ───────────
+# Clone is the first operation that can create a second descriptor in a live
+# group. The source half has three independently wrong shapes: accepting a
+# flag subset whose semantics the group cannot honor, synthesizing a child
+# context that starts somewhere other than the parent's return RIP, and
+# creating a descriptor that quietly owns a private page table or never joins
+# the group. The host test drives the first two; these clauses hold the trap
+# path and the process-table integration the host cannot reach.
+LCHUT=tests/linux_clone_host_test.c
+if grep -qE '#define LINUX_CLONE_VM[[:space:]]+0x00000100ull' "$LTHH" && \
+   grep -qE '#define LINUX_CLONE_FS[[:space:]]+0x00000200ull' "$LTHH" && \
+   grep -qE '#define LINUX_CLONE_FILES[[:space:]]+0x00000400ull' "$LTHH" && \
+   grep -qE '#define LINUX_CLONE_SIGHAND[[:space:]]+0x00000800ull' "$LTHH" && \
+   grep -qE '#define LINUX_CLONE_SYSVSEM[[:space:]]+0x00040000ull' "$LTHH" && \
+   grep -qE '#define LINUX_CLONE_THREAD[[:space:]]+0x00010000ull' "$LTHH" && \
+   grep -qE '#define LINUX_CLONE_SETTLS[[:space:]]+0x00080000ull' "$LTHH" && \
+   grep -qE '#define LINUX_CLONE_CHILD_CLEARTID[[:space:]]+0x00200000ull' "$LTHH" && \
+   grep -qF '#define LINUX_CLONE_GO_FLAGS (LINUX_CLONE_VM | LINUX_CLONE_FS |' "$LTHH" && \
+   grep -qF '#define LINUX_CLONE_ALLOWED  (LINUX_CLONE_GO_FLAGS | LINUX_CLONE_SETTLS | \' "$LTHH" && \
+   grep -qF '                              LINUX_CLONE_CHILD_CLEARTID)' "$LTHH" && \
+   grep -qF 'int linux_clone_plan(' "$LTHH" && \
+   grep -qF 'int linux_clone_plan(' "$LTHC" && \
+   grep -qF 'flags & ~LINUX_CLONE_ALLOWED' "$LTHC" && \
+   grep -qF '(flags & LINUX_CLONE_GO_FLAGS) != LINUX_CLONE_GO_FLAGS' "$LTHC" && \
+   grep -qF 'child_stack == 0 || !linux_fs_addr_is_user_canonical(child_stack)' "$LTHC" && \
+   grep -qF 'out->fs_base = tls;' "$LTHC" && \
+   grep -qF 'out->fs_base = parent_fs_base;' "$LTHC"; then
+    ok "Z1. the clone planner accepts exactly the Go shape plus its two optional promises — six mandatory shared flags, SETTLS and (since I5) CLONE_CHILD_CLEARTID, each with its own validation — refuses every outside bit with EINVAL, rejects a zero/non-canonical stack, TLS or clear-TID word, and selects the child's fs_base from TLS or the parent's live base"
+else
+    bad "Z1. a clone flag or the pure planner is gone — a subset would be accepted as a thread while the group still shares what the omitted flag made private, or a non-canonical child stack/TLS would reach the ring-3 context"
+fi
+if grep -qF 'void linux_clone_build_context(' "$LTHH" && \
+   grep -qF 'void linux_clone_build_context(' "$LTHC" && \
+   grep -qF 'for (int i = 0; i < 20; i++) w[i] = 0;' "$LTHC" && \
+   grep -qF 'ctx->rsi   = child_stack;' "$LTHC" && \
+   grep -qF 'ctx->rax   = 0;' "$LTHC" && \
+   grep -qF 'ctx->rip   = parent_rip;' "$LTHC" && \
+   grep -qF 'ctx->rsp   = child_stack;' "$LTHC" && \
+   grep -qF 'ctx->cs    = 0x23;' "$LTHC" && \
+   grep -qF 'ctx->ss    = 0x1B;' "$LTHC" && \
+   grep -qF 'int proc_read_linux_return_rip(uint64_t* out)' "$PDC" && \
+   grep -qF 'proc_read_linux_return_rip(&parent_rip)' "$DISP"; then
+    ok "Z2. the child context is a full 20-word synthesis: every GPR cleared except rsi=child stack, rax=0, rip=the caller's captured return RIP, rsp=child stack, CS/SS=0x23/0x1B, IF on — and the dispatcher feeds it the gs:0x18 return RIP rather than a stale user_rip field"
+else
+    bad "Z2. the child context builder, the return-RIP capture or one of its registers is gone — the child could start at _start/a stale entry, sysret with a parent register, or iretq with a kernel selector"
+fi
+clone_line=$(grep -n 'if (num == LINUX_CLONE) {' "$DISP" | head -1 | cut -d: -f1)
+desc_line=$(grep -n 'linux_syscall_describe(&req' "$DISP" | head -1 | cut -d: -f1)
+clone_branch="$(sed -n "${clone_line},${desc_line}p" "$DISP")"
+if grep -qE '#define LINUX_CLONE[[:space:]]+56u' "$LABH" && \
+   grep -qF 'LSC_THREAD' "$LABH" && \
+   grep -qF '{  56, LSC_THREAD' "$LABC" && \
+   grep -qF 'case LSC_THREAD: return "thread";' "$LABC" && \
+   [ -n "$clone_line" ] && [ -n "$desc_line" ] && \
+   [ "$clone_line" -lt "$desc_line" ] && \
+   grep -qF 'linux_clone_thread(cur, &cplan, parent_rip,' <<< "$clone_branch" && \
+   grep -qF 'return (uint64_t)child_tid;' <<< "$clone_branch"; then
+    ok "Z3. clone (56) is a real LSC_THREAD table row, and the first-trap branch runs BEFORE describe/post/park: it plans, calls linux_clone_thread, and returns the child TID directly — no sidecar request for a thread"
+else
+    bad "Z3. the clone row/class or its kernel-local first-trap branch is gone or moved behind the forward describe — clone would be posted to a sidecar that has no row for it, or never dispatched at all"
+fi
+clone_start=$(grep -n 'int linux_clone_thread(' "$PDC" | head -1 | cut -d: -f1)
+clone_end=$(grep -n '^// ─── process_exit' "$PDC" | head -1 | cut -d: -f1)
+clone_body="$(sed -n "${clone_start},${clone_end}p" "$PDC")"
+if [ -n "$clone_start" ] && [ -n "$clone_end" ] && \
+   grep -qF 'child->cr3          = g->cr3;' <<< "$clone_body" && \
+   grep -qF 'child->fs_base      = plan->fs_base;' <<< "$clone_body" && \
+   grep -qF 'alloc_proc_syscall_stack(parent->partition_id)' <<< "$clone_body" && \
+   grep -qF 'linux_group_join_thread(g, child)' <<< "$clone_body" && \
+   grep -qF 'child->has_ring3_ctx = 1;' <<< "$clone_body" && \
+   grep -qF 'child->state         = PROC_SUSPENDED;' <<< "$clone_body" && \
+   grep -qF 'return -LINUX_EAGAIN;' <<< "$clone_body" && \
+   ! grep -qF 'user_clone_page_table' <<< "$clone_body" && \
+   grep -qF 'int linux_group_join_thread(' "$LTHH" && \
+   grep -qF 'int linux_group_join_thread(' "$LTHC" && \
+   grep -qF 'child->group_index != LINUX_GROUP_NONE' "$LTHC" && \
+   grep -qF 'child->tgid = g->group_id;' "$LTHC" && \
+   grep -qF 'child->is_group_leader = 0;' "$LTHC"; then
+    ok "Z4. the process-table half creates no private page table: it shares g->cr3, stamps the planned fs_base, allocates a fresh syscall stack, joins the group as a non-leader (tid/tgid/index), and only then becomes a SUSPENDED ring3 context; cap/resource exhaustion is EAGAIN"
+else
+    bad "Z4. the integration or group-join half is gone — the child could free/clone the shared root, keep a stale fs_base/slot state, run before it is a group member, or exceed LINUX_THREADS_MAX without EAGAIN"
+fi
+if grep -qF 'linux_clone_plan(GO' "$LCHUT" && \
+   grep -qF 'linux_clone_plan(GO & ~required[i]' "$LCHUT" && \
+   grep -qF 'linux_clone_build_context(&c, 0x0000000000401234ull, STACK)' "$LCHUT" && \
+   grep -qF 'linux_group_join_thread(g, &proc_table[1])' "$LCHUT" && \
+   grep -qF 'linux_group_join_thread(g, &proc_table[LINUX_THREADS_MAX])' "$LCHUT"; then
+    ok "Z5. the host test drives all three contracts: the exact Go mask and every missing mandatory flag, the 20-word context with rax/rsi/rsp/rip, and group join/double-join/cap refusal"
+else
+    bad "Z5. the clone host test no longer exercises a branch above — the planner, context or group join would be argued from these greps alone, reachable only at boot"
+fi
+
+# ─── Z6. TG-1 I5: the thread-exit glue ─────────────────────────────────────
+# Every half of the promise has one owner and one place it is spelled, and the
+# live half is a marker only the JOINER can write after reading the words
+# back. A mutation of the owner check, either clear, either wake, the 273 row
+# or its census reddens this clause by name (tooth t160).
+if grep -qF '#define LINUX_CLONE_CHILD_CLEARTID 0x00200000ull' kernel/linux_thread.h && \
+   grep -qF 'LINUX_CLONE_CHILD_CLEARTID)' kernel/linux_thread.h && \
+   grep -qF 'int linux_ctid_ok(uint64_t word);' kernel/linux_thread.h && \
+   grep -qF 'uint32_t linux_robust_died_word(uint32_t word, uint32_t tid);' kernel/linux_thread.h && \
+   grep -qF 'int linux_robust_word_addr(uint64_t entry, int64_t futex_offset,' kernel/linux_thread.h && \
+   grep -qF 'if (!linux_ctid_ok(ctid)) return -LINUX_EINVAL;' "$LTHC" && \
+   grep -qF 'out->ctid = ctid;' "$LTHC" && \
+   grep -qF 'if ((word & LINUX_FUTEX_TID_MASK) != (tid & LINUX_FUTEX_TID_MASK)) return 0;' "$LTHC" && \
+   grep -qF 'return (word & ~LINUX_FUTEX_TID_MASK) | LINUX_FUTEX_OWNER_DIED |' "$LTHC" && \
+   grep -qF 'if (back > entry) return -LINUX_EINVAL;' "$LTHC" && \
+   grep -qF 'linux_thread_exit_glue(pd);' "$PDC" && \
+   grep -qF 'linux_user_copy_in(zero, pd->cr3, ctid, 4)' "$PDC" && \
+   grep -qF 'linux_futex_wake_threads(gid, ctid, 1);' "$PDC" && \
+   grep -qF '(void)linux_futex_wake_threads(gid, waddr, 1);' "$PDC" && \
+   grep -qF 'walked < LINUX_ROBUST_LIST_LIMIT' "$PDC" && \
+   grep -qF 'child->linux_clear_tid = plan->ctid;' "$PDC" && \
+   grep -qF 'pd->linux_clear_tid  = 0;' "$PDC" && \
+   grep -qF 'if (num == LINUX_SET_ROBUST_LIST) {' "$DISP" && \
+   grep -qF 'cur->linux_robust_list = largs[0];' "$DISP" && \
+   grep -qF 'cur->linux_clear_tid =' "$DISP" && \
+   grep -qF '{ 273, LSC_THREAD, 0 }' "$LABC" && \
+   grep -qE '^273 set_robust_list [1-9][0-9]*$' tools/linux_robust_list_census.txt && \
+   grep -qF 'sha256:' tools/linux_robust_list_census.txt && \
+   grep -qF 'tools/linux_robust_list_census.txt' "$LABC" && \
+   grep -qF 'linux_robust_died_word(T, T) ==' "$LCHUT" && \
+   grep -qF 'linux_robust_list_ok(CTID, LINUX_ROBUST_LIST_HEAD_BYTES) == 1' "$LCHUT" && \
+   grep -qF 'a non-canonical CLEARTID word is refused BEFORE the child exists' "$LCHUT" && \
+   grep -qF 'mov     $273, %eax' user/sidecar/fixtures/e7_thread_probe.S && \
+   grep -qF 'mov     $0x002D0F00, %edi' user/sidecar/fixtures/e7_thread_probe.S && \
+   grep -qF 'E7TG-CTID-OK' tests/linux_thread_probe_check.sh && \
+   grep -qF 'E7TG-ROBUST-OK' tests/linux_thread_probe_check.sh && \
+   grep -qF 'walked 1 entries, released [1-9]' tests/linux_thread_probe_check.sh; then
+    ok "Z6. the thread-exit glue is one promise with one owner per half: clone validates the CLEARTID word before the child exists and set_robust_list takes exactly the 24-byte canonical head (273's row exists because tools/linux_robust_list_census.txt measured glibc's start-up call and a program's own), the exit writes 0 through the validated copy and wakes that futex, the robust walk is bounded, checks OWNER with the mask, leaves OWNER_DIED|tid and wakes each released word, the per-thread words are re-stamped at slot reuse, and the live arm proves it from the joiner's side (E7TG-CTID-OK / E7TG-ROBUST-OK plus the kernel's clear-TID and walked-and-released lines)"
+else
+    bad "Z6. the exit glue lost a half: a clear that skips the validated copy is a ring-0 fault from a task's own address, a wake without a clear resumes a joiner into a tid that never went away, a robust walk without the owner check marks a live sibling's mutex dead, an unbounded walk follows a forged list, or a row without its census is a table entry built from belief"
+fi
+
+# ─── Z7. I5b: the glue runs on EVERY dying Linux thread ────────────────────
+# Linux clears in do_exit on every path, so the hook is pinned by SITE: one
+# call inside linux_descriptor_release (exit(60) and the deferred-kill sweep)
+# and one inside linux_group_release_all (exit_group, a kill, a fault — every
+# member, while the group's root is still alive), and NOTHING in
+# linux_thread_exit itself, which is what left the fault and exit_group paths
+# without a clear before this clause existed. The consumption rule is what
+# lets both sites run: the second is a no-op, which the host test drives.
+relsec="$(sed -n '/^static int linux_descriptor_release/,/^}/p' "$PDC" 2>/dev/null)"
+allsec="$(sed -n '/^static void linux_group_release_all/,/^}/p' "$PDC" 2>/dev/null)"
+texitsec="$(sed -n '/^void linux_thread_exit(/,/^}/p' "$PDC" 2>/dev/null)"
+z7_glue="$(grep -n 'linux_thread_exit_glue(pd);' <<< "$relsec" | head -1 | cut -d: -f1)"
+z7_exitsec="$(sed -n '/^void process_exit(/,/^}/p' "$PDC" 2>/dev/null)"
+z7_eglue="$(grep -n 'linux_thread_exit_glue(pd);' <<< "$z7_exitsec" | head -1 | cut -d: -f1)"
+z7_eclear="$(grep -n 'proc_clear_resume_state(pd);' <<< "$z7_exitsec" | head -1 | cut -d: -f1)"
+z7_clear="$(grep -n 'proc_clear_resume_state(pd);' <<< "$relsec" | head -1 | cut -d: -f1)"
+if [ -n "$relsec" ] && [ -n "$allsec" ] && [ -n "$texitsec" ] && \
+   [ "$(grep -c 'linux_thread_exit_glue(pd);' "$PDC")" -eq 3 ] && \
+   grep -qF 'linux_thread_exit_glue(pd);' <<< "$allsec" && \
+   [ -n "$z7_glue" ] && [ -n "$z7_clear" ] && [ "$z7_glue" -lt "$z7_clear" ] && \
+   [ -n "$z7_eglue" ] && [ -n "$z7_eclear" ] && [ "$z7_eglue" -lt "$z7_eclear" ] && \
+   ! grep -qF 'linux_thread_exit_glue(pd);' <<< "$texitsec" && \
+   grep -qF 'int linux_thread_take_exit_words(struct ProcessDescriptor* pd, uint64_t* ctid,' kernel/linux_thread.h && \
+   grep -qF 'pd->linux_clear_tid   = 0;' "$LTHC" && \
+   grep -qF 'return (c != 0 || r != 0) ? 1 : 0;' "$LTHC" && \
+   grep -qF 'if (!linux_thread_take_exit_words(pd, &ctid, &head)) return;' "$PDC" && \
+   grep -qF 'linux_thread_take_exit_words(&d, &ctid, &robust) == 1' "$LCHUT" && \
+   grep -qF 'the SECOND call takes nothing' "$LCHUT" && \
+   grep -qF 'E7TG-CTID-OK' tests/linux_thread_probe_check.sh; then
+    ok "Z7. every dying Linux thread runs the glue: the call sits in linux_descriptor_release (exit(60) and the deferred sweep, before proc_clear_resume_state zeroes the words it is honouring), in the fault handler's process_exit (same rule: before the clear that would drop them), and in linux_group_release_all (exit_group, a kill, a fault — every member, while the group's root is still alive), and nowhere else, so a faulted or group-exited thread clears its TID word and releases its robust list instead of leaving a joiner parked forever; linux_thread_take_exit_words makes the two sites safe to overlap (the second takes nothing), which the host test drives, and the exit(60) live arm still proves the clear end to end"
+else
+    bad "Z7. the clear is conditional again: with the hook only on a thread's own exit, a thread that faults or exits with its group never clears its TID word — the joiner hangs on a tid that never went away, and the robust mutex it held stays owned by a dead thread. A missing consumption rule turns the overlap of the two funnels into a second clear under a joiner."
+fi
+
+# ─── Z8. I5b (live): the fault and exit_group paths WAKE their joiner ─────
+# Z7 pins where the glue is called; this pins that those call sites can wake
+# anyone at all. Inside linux_group_release_all the per-member glue loop must
+# run BEFORE forget_group — a forgotten waiter cannot be woken, so forget-first
+# would clear the word and find nobody, which is the exit(60)-only defect with
+# extra steps — and before the release pass, so no descriptor is released with
+# a live waiter. The clear line must carry the wake COUNT, because a boot can
+# only tell n=0 from n=1 if the line says it. The live arm reads exactly that:
+# two fixtures spawned through the real create path, each with a sibling
+# parked on the dying thread's TID word, one dying by Ring-3 #PF and one going
+# down with exit_group.
+EZFI=user/sidecar/fixtures/e7_thread_fault_probe.S
+EZGI=user/sidecar/fixtures/e7_thread_groupexit_probe.S
+EZMOD=user/sidecar/src/e7_thread_death.rs
+EZCHK=tests/linux_thread_death_check.sh
+z8_glue="$(grep -n 'linux_thread_exit_glue(pd);' <<< "$allsec" | head -1 | cut -d: -f1)"
+z8_forget="$(grep -n 'linux_futex_forget_group(g->group_id);' <<< "$allsec" | head -1 | cut -d: -f1)"
+z8_release="$(grep -n 'linux_stack_maybe_report(pd, "exit");' <<< "$allsec" | head -1 | cut -d: -f1)"
+if [ -n "$allsec" ] && [ -n "$z8_glue" ] && [ -n "$z8_forget" ] && \
+   [ -n "$z8_release" ] && \
+   [ "$z8_glue" -lt "$z8_forget" ] && [ "$z8_forget" -lt "$z8_release" ] && \
+   grep -qF 'uint32_t woken = 0;' "$PDC" && \
+   grep -qF 'woken = (uint32_t)linux_futex_wake_threads(gid, ctid, 1);' "$PDC" && \
+   grep -qF 'cleared, joiner woken ' "$PDC" && grep -qF '(n=%u)' "$PDC" && \
+   [ -s "$EZFI" ] && [ -s "$EZGI" ] && \
+   grep -qF 'E7TD-FAULT-ARM' "$EZFI" && \
+   grep -qF 'E7TD-GROUP-ARM' "$EZGI" && \
+   grep -qF 'PROT_NONE' "$EZFI" && grep -qF '$231' "$EZGI" && \
+   grep -qF 'pub mod e7_thread_death;' user/sidecar/src/lib.rs && \
+   grep -qF 'crate::e7_thread_death::spawn_fault' user/sidecar/src/entry.rs && \
+   grep -qF 'crate::e7_thread_death::spawn_group' user/sidecar/src/entry.rs && \
+   grep -qF 'spawn_one(k, budget_base, budget_len, FAULT, FAULT_NAME)' "$EZMOD" && \
+   grep -qF 'joiner woken \(n=[1-9]' "$EZCHK" && \
+   grep -qF 'exit_group arm' "$EZCHK"; then
+    ok "Z8. the two deaths exit(60) never covered now wake their parked joiner end to end: linux_group_release_all runs every member's glue BEFORE forget_group and before the release pass, so the clear's futex wake finds the parked sibling instead of nobody (the clear line reports the count, n>=1, so a boot can tell a real wake from a silent one), and the sidecar spawns both arms through the real create path — e7_thread_fault_probe dies of a Ring-3 #PF on a PROT_NONE page with a joiner parked on its TID word, e7_thread_groupexit_probe takes the group down with exit_group (231) in the same state — with tests/linux_thread_death_check.sh reading the kernel's clear, wake, robust-walk and group-teardown lines for both"
+else
+    bad "Z8. the new call sites cannot wake anyone: if linux_group_release_all forgets the group's waiters before the glue loop, or releases members first, the clear finds no joiner and a faulted or group-exited thread still leaves it parked — the I5 defect the move was made to fix. If the clear line does not report the wake count, the live arm cannot tell that apart from a real wake."
+fi
+
+# ─── AA. E7 increment 31 (P1-C): the FAULT's own delivery ──────────────────
+# A ring-3 #PF has no syscall behind it, so the sidecar — the authority for
+# every disposition — cannot be asked before the thread must either run a
+# handler or die. The kernel's answer is a copy of the four fault signals'
+# acts, recorded where the bytes already cross, and a frame built by the SAME
+# builder every other delivery uses. Five claims, each a way this could be
+# silently wrong: the acts are recorded in the sidecar's own word order (AA1),
+# CR2 is captured where the fault is (AA2), the stub's saved frame and the C
+# struct are ONE shape (AA3), the action is recorded at the first trap and the
+# plan decides (AA4), and a handler is a delivery while no handler is still
+# the attributed kill — with a live arm that can tell those two apart (AA5).
+# The single-letter space is full (A–Z), so this is the first `AA` clause.
+STUBS=kernel/stubs.c
+FSHUT=tests/linux_fault_sig_host_test.c
+FSCHK=tests/linux_fault_sig_check.sh
+FSFIX=user/sidecar/fixtures/e7_fault_handler_probe.S
+FSMOD=user/sidecar/src/e7_thread_death.rs
+FSASM=arch/x86/interrupt.asm
+fs_cap="$(grep -n 'fcur->linux_cr2 = faulting_address;' "$STUBS" 2>/dev/null | head -1 | cut -d: -f1)"
+fs_plan="$(grep -n 'linux_fault_sig_plan(&fcur->linux_fault_act\[fi\],' "$STUBS" 2>/dev/null | head -1 | cut -d: -f1)"
+fs_copy="$(grep -n 'linux_user_copy_in(frame, fcur->cr3,' "$STUBS" 2>/dev/null | head -1 | cut -d: -f1)"
+fs_ret="$(grep -n '(not a kill)' "$STUBS" 2>/dev/null | head -1 | cut -d: -f1)"
+fs_kill="$(grep -n '\[FAULT\] Ring-3 #PF' "$STUBS" 2>/dev/null | head -1 | cut -d: -f1)"
+if grep -qF 'struct LinuxFaultAct {' "$LABH" && \
+   grep -qF '#define LINUX_FAULT_SIG_COUNT 4u' "$LABH" && \
+   grep -qF 'int linux_fault_sig_plan(const struct LinuxFaultAct *act, uint64_t blocked,' "$LABH" && \
+   grep -qF 'slots[i].mask     = sig_get64(act + 16);' "$LABC" && \
+   grep -qF 'slots[i].restorer = sig_get64(act + 24);' "$LABC" && \
+   grep -qE 'slots\[3\]\.mask +== 0xCCCC0000ull' "$FSHUT" && \
+   grep -qF 'slots[3].restorer == 0xBBBB0000ull' "$FSHUT" && \
+   grep -qF 'uint64_t   linux_cr2;' "$PDH" && \
+   grep -qF 'struct LinuxFaultAct linux_fault_act[LINUX_FAULT_SIG_COUNT];' "$PDH" && \
+   grep -qF 'pd->linux_fault_act[fi].handler  = 0;' "$PDC" && \
+   [ -n "$fs_cap" ] && \
+   grep -qF 'if (num == LINUX_RT_SIGACTION && largs[1] != 0) {' "$DISP" && \
+   grep -qF 'linux_fault_act_record(cur->linux_fault_act,' "$DISP" && \
+   grep -qF 'linux_sig_delivery_needed(blocked, signo, act->handler)' "$LABC" && \
+   grep -qF 'linux_sig_si_addr(signo, cr2,' "$LABC" && \
+   grep -qF 'linux_sig_frame_build(frame, LINUX_SIGFRAME_SIZE, &spec,' "$LABC" && \
+   grep -qF 'uint64_t r15, r14, r13, r12, r11, r10, r9, r8;' "$STUBS" && \
+   grep -qF 'uint64_t rdi, rsi, rbx, rdx, rcx, rax;' "$STUBS" && \
+   grep -qF 'push r15' "$FSASM" && grep -qF 'pop  r15' "$FSASM" && \
+   grep -qF 'mov  r8,  rbp' "$FSASM" && grep -qF 'mov  rcx, [rsp + 64]' "$FSASM" && \
+   grep -qF 'process_exit(139);' "$STUBS" && \
+   [ -n "$fs_plan" ] && [ -n "$fs_copy" ] && [ -n "$fs_ret" ] && [ -n "$fs_kill" ] && \
+   [ "$fs_cap" -lt "$fs_plan" ] && [ "$fs_plan" -lt "$fs_copy" ] && \
+   [ "$fs_copy" -lt "$fs_ret" ] && [ "$fs_ret" -lt "$fs_kill" ] && \
+   grep -qF 'si_addr is CR2' "$FSHUT" && \
+   grep -qF 'SIG_DFL asks for no frame' "$FSHUT" && \
+   [ -s "$FSFIX" ] && [ -s user/sidecar/fixtures/e7_fault_handler_probe.flat ] && \
+   grep -qF 'E7FH-OK' "$FSFIX" && grep -qF 'cmp     %r13, %rax' "$FSFIX" && \
+   grep -qF 'SA_SIGINFO' "$FSFIX" && \
+   grep -qF 'spawn_fault_handler' "$FSMOD" && \
+   grep -qF 'crate::e7_thread_death::spawn_fault_handler' "$LRE" && \
+   grep -qF 'pub mod e7_thread_death;' user/sidecar/src/lib.rs && \
+   [ -s "$FSCHK" ] && grep -qF 'E7FH-OK' "$FSCHK" && \
+   grep -qF 'the handlerless arm still died by the attributed Ring-3 #PF kill' "$FSCHK"; then
+    ok "AA. a Ring-3 #PF with a handler installed is a DELIVERY: the kernel keeps the four fault signals' acts (recorded at rt_sigaction's first trap, in the same word order the sidecar reads — mask at 16, restorer at 24, asserted by the host test), the fault captures CR2 into the descriptor BEFORE it decides, the decision is linux_sig_fault_plan's (SIG_DFL/SIG_IGN/blocked/no-restorer = no frame) and the frame is the same builder every other delivery uses; a delivery copies the frame through the validated walker, rewrites the trap frame and returns 1, so the stub's pop/iretq IS the jump into the handler — while the attributed kill (process_exit 139) is still reachable below it and [FAULT] is printed only on that path. isr14_stub saves all 15 GPRs in the SAME field order the C struct reads, the slot reset clears the acts so a reused descriptor cannot run its predecessor's handler, the host test pins si_addr to CR2 and the interrupted registers, and the live arm proves both answers on one boot: the handlerless fault still dies, the handled one writes E7FH-OK only when si_addr equals the page it mapped"
+else
+    bad "AA. the fault's delivery is not wired: without the act copy the kernel cannot know a handler was installed and a #PF keeps killing threads that asked to survive it; without the CR2 capture a SIGSEGV handler is told the fault happened at NULL; a stub that saves fewer registers gives the handler a frame full of the wrong context; a plan that ran AFTER the kill line would leave the two answers indistinguishable in the log; and a live arm that cannot show the handlerless kill on the same boot cannot tell 'delivery works' from 'nothing faults any more'."
+fi
+
+# ─── AB. E7 increment 32 (P1-C): a FAULT handler's return ────────────────
+# Increment 31 enters a handler from the trap, and nothing could come back:
+# the sidecar never saw that delivery, so its rt_sigreturn arm answers EINVAL
+# ("no handler was entered") — correct for its own bookkeeping and the last
+# word on a return the kernel owes. AB pins the kernel's own gate to exactly
+# that case and nothing wider: an installed frame, entered from the TRAP, in
+# answer to a refusal (never a consent or a -EPROTO), and only when the errno
+# the task would have heard is -EINVAL — so the "15 with no handler" refusal
+# the sigret probe asserts is untouched, and a different refusal still
+# reaches the task by name.
+#
+# The other half is WHERE the frame is: the trap never passes through
+# park_ctx, so the frame's address is recorded at delivery and read back by
+# the return. A return that read park_ctx would restore whatever the task's
+# last park left there.
+if grep -qF 'int linux_sig_fault_return_ok(int sig_active, int fault_active, uint64_t rax,' "$LABH" && \
+   grep -qF 'int linux_sig_fault_return_ok(int sig_active, int fault_active, uint64_t rax,' "$LABC" && \
+   grep -qF 'if (!fault_active) return 0;' "$LABC" && \
+   grep -A 6 'int linux_sig_fault_return_ok' "$LABC" | grep -qF 'return rax == (uint64_t)(int64_t)(-LINUX_EINVAL);' && \
+   grep -qF 'fcur->linux_sig_fault_active = 1;' "$STUB" && \
+   grep -qF 'fcur->linux_sig_frame_rsp = entry.r[LINUX_SIGREG_RSP];' "$STUB" && \
+   grep -qF 'pd->linux_sig_frame_rsp = entry.r[LINUX_SIGREG_RSP];' "$PDC" && \
+   grep -qF 'linux_user_copy_out(frame, pd->cr3, pd->linux_sig_frame_rsp,' "$PDC" && \
+   grep -qF 'pd->linux_sig_fault_active = 0;' "$PDC" && \
+   grep -qF 'linux_sig_frame_rsp   = 0;' "$PDC" && \
+   grep -qF 'linux_sig_frame_rsp;' "$PDH" && \
+   grep -qF 'linux_sig_fault_active;' "$PDH" && \
+   [ -n "$(grep -nF 'linux_sig_fault_return_ok(' kernel/chan.c | head -1 | cut -d: -f1)" ] && \
+   [ "$(grep -nF 'linux_sig_fault_return_ok(' kernel/chan.c | head -1 | cut -d: -f1)" -lt \
+     "$(grep -nF 'if (!linux_sig_return_reply_ok(expect_num, rax,' kernel/chan.c | head -1 | cut -d: -f1)" ] && \
+   grep -A 6 'linux_sig_fault_return_ok(' kernel/chan.c | grep -qF 'linux_sig_return_apply(pd)' && \
+   grep -qF 'linux_sig_fault_return_ok(1, 1, inval, -1) == 1' tests/linux_fault_return_host_test.c && \
+   grep -qF 'linux_sig_fault_return_ok(1, 0, inval, -1) == 0' tests/linux_fault_return_host_test.c && \
+   grep -qF 'linux_sig_fault_return_ok(0, 1, inval, -1) == 0' tests/linux_fault_return_host_test.c && \
+   grep -qF 'linux_sig_fault_return_ok(1, 1, enosys, -1) == 0' tests/linux_fault_return_host_test.c && \
+   grep -qF 'mov     %rax, 80(%rdx)' user/sidecar/fixtures/e7_fault_return_probe.S && \
+   grep -qE '^    ret .*Lrestorer' user/sidecar/fixtures/e7_fault_return_probe.S && \
+   grep -qF 'E7FR-LOOP' user/sidecar/fixtures/e7_fault_return_probe.S && \
+   ! grep -qF 'E7FR' user/sidecar/fixtures/e7_fault_handler_probe.S && \
+   grep -qF 'pub fn spawn_fault_return<' user/sidecar/src/e7_thread_death.rs && \
+   grep -qF 'crate::e7_thread_death::spawn_fault_return' "$LRE"; then
+    ok "AB. a fault-delivered handler can RETURN: rt_sigreturn's sidecar half refuses it (it entered nothing, moved no mask), and the kernel takes exactly that one return — linux_sig_fault_return_ok requires an installed frame, a TRAP delivery, a refusal (never status 0 or -EPROTO) and the exact -EINVAL the task would have heard, so the no-handler refusal still reaches the task and a different errno is never swallowed. The frame's ADDRESS is recorded at delivery (park_ctx is not on the fault path) and read back by the return, the resume installs the restored context, and the live arm proves the whole trip: its handler rewrites the interrupted r13 through its own ucontext (80(%rdx) — the host test pins that offset to the frame's sigcontext) and RETURNS through the frame's pretcode, so the restorer's 15 is the return under test, and the retried faulting load reads the page the handler supplied, writing E7FR-OK only then — with E7FR-LOOP if the handler ran twice, so a missing return is a named line and not a hang. The increment-31 arm is unchanged: its handler still exits instead of returning."
+else
+    bad "AB. a fault handler's return is not wired, in one of the ways that matter: without the gate the sidecar's truthful EINVAL still reaches a handler that has a frame waiting, so every fault-delivered handler dies the moment it returns; a gate that fired on status 0 would restore a frame the sidecar's own -EPROTO check never vetted; one that fired on ANY errno would swallow a real refusal; a return that read park_ctx.user_rsp would restore a stale park context because the trap never parks; and a frame address recorded nowhere means the return cannot find the 440 bytes it owes, which is why the live arm would print E7FR-BAD (the restorer's 15 came back with an errno) or E7FR-LOOP (the retried instruction faulted again)."
+fi
+
+# ─── AC. E7 increment 33 (P1-C): the mask inside a trap handler ────────────
+# The #PF delivery moves the KERNEL's mask to the handler's set, and nothing
+# ever told the sidecar — a trap has no round trip to ride — so its copy still
+# held the pre-delivery one and a forwarded 14 answered the narrower set.
+#
+# AC pins the window in which the kernel answers instead: an rt_sigprocmask
+# from a TRAP-delivered frame is answered out of linux_sig_mask, with the
+# sidecar's own arithmetic, and posted nowhere (the branch sits before the
+# forward's describe). The order that makes it honest is pinned too: the
+# oldset is written through the validated copy BEFORE the new mask is
+# committed, so a bad pointer refuses with nothing moved.
+#
+# And the gate is BOTH flags, which is what leaves the tkill path alone: its
+# frame was entered by the sidecar, reply_apply cleared fault_active for
+# exactly that reason, and its 14 keeps the forward whose mask the sidecar
+# already moved.
+if grep -qF 'int linux_sig_mask_fault_owned(int sig_active, int fault_active);' "$LABH" && \
+   grep -qF 'int linux_sig_mask_step(uint64_t cur, uint64_t how, uint64_t set,' "$LABH" && \
+   grep -qF 'int linux_sig_mask_fault_owned(int sig_active, int fault_active)' "$LABC" && \
+   grep -qF 'return sig_active && fault_active;' "$LABC" && \
+   grep -qF 'if (!out) return 0;' "$LABC" && \
+   grep -qF 'case 0: *out = cur | set;  return 1;' "$LABC" && \
+   grep -qF 'case 1: *out = cur & ~set; return 1;' "$LABC" && \
+   grep -qF 'case 2: *out = set;        return 1;' "$LABC" && \
+   grep -qF 'int owned = linux_sig_mask_fault_owned(' "$DISP" && \
+   grep -qF 'cur->linux_sig_fault_active);' "$DISP" && \
+   [ "$(grep -nF 'if (num == LINUX_RT_SIGPROCMASK) {' "$DISP" | head -1 | cut -d: -f1)" -lt \
+     "$(grep -nF 'linux_syscall_describe(&req, num, largs);' "$DISP" | head -1 | cut -d: -f1)" ] && \
+   grep -qF 'linux_user_copy_out((uint8_t *)&set, cur->cr3,' "$DISP" && \
+   grep -qF 'linux_sig_mask_fault_plan(old, largs[0], set,' "$DISP" && \
+   grep -qF 'linux_user_copy_in((const uint8_t *)&old, cur->cr3,' "$DISP" && \
+   [ "$(grep -nF 'linux_user_copy_in((const uint8_t *)&old, cur->cr3,' "$DISP" | head -1 | cut -d: -f1)" -lt \
+     "$(grep -nF 'cur->linux_sig_mask = new_mask;' "$DISP" | head -1 | cut -d: -f1)" ] && \
+   grep -qF 'pd->linux_sig_fault_active = 0;   /* the sidecar entered this one */' "$PDC" && \
+   grep -qF 'linux_sig_mask_fault_owned(1, 1) == 1' tests/linux_sig_mask_host_test.c && \
+   grep -qF 'linux_sig_mask_fault_owned(1, 0) == 0' tests/linux_sig_mask_host_test.c && \
+   grep -qF 'linux_sig_mask_step(0x400ull, 2, 0x400ull, &new_mask) == 1' tests/linux_sig_mask_host_test.c && \
+   grep -qF 'linux_sig_mask_step(0ull, 0, 0x2ull, &new_mask) == 1' tests/linux_sig_mask_host_test.c && \
+   grep -qF 'mov     $14, %eax' user/sidecar/fixtures/e7_fault_return_probe.S && \
+   grep -qF 'E7FR-MASK' user/sidecar/fixtures/e7_fault_return_probe.S; then
+    ok "AC. the mask inside a trap-delivered handler is the handler's own: the #PF delivery moved the KERNEL's linux_sig_mask to the handler's set while the sidecar — told nothing, because a trap has no round trip — kept the pre-delivery one, so a forwarded 14 reported the narrower set and computed BLOCK/UNBLOCK on the wrong base. linux_sig_mask_fault_owned asks BOTH questions (an installed frame AND a trap delivery), which leaves the tkill path (reply_apply cleared fault_active because the sidecar entered that one and moved its mask) on the forward it always had; linux_sig_mask_step is the sidecar's own arithmetic, replayed in the host test so the two languages cannot drift; the dispatch branch answers from linux_sig_mask, writes the oldset through the validated copy, commits the new mask only after that write lands, posts nothing, and refuses a foreign \`how\` with -EINVAL and the mask unmoved. The live arm's handler asks for its own mask before it fixes the fault and requires 0x400 — the whole set its frame installed — writing E7FR-MASK if it is given the narrower one."
+else
+    bad "AC. the mask inside a trap-delivered handler is not wired, in one of the ways that matter: without the branch a forwarded 14 answers the sidecar's stale pre-delivery set (the narrower mask, and the wrong base for BLOCK/UNBLOCK); a gate that asked only 'a handler is active' would take the tkill path's 14 away from the sidecar that moved its mask for it; arithmetic that differed from the sidecar's own would make the two ends disagree in a way no boot line names; committing the mask before the oldset write lands would move state on a call that answers -EFAULT; and a live arm that never asks for the mask leaves the whole window unobserved, which is what E7FR-MASK would have said."
+fi
+
+# ─── AD. E7 increment 34 (P1-C): the reveal an unmask owes ─────────────────
+# Increment 33 made the kernel answer a trap handler's 14 out of its own
+# mask. An unmask has a second half that is not arithmetic: a signal that was
+# BLOCKED and is now UNBLOCKED must be REVEALED, and what that means depends
+# on the PENDING set and the dispositions — both the sidecar's. Answering
+# locally left the bit pending until after the return, which a tkill-delivered
+# handler's unblock has never done.
+#
+# AD pins the whole crossing: the predicate that names when a call frees a bit
+# (old & ~new — the inverse would call every BLOCK a reveal), the single plan
+# the dispatch runs for every 14, the tagged CONTROL forward that spends a
+# round trip only when a reveal is owed, the sidecar arm that runs the SAME
+# ladder the tkill path runs while leaving its own mask alone, and the reply
+# hook that commits the kernel's copy only on a consent.
+#
+# The prerequisite is pinned too: the kernel's mask used to move only at
+# DELIVERIES, so a signal blocked between two signals was invisible to the
+# fault path — its frame carried the wrong mask, and a trap handler could not
+# free a bit the kernel never knew was blocked. Every 14 now stages what it
+# moved to; a refusal commits nothing, and the sidecar still answers every
+# unblock it answered before.
+if grep -qF '#define LINUX_SIG_REVEAL_TAG 0x53475256ull' "$LABH" && \
+   grep -qF 'int linux_sig_mask_reveals(uint64_t old, uint64_t new_mask);' "$LABH" && \
+   grep -qF 'int linux_sig_mask_fault_plan(uint64_t old, uint64_t how, uint64_t set,' "$LABH" && \
+   grep -qF 'return (old & ~new_mask) != 0;' "$LABC" && \
+   grep -qF 'if (needs_probe) *needs_probe = linux_sig_mask_reveals(old, nm);' "$LABC" && \
+   grep -qF 'int owned = linux_sig_mask_fault_owned(' "$DISP" && \
+   grep -qF 'cur->linux_sig_fault_active);' "$DISP" && \
+   grep -qF 'linux_sig_mask_fault_plan(old, largs[0], set,' "$DISP" && \
+   grep -qF 'if (owned && !probe) {' "$DISP" && \
+   grep -qF 'cur->linux_sig_mask_stage_dst   = owned ? largs[2] : 0;' "$DISP" && \
+   grep -qF 'largs[5] = LINUX_SIG_REVEAL_TAG;' "$DISP" && \
+   [ "$(grep -nF 'cur->linux_sig_mask_stage_valid = 1;' "$DISP" | head -1 | cut -d: -f1)" -lt \
+     "$(grep -nF 'linux_syscall_describe(&req, num, largs);' "$DISP" | head -1 | cut -d: -f1)" ] && \
+   grep -qF '[E7] fault handler unmask: mask %lx, the reveal ran inside the handler' "$CANC" && \
+   grep -qF 'if (rax == 0) pd->linux_sig_mask = nm;' "$CANC" && \
+   [ "$(grep -nF 'if (rax == 0) pd->linux_sig_mask = nm;' "$CANC" | head -1 | cut -d: -f1)" -gt \
+     "$(grep -nF 'linux_user_copy_in(pay, pd->cr3, sva, n) != 0' "$CANC" | head -1 | cut -d: -f1)" ] && \
+   grep -qF 'const SIG_MASK_REVEAL_TAG: u64 = 0x5347_5256;' "$LRS" && \
+   grep -qF '} else if args[5] == SIG_MASK_REVEAL_TAG {' "$LRS" && \
+   grep -qF 'fn reveal_verdict(sig: &SigState, new_mask: u64) -> (u8, u64) {' "$LRS" && \
+   [ "$(grep -cF 'sig.mask = new_mask;' "$LRS")" -eq 1 ] && \
+   grep -qF 'linux_sig_mask_reveals(0x4400ull, 0x400ull) == 1' tests/linux_sig_mask_host_test.c && \
+   grep -qF 'linux_sig_mask_fault_plan(0x4400ull, 1, term_bit, &new_mask,' tests/linux_sig_mask_host_test.c && \
+   grep -qF 'linux_sig_mask_reveals(0x400ull, 0x400ull) == 0' tests/linux_sig_mask_host_test.c && \
+   grep -qF 'E7RV-AFTER' user/sidecar/fixtures/e7_fault_reveal_probe.S && \
+   grep -qF 'pub fn spawn_fault_reveal<' user/sidecar/src/e7_thread_death.rs && \
+   grep -qF 'crate::e7_thread_death::spawn_fault_reveal' "$LRE" && \
+   grep -qF 'sig=15 default-action -> kill' tests/linux_fault_reveal_check.sh; then
+    ok "AD. an unmask inside a trap-delivered handler REVEALS what it frees: a bit that leaves the mask (old & ~new) may be pending, and only the sidecar knows the pending set and the dispositions that decide what revealing it means — so the kernel forwards a TAGGED control probe (the mask in args[4], LINUX_SIG_REVEAL_TAG in args[5]) instead of the child's call, the sidecar runs the SAME reveal ladder the tkill arm has always run while leaving its own mask alone, and the kernel commits its copy (and writes the oldset) only on the sidecar's consent, so a refusal moves nothing and the two copies still agree after the return. The prerequisite is wired too: every 14 now stages the mask it moved to, so a signal blocked BEFORE a fault is in the fault frame's mask and can be freed inside the handler at all — a tkill-delivered handler's unblock is untouched, still answered by the sidecar. The live arm blocks SIGTERM, pends it with tkill, faults, and unblocks it from the handler: the sidecar's ladder must kill the task inside that call (\`sig=15 default-action -> kill\`, after E7RV-ARM), so the handler's own E7RV-AFTER is the named failure."
+else
+    bad "AD. an unmask inside a trap-delivered handler still skips the reveal, in one of the ways that matter: without the probe the bit stays pending until after the return (the handler runs on and writes E7RV-AFTER); a probe that fired on a mask which never freed a bit would spend a round trip on every BLOCK, and one that used new & ~old would call every BLOCK a reveal; a sidecar arm that moved its own mask would recreate the divergence increment 33 closed; a commit before the sidecar's consent would move the mask on a call that answers E_NOSYS; and a kernel whose mask only moves at DELIVERIES cannot see a block made before the fault, so the handler could not free that bit even with the probe wired."
+fi
+
+# ─── AE. E7 increment 35 (P1-C): the frame a handler ABANDONS ─────────
+# Increments 32–34 close the mask window at a 15 that restores the frame. A
+# handler that leaves by longjmp never sends that 15: siglongjmp restores the
+# mask through a 14 (so the call still arrives) and then pops rsp above the
+# frame, and the kernel would answer that task's 14 out of its own copy for
+# the rest of its life — increment 33's split, now permanent.
+#
+# AE pins the closure: the predicate (rsp ABOVE the recorded frame, and no
+# frame is nothing to abandon), the user-rsp accessor it needs ([gs:0], the
+# word syscall entry stores), the check running BEFORE the window's ownership
+# is read (or the call it was meant to survive would answer from the stale
+# copy anyway), the mask put back to the number BOTH ends agree on — the
+# frame's own uc_sigmask, the pre-delivery set the sidecar still holds — and
+# the frame dropped on every path, so no later 15 restores a frame the task
+# has left.
+if grep -qF 'int linux_sig_frame_abandoned(uint64_t frame_rsp, uint64_t user_rsp);' "$LABH" && \
+   grep -qF 'int linux_sig_frame_abandoned(uint64_t frame_rsp, uint64_t user_rsp)' "$LABC" && \
+   grep -qF 'return user_rsp > frame_rsp;' "$LABC" && \
+   grep -qF 'if (frame_rsp == 0) return 0;' "$LABC" && \
+   grep -qF 'uint64_t proc_read_user_rsp(void);' "$PDH" && \
+   grep -qF 'uint64_t proc_read_user_rsp(void)' "$PDC" && \
+   grep -qF 'linux_sig_frame_abandoned(' "$DISP" && \
+   grep -qF 'cur->linux_sig_frame_rsp, now)) {' "$DISP" && \
+   grep -qF 'uint64_t now = proc_read_user_rsp();' "$DISP" && \
+   grep -qF 'if (cur->linux_sig_fault_active &&' "$DISP" && \
+   [ "$(grep -nF 'if (cur->linux_sig_fault_active &&' "$DISP" | head -1 | cut -d: -f1)" -lt \
+     "$(grep -nF 'int owned = linux_sig_mask_fault_owned(' "$DISP" | head -1 | cut -d: -f1)" ] && \
+   grep -qF 'at + LINUX_SIGFRAME_SIGMASK,' "$DISP" && \
+   grep -qF 'LINUX_SIGSET_BYTES) == 0;' "$DISP" && \
+   grep -qF 'cur->linux_sig_mask         = agreed;' "$DISP" && \
+   grep -qF 'cur->linux_sig_active       = 0;' "$DISP" && \
+   grep -qF 'cur->linux_sig_fault_active = 0;' "$DISP" && \
+   grep -qF 'cur->linux_sig_frame_rsp    = 0;' "$DISP" && \
+   grep -qF 'linux_sig_frame_abandoned(0x7000ull, 0x7000ull) == 0' tests/linux_sig_mask_host_test.c && \
+   grep -qF 'linux_sig_frame_abandoned(0x7000ull, 0x6f00ull) == 0' tests/linux_sig_mask_host_test.c && \
+   grep -qF 'linux_sig_frame_abandoned(0x7000ull, 0x7008ull) == 1' tests/linux_sig_mask_host_test.c && \
+   grep -qF 'linux_sig_frame_abandoned(0ull, 0x7008ull) == 0' tests/linux_sig_mask_host_test.c && \
+   grep -qF 'E7AB-LEAP' user/sidecar/fixtures/e7_fault_abandon_probe.S && \
+   grep -qF 'mov     0(%r12), %rsp' user/sidecar/fixtures/e7_fault_abandon_probe.S && \
+   grep -qF 'pub fn spawn_fault_abandon<' user/sidecar/src/e7_thread_death.rs && \
+   grep -qF 'crate::e7_thread_death::spawn_fault_abandon' "$LRE" && \
+   grep -qF 'mask window closed at 4000' tests/linux_fault_abandon_check.sh; then
+    ok "AE. a frame the handler ABANDONS closes the mask window without a 15: increments 32–34 end the window at rt_sigreturn, but a handler that leaves by longjmp never sends one — siglongjmp restores the mask through a 14 first (so a 14 arrives) and then pops rsp back to the setjmp caller, which is strictly above the frame — so linux_sig_frame_abandoned asks the one structural question a syscall can see (rsp > frame_rsp, with no recorded frame meaning nothing to abandon) and the dispatch asks it BEFORE the window's ownership is read. The mask is put back to the frame's own uc_sigmask — the PRE-delivery set the builder stored, which is exactly what the sidecar's copy still holds, since it never moved during the window and every 14 stages what it moved to — and the frame is dropped on every path, so the task's 14s go back to the sidecar that owns them and no later 15 restores a frame behind it. The tkill path is untouched: its frame DOES record an address (linux_sig_reply_apply stores frame_rsp), and fault_active is 0 there, so the gate — not a missing address — keeps that path on the sidecar's forward. The predicate's one false positive is named, not solved: a handler running on a stack ABOVE its frame (makecontext/swapcontext) reads exactly like an abandonment and would close the window early. The live arm proves it on a boot (tests/linux_fault_abandon_check.sh): SIGTERM is blocked before the fault so the frame RECORDS 0x4000, the handler blocks SIGUSR1 inside the window (the kernel's copy moves to 0x4600) and leaves by popping rsp to the setjmp caller, and the first 14 after the jump must be answered 0x4000 — E7AB-MASK names the window still being the kernel's, E7AB-RET and E7AB-LOOP name a frame that was not dropped, and the kernel's 'fault handler abandoned the frame … mask window closed at 4000' line must sit between E7AB-LEAP and E7AB-OK."
+else
+    bad "AE. an abandoned frame still leaves the mask window open, in one of the ways that matter: with no predicate the kernel answers every 14 of that task's life out of a copy the sidecar never saw (increment 33's split, now permanent); a check that ran after the ownership read would answer the very call that should have closed it from the stale copy; a comparison of the wrong direction (rsp < frame_rsp) would close the window at the handler's first push, which is every ordinary handler there is; restoring anything but the frame's recorded set would move the mask to a number the sidecar cannot agree with, since it is the one both ends held when the frame was built; a block that cleared the flags but kept frame_rsp would let a later 15 restore a frame the task has already left; and a live arm that never leaves its frame — or that the sidecar never spawns — leaves the closure unexercised on the machine, which is the silence a guard on grep alone cannot hear."
+fi
+
+# ─── P. E7 increment 26 (P1-C): the signal frame ───────────────────────
+# Five claims, each one a way the frame could be quietly wrong: the contract
+# exists and names its numbers (P), the layout is pinned by the compiler and
+# the builder allocates nothing (P1), the dispatch that does NOT exist yet
+# stays absent (P2), the host test actually drives every branch (P3), and no
+# delivery path was smuggled in beside the builder (P4).
+if grep -qF '#define LINUX_RT_SIGRETURN      15u' "$LABH" && \
+   grep -qF 'struct LinuxSigFrameSpec {' "$LABH" && \
+   grep -qF 'int linux_sig_frame_build(uint8_t *buf, uint32_t cap,' "$LABH" && \
+   grep -qF 'int linux_sig_frame_restore(const uint8_t *buf, uint32_t len,' "$LABH" && \
+   grep -qF '#define LINUX_SIGFRAME_SIZE      440u' "$LABH" && \
+   grep -qF '#define LINUX_SIGFRAME_SIGMASK   304u' "$LABH" && \
+   grep -qF '#define LINUX_SIGFRAME_INFO      312u' "$LABH" && \
+   grep -qF 'int linux_sig_default_action(uint32_t signo);' "$LABH" && \
+   grep -qF 'int linux_sig_delivery_needed(uint64_t blocked, uint32_t signo,' "$LABH" && \
+   grep -qF 'int linux_sig_park_is_eintr(uint32_t signo, uint64_t blocked,' "$LABH"; then
+    ok "P. the frame is a named contract: rt_sigreturn's number (15), the 440-byte rt_sigframe with its sigcontext at 48 and sigset at 304, and the three decisions — default action, delivery-needed and the EINTR rule — each declared where a host test can drive it"
+else
+    bad "P. the signal-frame contract is missing from kernel/linux_abi.h — the builder's numbers would live only in the .c, the EINTR rule would be an inline condition again, and no host test could pin the layout a libc reads"
+fi
+
+framesec="$(sed -n '/E7 increment 26 (P1-C/,/^int linux_sig_default_action/p' "$LABC" 2>/dev/null)"
+if [ -n "$framesec" ] && \
+   grep -qF 'struct LinuxSigContextMirror {' <<< "$framesec" && \
+   grep -qF 'struct LinuxUContextMirror {' <<< "$framesec" && \
+   grep -qF 'struct LinuxRtSigframeMirror {' <<< "$framesec" && \
+   [ "$(grep -c '_Static_assert' <<< "$framesec")" -ge 10 ] && \
+   grep -qF 'offsetof(struct LinuxSigContextMirror, rip) == 128' <<< "$framesec" && \
+   grep -qF 'offsetof(struct LinuxSigContextMirror, cs) == LINUX_SIGCTX_CS' <<< "$framesec" && \
+   grep -qF 'offsetof(struct LinuxUContextMirror, uc_sigmask) == 296' <<< "$framesec" && \
+   grep -qF 'offsetof(struct LinuxRtSigframeMirror, info) == LINUX_SIGFRAME_INFO' <<< "$framesec" && \
+   grep -qF 'sizeof(struct LinuxRtSigframeMirror) == LINUX_SIGFRAME_SIZE' <<< "$framesec" && \
+   grep -qF 'sig_handler_stack(' <<< "$framesec" && \
+   grep -qF 'rsp = ((top - (uint64_t)LINUX_SIGFRAME_SIZE) & ~(uint64_t)0xF) - 8u;' <<< "$framesec" && \
+   ! grep -qE 'malloc|kmalloc|alloc_page|alloc_frame' <<< "$framesec"; then
+    ok "P1. the layout is pinned by the compiler, not by prose: a mirror of sigcontext/ucontext/rt_sigframe plus ten _Static_asserts (rip at 128, cs at 144, uc_sigmask at 296, info at 312, frame 440) and Linux's own align_sigframe arithmetic — and the whole section allocates nothing, so the frame cannot leak a page on a refusal"
+else
+    bad "P1. the frame's layout pins are gone or the builder gained an allocator — a compiler that packed a field differently (or an edit to one offset) would ship a frame a guest libc misreads, with the failure landing in the handler instead of here"
+fi
+
+if grep -qF 'linux_syscall_class(LINUX_RT_SIGRETURN) == LSC_SIG' "$SIGFRAME_HUT" && \
+   grep -qF '{  15, LSC_SIG,    0 }' "$LABC" && \
+   grep -qE '^15 rt_sigreturn [1-9][0-9]*$' tools/linux_rt_sigreturn_census.txt && \
+   grep -qF 'linux_syscall_class(200) == LSC_UNKNOWN' "$SYSTAB" && \
+   ! grep -qF 'LINUX_RT_SIGRETURN' "$DISP"; then
+    ok "P2. the row that was an asserted ABSENCE is now an asserted PRESENCE, with the same teeth: 15 is LSC_SIG in the table, the host test checks it (so deleting the row fails a test rather than passing silently), and the number's own census artifact carries the measured line — while a number nobody traced (200's stale table entry) stays UNKNOWN and the dispatcher still names neither: the row arrived by trace, and the trip is a restore, not a new dispatch"
+else
+    bad "P2. rt_sigreturn's classification is not backed end to end — the table row, the host test and tools/linux_rt_sigreturn_census.txt must all agree, or a row was added from belief (or deleted behind a test that kept passing): §5.6 says the table is BUILT from the trace"
+fi
+
+if grep -qF 'LINUX_SIGFRAME_SIZE == 440' "$SIGFRAME_HUT" && \
+   grep -qF 'LINUX_SIGFRAME_SIGMASK == 304' "$SIGFRAME_HUT" && \
+   grep -qF '(entry.r[LINUX_SIGREG_RSP] & 0xFu) == 8u' "$SIGFRAME_HUT" && \
+   grep -qF 'frame[LINUX_SIGFRAME_MCONTEXT + LINUX_SIGCTX_CS] == 0x33' "$SIGFRAME_HUT" && \
+   grep -qF 'a DISABLED altstack is not used even when SA_ONSTACK asks' "$SIGFRAME_HUT" && \
+   grep -qF 'SA_NODEFER leaves the signal unblocked' "$SIGFRAME_HUT" && \
+   grep -qF 'build/restore is a round trip' "$SIGFRAME_HUT" && \
+   grep -qF 'SA_RESTART means the syscall is restarted instead' "$SIGFRAME_HUT" && \
+   grep -qF 'a frame whose cs is not 0x33 is refused' "$SIGFRAME_HUT"; then
+    ok "P3. the host test drives the frame instead of describing it: the offsets as literals, the handler's rsp%16==8 entry shape, cs==0x33 both ways (built, and refused when forged), the altstack plus its disabled/tiny fallbacks, the mask with and without SA_NODEFER, a build/restore round trip, and the EINTR/SA_RESTART split"
+else
+    bad "P3. the frame host test no longer exercises a branch above — the layout, the altstack choice, the mask rule or the EINTR predicate would be argued from the builder's own prose, reachable only at boot"
+fi
+
+if grep -qF 'int linux_sig_deliver(' "$LABC" && \
+   grep -qF 'linux_user_copy_in(frame, root,' "$LABC" && \
+   [ "$(grep -cF 'linux_user_copy_out(frame, pd->cr3,' kernel/process.c)" -eq 1 ] && \
+   ! grep -qE 'setup_rt_frame|sigframe_write_user' "$LABC" "$DISP" && \
+   ! grep -qF 'LINUX_RT_SIGRETURN' "$DISP"; then
+    ok "P4. the frame has one validated path in EACH direction and no other: it reaches a user stack only through linux_user_copy_in against the task's own cr3, and increment 29 reads it back through exactly one linux_user_copy_out at the handler's own rsp — a direct store or load into a user page is the shape that skips every protection check, and on the return side it would be a ring-0 fault from a frame the task itself can forge"
+else
+    bad "P4. the frame's only writer or reader is no longer the validated copy — a direct access into a user page skips every protection check, and on the return side a frame the task can forge would be read with ring-0 privileges"
+fi
+
+if grep -qF '#define CAP_EINTR       (-33)' "$CAPH" && \
+   grep -qF 'case CAP_EINTR:                  return -LINUX_EINTR;' "$LABC" && \
+   grep -qF '#define LINUX_EINTR        4' "$LABH" && \
+   grep -qF 'const E_INTR: i32 = -33;' "$LINUXRS" && \
+   grep -qF 'fn park_interrupt(sig: &SigState) -> Option<u64> {' "$LINUXRS" && \
+   grep -qF 'dispo(sig, no) == DISPO_HANDLER' "$LINUXRS" && \
+   grep -qF 'sig.act[no as usize][1] & SIG_SA_RESTART == 0' "$LINUXRS" && \
+   grep -qF 'fn a_parked_forward_is_woken_only_by_a_handler_without_sa_restart()' "$LINUXRS" && \
+   grep -qF 'linux_sig_park_is_eintr' "$LABH" "$LABC"; then
+    ok "P5. the park's wake is one rule in two languages: CAP_EINTR (-33) maps to -EINTR through §5.7 like every other code, the sidecar's park_interrupt names the same three conditions the kernel's linux_sig_park_is_eintr does (deliverable, a HANDLER, no SA_RESTART), and its six-case unit test drives each branch — so a restartable read cannot become a spurious EINTR, and a HANDLER cannot be answered with EAGAIN's code"
+else
+    bad "P5. the EINTR twin drifted: either the code lost its map row (leaving the sidecar's status to fall through §5.7's default and reach the task as EIO), or the sidecar's rule no longer matches the kernel's three conditions — the exact divergence a boot would show as a read that sometimes fails"
+fi
+
+if grep -qF 'r = linux_sig_deliver_req_parse(bytes, LINUX_SIGDELIVER_BYTES - 1u, &back);' "$SIGDELIVER_HUT" && \
+   grep -qF 'r = linux_sig_deliver_req_parse(bytes, LINUX_SIGDELIVER_BYTES + 1u, &back);' "$SIGDELIVER_HUT" && \
+   grep -qF 'if (len != LINUX_SIGDELIVER_BYTES) return -LINUX_EINVAL;' "$LABC" && \
+   grep -qF '_Static_assert(sizeof(struct LinuxSigDeliverReq) == LINUX_SIGDELIVER_BYTES' "$LABH"; then
+    ok "P6. the answer's shape is fixed on both sides of the wire: 80 bytes exactly, refused at 79 and 81, with the struct's size pinned to the wire length by a _Static_assert — a decoder that accepted a prefix would hand the builder a handler read out of the wrong word"
+else
+    bad "P6. the delivery request lost its exact-length boundary: a short or padded reply would decode into a struct with a made-up handler and restorer, and the frame would be written to an address the sidecar never named"
+fi
+
+if grep -qF 'case 11u:' "$LABC" && grep -qF 'case 7u:' "$LABC" && \
+   grep -qF 'case 8u:' "$LABC" && grep -qF 'case 4u:' "$LABC" && \
+   grep -qF '*out = cr2;' "$LABC" && grep -qF '*out = rip;' "$LABC" && \
+   grep -qF "a NULL deref's si_addr is 0 and still counts as an answer" "$SIGDELIVER_HUT" && \
+   grep -qF 'SIGFPE takes RIP' "$SIGDELIVER_HUT"; then
+    ok "P7. si_addr comes from the number the signal HAS: CR2 for the two address faults (SIGSEGV, SIGBUS — including a NULL deref, where 0 is the answer and not 'no answer'), RIP for the two instruction faults (SIGFPE, SIGILL, where CR2 is stale), and the sidecar's own addr otherwise — each case driven by the host test"
+else
+    bad "P7. the CR2 -> si_addr rule was flattened: a crash reporter would print a stale address from whatever faulted before, or a SIGFPE would name the wrong instruction, and the guest's backtrace would point at code that never ran"
+fi
+
+if grep -qF 'CHECK(clean,' "$SIGDELIVER_HUT" && \
+   grep -qF 'every byte of the guest' "$SIGDELIVER_HUT" && \
+   grep -qF 'a read-only stack refuses the frame with -EFAULT' "$SIGDELIVER_HUT" && \
+   grep -qF 'if (r != 0) return r;           /* nothing written: the builder refuses' "$LABC"; then
+    ok "P8. a refused delivery mutates NOTHING: the builder refuses before its first store, the copy validates every page before the first byte moves, and the host test asserts the guest's stack is byte-identical by sentinel — so a signal onto an unwritable or unmapped stack is an errno, never a half-written frame in somebody's stack"
+else
+    bad "P8. the refusal-before-mutation property is no longer asserted: a partial frame write would be kernel-authored corruption of the task's memory, and the test that proves it did not happen is gone"
+fi
+
+if grep -qF 'LINUX_STAGE_SIGFRAME' "$LABH" "$LABC" && \
+   grep -qF 'p.kind = LINUX_STAGE_SIGFRAME;' "$LABC" && \
+   grep -qF 'p.len  = LINUX_SIGDELIVER_BYTES;' "$LABC" && \
+   grep -qF 'p.aux  = LINUX_SIGDELIVER_BYTES;' "$LABC" && \
+   grep -qF 'if (num == LINUX_TKILL)' "$LABC" && \
+   grep -qF 'if (skind == LINUX_STAGE_SIGFRAME) {' kernel/chan.c && \
+   grep -qF 'linux_sig_reply_apply(pd, pay, n)' kernel/chan.c && \
+   grep -qF 'Answer::SignalFrame(' "$LINUXRS" && \
+   grep -qF 'SIGDELIVER_BYTES' "$LINUXRS"; then
+    ok "P9. the wire has ONE description of a delivery: the plan stages LINUX_STAGE_SIGFRAME for tkill with no user destination (the bytes are an instruction, not an owed copy), the shape rule demands exactly the 80-byte request, chan.c hands it to linux_sig_reply_apply instead of the pointer copy path, and the sidecar answers Answer::SignalFrame — three ends, one length, so a handler can only be reached by a message all three agree on"
+else
+    bad "P9. the delivery wire lost one of its three ends — a plan without the stage would refuse the sidecar's answer as payload-on-a-number-with-no-plan, a sidecar without the variant would answer E_NOSYS to a disposition that now has a frame, and a chan.c without the branch would try to copy 80 bytes to address 0"
+fi
+
+if grep -qF 'w[1]  = entry->r[LINUX_SIGREG_RIP];' "$LABC" && \
+   grep -qF 'w[8]  = entry->r[LINUX_SIGREG_RSP];' "$LABC" && \
+   grep -qF 'w[9]  = entry->r[LINUX_SIGREG_RDI];' "$LABC" && \
+   grep -qF 'w[15] = entry->r[LINUX_SIGREG_RAX];' "$LABC" && \
+   grep -qF 'sizeof(struct CapParkCtx) == 128u' kernel/process.h && \
+   grep -qF 'cap_resume_linux_sig' kernel/process.h kernel/process.c && \
+   [ "$(grep -A 45 'void cap_resume_linux_sig' kernel/process.c | grep -c 'swapgs')" -eq 0 ] && \
+   grep -A 45 'void cap_resume_linux_sig' kernel/process.c | grep -qF 'jmp syscall_return_path' && \
+   grep -qF 'the park context reads into the register file' "$SIGDELIVER_HUT"; then
+    ok "P10. the handler is entered through the park context, not around it: the entry installs RIP at word 1, the frame's rsp at word 8, the signo at word 9 and (increment 29) the sysret's RAX at word 15 (the offsets cap_recv_resume's and cap_sysret_resume's asm actually read), CapParkCtx's size is asserted at 128 bytes where it is defined, and the resume is that asm's push-and-sysret WITHOUT a second swapgs — this runs inside do_syscall, where a swap would put GS_BASE back at 0 with a kernel view live"
+else
+    bad "P10. the install and the return path disagree — a word nudged by one is a handler entered with the syscall's rsp or the caller's rip (a #PF or a crash in a place with no relation to the signal), a missing size assert lets a field move silently, and a second swapgs in the resume corrupts GS on the way out"
+fi
+
+if grep -qF 'r = linux_sig_park_install(w, LINUX_PARK_WORDS, &entry);' kernel/process.c && \
+   grep -A 2 'r = linux_sig_park_install(w, LINUX_PARK_WORDS, &entry);' kernel/process.c | grep -qF 'if (r != 0) return r;' && \
+   [ "$(grep -c 'cap_resume_linux_sig(pd);' kernel/process.c)" -eq 2 ] && \
+   grep -A 3 'r = linux_sig_park_install(w, LINUX_PARK_WORDS, &regs);' kernel/process.c | grep -qF 'if (r != 0) return r;' && \
+   grep -qF 'pd->linux_sig_mask   = mask;' kernel/process.c && \
+   grep -qF 'let before = sig.mask;' "$LINUXRS" && \
+   grep -qF 'let mut frame_mask = before | sig.act[no][2] | bit;' "$LINUXRS" && \
+   grep -qF 'sig.mask = frame_mask;' "$LINUXRS" && \
+   grep -qF 'frame_mask &= !bit;' "$LINUXRS"; then
+    ok "P11. one mask, two languages, and no resume without an install (in both directions now: the return installs through the same bridge, checks its refusal before clearing the mask, and only then resumes): the sidecar moves its mask to blocked|sa_mask|the signal (minus the signal under SA_NODEFER) BEFORE it answers, the kernel computes the same number in the frame and stores it as linux_sig_mask, and the only call into the resume sits after the install's own refusal check — so every failure path answers the syscall with an errno and the task keeps running, rather than jumping into a handler with half a context"
+else
+    bad "P11. the delivery's success is no longer conditional: a resume reachable from a refusal, or two masks that can disagree, is the shape where the task enters a handler the kernel did not install (or runs with a mask the sidecar did not set) and every subsequent signal behaves wrongly"
+fi
+
+if grep -qF '.Lsig_try:' "$FIX" && \
+   grep -qF 'SIGHAND-OK' "$FIX" && \
+   grep -qF 'mov     $200, %eax' "$FIX" && \
+   grep -qF 'jmp     .Lsoft_tail' "$FIX" && \
+   grep -qF '[E7] sig %u (code %u) -> handler %lx' kernel/process.c && \
+   [ -s tests/linux_signal_probe_check.sh ] && \
+   grep -qF 'SIGHAND-OK reached the serial log' tests/linux_signal_probe_check.sh && \
+   grep -qF 'mask 200$' tests/linux_signal_probe_check.sh; then
+    ok "P12. the delivery has a LIVE proof, not only a host test: the existing probe installs SIGUSR1 and raises it with tkill (13 then 200), its handler writes SIGHAND-OK and then finishes the soft-mprotect case (the probe's original terminal step, so nothing was lost by putting the delivery last), and tests/linux_signal_probe_check.sh boots the ISO and reads the kernel's own [E7] sig N -> handler line with the frame and the 0x200 mask both ends computed, with MARKERS 409/410/411 absent"
+else
+    bad "P12. the live proof is incomplete: a fixture without the handler or without its terminal step, a kernel that stopped printing the delivery line, or a check that no longer reads it — any of these leaves the wired delivery asserted from source only, which is exactly what this increment was not allowed to do"
+fi
+
+if [ -s tools/linux_rt_sigreturn_census.txt ] && \
+   grep -qE '^15 rt_sigreturn [1-9][0-9]*$' tools/linux_rt_sigreturn_census.txt && \
+   grep -qF 'sha256:' tools/linux_rt_sigreturn_census.txt && \
+   grep -qF 'strace -f full trace, entry-counted' tools/linux_rt_sigreturn_census.txt && \
+   grep -qF '{  15, LSC_SIG,    0 }' "$LABC" && \
+   grep -qF 'tools/linux_rt_sigreturn_census.txt' "$LABC" "$SIGFRAME_HUT" && \
+   grep -qF 'linux_syscall_class(LINUX_RT_SIGRETURN) == LSC_SIG' "$SIGFRAME_HUT"; then
+    ok "P13. rt_sigreturn's row is CENSUSED, not believed: the artifact carries the same provenance columns as the candidate trace (method, sha256, host, date, entry-counted) and one measured row — 15, count 1, produced by a handler that returns — the table cites it by path, and the host test asserts the classification so a row could not be deleted while its test kept passing"
+else
+    bad "P13. the row lost its trace (or the trace lost its provenance): §5.6 says the table is BUILT from a measurement, and a row without one is the belief this artifact exists to forbid — while a deleted row with a passing test is the same lie from the other end"
+fi
+
+if grep -qF 'int linux_sig_return_apply(struct ProcessDescriptor* pd)' kernel/process.c && \
+   grep -qF 'linux_user_copy_out(frame, pd->cr3, pd->linux_sig_frame_rsp,' kernel/process.c && \
+   grep -qF 'linux_sig_frame_restore(frame, LINUX_SIGFRAME_SIZE, &regs, &mask)' kernel/process.c && \
+   grep -qF 'pd->linux_sig_mask   = mask;' kernel/process.c && \
+   grep -qF 'pd->linux_sig_active = 0;' kernel/process.c && \
+   grep -qF 'expect_num == LINUX_RT_SIGRETURN' kernel/chan.c && \
+   grep -qF 'sig.mask = sig.saved_mask;' "$LINUXRS" && \
+   grep -qF 'sig.handler_active = false;' "$LINUXRS" && \
+   grep -qF 'fn rt_sigreturn_restores_the_mask_a_delivery_changed()' "$LINUXRS"; then
+    ok "P14. the return trip restores BOTH halves and invents neither: the kernel reads the frame at the address its own delivery recorded (the rsp the handler was entered with) through the validated copy (a frame the task unmapped refuses -EFAULT, never a ring-0 fault), restores the registers and uc_sigmask, clears the active flag and resumes; the sidecar puts back the mask it saved at the delivery and refuses a 15 with no handler entered — one number, two authorities, each restoring what it owns"
+else
+    bad "P14. the return trip lost a half: a kernel restore without the validated read is a ring-0 fault waiting for a hostile frame, a kernel that keeps its own mask while the sidecar keeps another is the divergence a second raise exposes, and a 15 accepted with no handler entered unblocks signals no delivery blocked"
+fi
+
+if grep -qF 'w[15] = entry->r[LINUX_SIGREG_RAX];' "$LABC" && \
+   grep -qF 'ctx->r[LINUX_SIGREG_RAX] = w[15];' "$LABC" && \
+   grep -qF 'movq 120(%1), %%rax' kernel/process.c && \
+   grep -qF 'uint64_t rax;' kernel/process.h && \
+   grep -qF 'w[15] == 0x7777ULL' "$SIGDELIVER_HUT" && \
+   grep -qF 'restored.r[LINUX_SIGREG_RAX] == 0x7777ULL' "$SIGDELIVER_HUT"; then
+    ok "P15. the sysret's RAX is part of the context: the bridge carries it in word 15, the resume loads it from 120(%1) instead of forcing zero, and the host test drives an interrupted rax of 0x7777 through build, restore, install and read-back — a return trip that dropped it would hand the caller a value the interrupted syscall never produced"
+else
+    bad "P15. RAX fell out of the context: a delivery wants 0 there and a return wants the interrupted value, so a hardcoded zero (or a word that is written but never read) makes every handler return look like a successful syscall"
+fi
+
+if grep -qF 'int linux_sig_return_reply_ok(uint64_t num, uint64_t rax, int32_t status);' "$LABH" && \
+   grep -qF 'if (num != LINUX_RT_SIGRETURN) return 0;' "$LABC" && \
+   grep -qF 'if (rax == (uint64_t)(int64_t)(-LINUX_EPROTO)) return 0;' "$LABC" && \
+   grep -qF 'return status == 0;' "$LABC" && \
+   grep -qF 'if (!linux_sig_return_reply_ok(expect_num, rax,' kernel/chan.c && \
+   grep -A 2 'if (!linux_sig_return_reply_ok(expect_num, rax,' kernel/chan.c | grep -qF 'return rax;' && \
+   ! grep -qF 'rax != (uint64_t)(int64_t)(-LINUX_EPROTO)) {' kernel/chan.c && \
+   grep -qF 'linux_sig_return_reply_ok(LINUX_RT_SIGRETURN, 0, 0) == 1' "$SIGDELIVER_HUT" && \
+   grep -qF 'linux_sig_return_reply_ok(LINUX_RT_SIGPROCMASK, 0, 0) == 0' "$SIGDELIVER_HUT"; then
+    ok "P16. the return trip's gate is the sidecar's answer, named once: status 0 from its 15 arm (the only condition under which it put saved_mask back) opens the restore, a nonzero status — its refusal, no handler entered — falls through to the errno the §5.7 map produced with the frame untouched, a reply that never applied is refused by its -EPROTO rather than by describe's stale zero, and no number but 15 reaches it; the old \"not -EPROTO\" shortcut that restored under an E_INVAL is gone"
+else
+    bad "P16. the gate drifted back to a non-answer: a restore reachable on any reply that is merely not -EPROTO lets a 15 the sidecar refused (no handler entered) resume the task into a context whose mask was never unwound, with the errno silently swallowed — the divergence a second raise exposes"
+fi
+
+# The refusal branch of the gate, proven on a boot rather than only by the
+# host test and t158: the probe issues 15 BEFORE it installs SIGUSR1 (the
+# order is the "no handler entered"), expects exactly -EINVAL, marks it and
+# issues 412 on anything else; the check reads that marker from the serial
+# log and insists the boot holds exactly ONE restore line — the handler's.
+sigret_sec="$(sed -n '/^\.Lsig_try:/,/^\.Lsig_install_bad:/p' "$FIX" 2>/dev/null)"
+sr15="$(grep -n 'mov     \$15, %eax' <<< "$sigret_sec" | head -1 | cut -d: -f1)"
+sr13="$(grep -n 'mov     \$13, %eax' <<< "$sigret_sec" | head -1 | cut -d: -f1)"
+if [ -n "$sigret_sec" ] && [ -n "$sr15" ] && [ -n "$sr13" ] && [ "$sr15" -lt "$sr13" ] && \
+   grep -qF 'cmp     $-22, %rax' <<< "$sigret_sec" && \
+   grep -qF 'mov     $412, %eax' <<< "$sigret_sec" && \
+   grep -qF 'SIGRET-NOHAND-OK' <<< "$sigret_sec" && \
+   grep -qF 'SIGRET-NOHAND-OK' tests/linux_signal_probe_check.sh && \
+   grep -qF 'exactly ONE [E7] rt_sigreturn: restored line' tests/linux_signal_probe_check.sh && \
+   grep -qF "412) why='a 15 with no handler entered was not -EINVAL'" tests/linux_signal_probe_check.sh; then
+    ok "P17. the refusal is LIVE, not only a host test and a tooth: the probe issues rt_sigreturn(15) before it installs SIGUSR1 — so no handler has been entered by construction — and requires exactly -EINVAL, marking it SIGRET-NOHAND-OK and issuing 412 on any other answer; tests/linux_signal_probe_check.sh reads that marker from the serial log, requires exactly ONE restore line in the whole boot (the handler's own return) so a refused 15 that restored anyway cannot hide, orders the marker before that line, and keeps 412 absent"
+else
+    bad "P17. the refusal branch lost its live proof: without a 15 issued before the install the boot never exercises the gate's else-arm, and without the one-restore count a refused 15 that restored a frame nobody built would look exactly like a passing boot — the branch would be back to being asserted from a host test alone"
 fi
 
 echo

@@ -7,6 +7,9 @@
  * discipline the rest of this tree applies to on-disk formats. See
  * kernel/linux_abi.h for why this increment lands before any mechanism.
  */
+#include <stddef.h>  /* offsetof — a freestanding header, not libc: the frame's
+                      * field offsets are asserted against a local mirror, so a
+                      * compiler that disagrees stops the build (clause P) */
 #include "linux_abi.h"
 #include "cap.h"      /* CAP_E* (Phase-3 syscalls), CAP_ERR_* (Phase-5 k_chan), CAP_NONE */
 
@@ -80,6 +83,10 @@ int32_t linux_errno_from_cap(int32_t cap_code)
     case CAP_ENETUNREACH:            return -LINUX_ENETUNREACH;
     case CAP_EHOSTUNREACH:           return -LINUX_EHOSTUNREACH;
     case CAP_EAFNOSUPPORT:           return -LINUX_EAFNOSUPPORT;
+    /* E7 increment 27: the park's wake. Its own code rather than a reuse of
+     * EAGAIN, because a caller retries an EINTR and must not retry a
+     * would-block: the two are different answers to different questions. */
+    case CAP_EINTR:                  return -LINUX_EINTR;
     default:
         /* CAP_NONE (0xFFFF, the out-param sentinel) and anything else that
          * is not an enumerated code: translated, never leaked (§5.7). */
@@ -135,7 +142,12 @@ int32_t cap_code_from_linux_errno(int32_t linux_errno)
 
 /* ─── The syscall classification table (§5.6) ──────────────────────────────
  * Built FROM tools/linux_syscall_census.txt: its 27 rows plus M1's eight
- * network rows, sorted by number.
+ * network rows, plus the four epoll/eventfd rows the Go gate's census
+ * requires (tools/go_thread_gate_census.txt — TG-0), plus 15
+ * (rt_sigreturn) from tools/linux_rt_sigreturn_census.txt — the candidate's
+ * own trace never returns from a handler, so that number needed a
+ * measurement of the flow it exists for (a handler that returns: 15 appears
+ * once, count 1). Sorted by number.
  * The class names where the semantics live, per §5.6's destination table;
  * the flag pins §5.4's W^X refusal against the census's own mprotect row.
  *
@@ -158,8 +170,13 @@ const struct LinuxSyscallEntry linux_syscall_table[] = {
     {  10, LSC_MEM,    LSC_F_REFUSES_WX }, /* mprotect — W|X refused (§5.4) */
     {  11, LSC_MEM,    0 },   /* munmap */
     {  12, LSC_MEM,    0 },   /* brk — §5.4 bump pointer in the budget */
-    {  13, LSC_SIG,    0 },   /* rt_sigaction — recorded; handler installs refused */
+    {  13, LSC_SIG,    0 },   /* rt_sigaction — the act recorded, and a handler now runs */
     {  14, LSC_SIG,    0 },   /* rt_sigprocmask — recorded; unblock delivers (step 2) */
+    {  15, LSC_SIG,    0 },   /* rt_sigreturn — the return trip: restored from the
+                               * frame the kernel built (increment 29); the row
+                               * exists because tools/linux_rt_sigreturn_census.txt
+                               * measured a handler returning */
+    {  39, LSC_TASK,   0 },   /* getpid — the group's leader pid (TG-1 I2) */
     /* M1 — the network bridge's eight numbers. Their semantics are the
      * sidecar's SocketOps, exactly as the fd class's are the VFS's. */
     {  41, LSC_NET,    0 },   /* socket */
@@ -170,7 +187,9 @@ const struct LinuxSyscallEntry linux_syscall_table[] = {
     {  48, LSC_NET,    0 },   /* shutdown */
     {  49, LSC_NET,    0 },   /* bind */
     {  50, LSC_NET,    0 },   /* listen */
+    {  56, LSC_THREAD, 0 },   /* clone — the Go thread shape, kernel-local (I2) */
     {  59, LSC_SPAWN,  0 },   /* execve — the spawn path */
+    {  60, LSC_TASK,   0 },   /* exit — thread-local teardown (TG-1 I2) */
     {  72, LSC_FD,     0 },   /* fcntl */
     {  74, LSC_FD,     0 },   /* fsync */
     {  77, LSC_FD,     0 },   /* ftruncate */
@@ -179,10 +198,27 @@ const struct LinuxSyscallEntry linux_syscall_table[] = {
     {  87, LSC_FD,     0 },   /* unlink */
     { 131, LSC_SIG,    0 },   /* sigaltstack — recorded, never delivered */
     { 158, LSC_MSR,    0 },   /* arch_prctl(ARCH_SET_FS) — §5.3's one MSR */
+    { 186, LSC_TASK,   0 },   /* gettid — this descriptor's pid (TG-1 I2) */
+    { 202, LSC_FUTEX,  0 },   /* futex — private wait/wake, kernel-local (I3) */
     { 217, LSC_FD,     0 },   /* getdents64 */
-    { 218, LSC_LOCAL,  0 },   /* set_tid_address — single-threaded: stored and ignored */
+    { 218, LSC_LOCAL,  0 },   /* set_tid_address — the sidecar answers the tid
+                               * echo; the KERNEL captures the word at the
+                               * first trap and clears it at exit (I5) */
     { 228, LSC_LOCAL,  0 },   /* clock_gettime — vDSO-backstopped (§5.5): a real trap here */
     { 231, LSC_EXIT,   0 },   /* exit_group — the sidecar reaps, frames return */
+    /* The Go gate's netpoll startup (TG-0): all four are required-by-runtime
+     * rows, and the sidecar records the descriptors and epoll membership
+     * with no event source behind them — epoll_pwait's zero-timeout probe
+     * answers 0, a blocking wait is refused by name (linux.rs answer_event). */
+    { 233, LSC_FD,     0 },   /* epoll_ctl */
+    { 257, LSC_FD,     0 },   /* openat — the gate's measured path open (I4) */
+    { 273, LSC_THREAD, 0 },   /* set_robust_list — I5: the thread's robust list,
+                               * walked and marked at its own exit; the row
+                               * exists because tools/linux_robust_list_census.txt
+                               * measured a real program's call */
+    { 281, LSC_FD,     0 },   /* epoll_pwait — zero-timeout probe only */
+    { 290, LSC_FD,     0 },   /* eventfd2 */
+    { 291, LSC_FD,     0 },   /* epoll_create1 */
 };
 const size_t linux_syscall_table_len =
     sizeof(linux_syscall_table) / sizeof(linux_syscall_table[0]);
@@ -216,6 +252,9 @@ const char *linux_syscall_class_name(enum LinuxSyscallClass cls)
     case LSC_SIG:    return "sig";
     case LSC_MSR:    return "msr";
     case LSC_SPAWN:  return "spawn";
+    case LSC_THREAD: return "thread";
+    case LSC_TASK:   return "task";
+    case LSC_FUTEX:  return "futex";
     case LSC_LOCAL:  return "local";
     case LSC_EXIT:   return "exit";
     case LSC_UNKNOWN:
@@ -366,6 +405,8 @@ struct LinuxFdWritePlan linux_fd_write_plan(uint64_t num,
 #define LAB_PTE_USER     0x4ULL
 #define LAB_PTE_PS       0x80ULL
 #define LAB_PTE_FRAME    0x000FFFFFFFFFF000ULL
+#define LAB_PTE_SOFT     (1ULL << 9)  /* E7 §10.15: PRESENT, U=0,
+                                       * soft-protected leaf */
 
 /* The copy. Read-ONLY by construction: every level is checked before the
  * next pointer is followed, and nothing anywhere writes a table — the
@@ -395,7 +436,7 @@ struct LinuxFdWritePlan linux_fd_write_plan(uint64_t num,
  * Frame -> pointer is the identity map's own claim (boot.asm: "the
  * physical addr = virtual addr"). */
 static int lab_walk_leaf(uint64_t root, uint64_t va, uint64_t *leaf_out,
-                         int require_rw)
+                         int require_rw, int accept_soft)
 {
     const uint64_t *tbl = (const uint64_t *)(uintptr_t)(root & LAB_PTE_FRAME);
     uint64_t leaf = 0;
@@ -408,7 +449,9 @@ static int lab_walk_leaf(uint64_t root, uint64_t va, uint64_t *leaf_out,
         if ((lvl == 1 || lvl == 2) && (e & LAB_PTE_PS))
             return -LINUX_EFAULT;   /* a huge page is not this shim's
                                      * user shape; refused by name */
-        if (!(e & LAB_PTE_USER)) return -LINUX_EFAULT;
+        if (!(e & LAB_PTE_USER) &&
+            !(lvl == 3 && accept_soft && (e & LAB_PTE_SOFT)))
+            return -LINUX_EFAULT;
         if (require_rw && !(e & LAB_PTE_RW)) return -LINUX_EFAULT;
         leaf = e;
         if (lvl < 3) tbl = (const uint64_t *)(uintptr_t)(e & LAB_PTE_FRAME);
@@ -422,7 +465,7 @@ int linux_user_copy_out(uint8_t *dst, uint64_t root, uint64_t va, uint32_t n)
     if (!dst) return -LINUX_EFAULT;
     while (n) {
         uint64_t leaf = 0;
-        if (lab_walk_leaf(root, va, &leaf, 0) != 0) return -LINUX_EFAULT;
+        if (lab_walk_leaf(root, va, &leaf, 0, 0) != 0) return -LINUX_EFAULT;
         {
             uint32_t off = (uint32_t)(va & (LINUX_PAGE_SIZE - 1u));
             uint32_t page_left = LINUX_PAGE_SIZE - off;
@@ -461,6 +504,11 @@ struct LinuxSigCopyPlan linux_sig_copy_plan(uint64_t num, const uint64_t args[6]
     p.src = 0;
     p.len = 0;
     p.refuse = 0;
+    /* sigaltstack installs do not need their stack_t copied IN: this v1
+     * records no alternative stack to deliver on, and the query's old
+     * stack_t is the reply plan's job (linux_fd_reply_plan). */
+    if (num == LINUX_SIGALTSTACK)
+        return p;
     if (num != LINUX_RT_SIGACTION && num != LINUX_RT_SIGPROCMASK)
         return p;   /* not a sig-class crossing */
     if (!args) return p;
@@ -506,6 +554,82 @@ struct LinuxSigCopyPlan linux_sig_copy_plan(uint64_t num, const uint64_t args[6]
 int linux_mprotect_refuses_wx(uint64_t prot)
 {
     return (prot & LINUX_PROT_WRITE) && (prot & LINUX_PROT_EXEC);
+}
+
+/* E7 §10.15: the first-trap and reply-recheck halves of a real mprotect.
+ * The range is bounded by the task's OWN image/stack/heap windows; the
+ * page tables are checked at the reply by the apply (a present 4 KiB leaf
+ * at every page), because a window can contain a hole. Nothing here maps,
+ * allocates or frees. */
+static int linux_mem_range_in(uint64_t addr, uint64_t len_r,
+                              uint64_t lo, uint64_t hi)
+{
+    return lo < hi && addr >= lo && addr <= hi &&
+           len_r <= hi - addr;
+}
+
+int linux_mem_mprotect_refusal(const struct LinuxMprotectReq *req,
+                               uint64_t image_lo, uint64_t image_hi,
+                               uint64_t stack_lo, uint64_t stack_hi,
+                               uint64_t heap_lo, uint64_t heap_hi)
+{
+    uint64_t len_r;
+
+    if (!req) return -LINUX_EINVAL;
+    if (req->len == 0) return -LINUX_EINVAL;
+    if (req->addr & (LINUX_PAGE_SIZE - 1)) return -LINUX_EINVAL;
+    if (req->len > UINT64_MAX - (LINUX_PAGE_SIZE - 1))
+        return -LINUX_EINVAL;
+    if (req->prot & ~(LINUX_PROT_READ | LINUX_PROT_WRITE |
+                      LINUX_PROT_EXEC)) return -LINUX_EINVAL;
+    if (linux_mprotect_refuses_wx(req->prot)) return -LINUX_EPERM;
+
+    len_r = (req->len + LINUX_PAGE_SIZE - 1)
+          & ~((uint64_t)LINUX_PAGE_SIZE - 1);
+    if (!linux_mem_range_in(req->addr, len_r, image_lo, image_hi) &&
+        !linux_mem_range_in(req->addr, len_r, stack_lo, stack_hi) &&
+        !linux_mem_range_in(req->addr, len_r, heap_lo, heap_hi))
+        return -LINUX_ENOMEM;
+    return 0;
+}
+
+struct LinuxMemMprotectVerdict
+linux_mem_mprotect_verdict(uint64_t image_lo, uint64_t image_hi,
+                           uint64_t stack_lo, uint64_t stack_hi,
+                           uint64_t heap_lo, uint64_t heap_hi,
+                           const struct LinuxMprotectReq *req, uint64_t rax)
+{
+    struct LinuxMemMprotectVerdict v;
+    uint64_t len_r;
+
+    v.malformed = 0;
+    v.va = 0;
+    v.pages = 0;
+
+    /* A negative answer is the sidecar's refusal: its errno rides the
+     * §5.7 map and nothing changes. mprotect's success value is 0, so any
+     * other non-negative reply is a lie the kernel must not act on. */
+    if ((int64_t)rax < 0) return v;
+    if (rax != 0) {
+        v.malformed = 1;
+        return v;
+    }
+
+    /* The ladder re-runs over the staged words: the verdict is total on
+     * any input, including a success for a shape the first trap would
+     * have refused. */
+    if (linux_mem_mprotect_refusal(req, image_lo, image_hi,
+                                   stack_lo, stack_hi,
+                                   heap_lo, heap_hi) != 0) {
+        v.malformed = 1;
+        return v;
+    }
+
+    len_r = (req->len + LINUX_PAGE_SIZE - 1)
+          & ~((uint64_t)LINUX_PAGE_SIZE - 1);
+    v.va = req->addr;
+    v.pages = len_r / LINUX_PAGE_SIZE;
+    return v;
 }
 
 struct LinuxMemBrkVerdict linux_mem_brk_verdict(uint64_t heap_base,
@@ -686,7 +810,12 @@ linux_mem_mmap_verdict(uint64_t heap_base, uint64_t heap_limit,
     v.map_pages = (req->prot == LINUX_PROT_NONE)
                 ? 0 : v.range_pages;
     v.prot_write = (req->prot & LINUX_PROT_WRITE) ? 1 : 0;
-    v.new_mmap_top = is_fixed ? mmap_top : rax;
+    /* A non-fixed addr is a hint, not the anonymous-map cursor: Linux
+     * leaves the cursor alone and keeps serving NULL maps elsewhere. The
+     * Go gate depends on that (its arena hint 0xc000000000 is followed by
+     * 32 MiB and small NULL maps). Only a NULL-address grant descends the
+     * cursor; a FIXED map never does either. */
+    v.new_mmap_top = (is_fixed || req->addr != 0) ? mmap_top : rax;
     return v;
 }
 
@@ -756,7 +885,11 @@ linux_mem_munmap_verdict(uint64_t heap_base, uint64_t heap_limit,
 uint64_t linux_user_page_frame(uint64_t root, uint64_t va)
 {
     uint64_t leaf = 0;
-    if (lab_walk_leaf(root, va, &leaf, 0) != 0) return 0;
+    /* The OWNERSHIP read, not a copy: a soft-protected leaf is still this
+     * task's frame and munmap/brk/map unwind must be able to return it.
+     * linux_user_copy_out/in call the same walker with accept_soft=0 and
+     * keep the U=1 boundary. */
+    if (lab_walk_leaf(root, va, &leaf, 0, 1) != 0) return 0;
     return leaf & LAB_PTE_FRAME;
 }
 
@@ -772,7 +905,7 @@ uint64_t linux_user_page_frame(uint64_t root, uint64_t va)
  * validate EVERY page of the span before a single byte moves. */
 static int lab_walk_leaf_rw(uint64_t root, uint64_t va, uint64_t *leaf_out)
 {
-    return lab_walk_leaf(root, va, leaf_out, 1);
+    return lab_walk_leaf(root, va, leaf_out, 1, 0);
 }
 
 int linux_user_copy_in(const uint8_t *src, uint64_t root, uint64_t va,
@@ -844,12 +977,19 @@ struct LinuxFdReplyPlan linux_fd_reply_plan(uint64_t num, const uint64_t args[6]
     if (!args) return p;
 
     /* The sig class — increment 12's copy-IN, unchanged in shape, now
-     * named as the RAW family (the payload lands verbatim). */
-    if (num == LINUX_RT_SIGACTION || num == LINUX_RT_SIGPROCMASK) {
-        if (args[2] == 0) return p;   /* no out-pointer: nothing owed */
-        p.dst  = args[2];
+     * named as the RAW family (the payload lands verbatim). sigaltstack
+     * is the class's third number: its query returns one 24-byte
+     * struct stack_t at args[1], while an install (args[0] non-NULL)
+     * needs no input copy because this v1 never delivers a signal on
+     * an alternative stack. */
+    if (num == LINUX_RT_SIGACTION || num == LINUX_RT_SIGPROCMASK ||
+        num == LINUX_SIGALTSTACK) {
+        uint64_t out = (num == LINUX_SIGALTSTACK) ? 1u : 2u;
+        if (args[out] == 0) return p;   /* no out-pointer: nothing owed */
+        p.dst  = args[out];
         p.len  = (num == LINUX_RT_SIGACTION) ? LINUX_SIGACT_BYTES
-                                             : LINUX_SIGSET_BYTES;
+               : (num == LINUX_SIGALTSTACK) ? LINUX_STACK_T_BYTES
+                                            : LINUX_SIGSET_BYTES;
         p.aux  = p.len;
         p.kind = LINUX_STAGE_RAW;
     } else if (num == LINUX_STAT || num == LINUX_LSTAT) {
@@ -970,6 +1110,18 @@ struct LinuxFdReplyPlan linux_fd_reply_plan(uint64_t num, const uint64_t args[6]
                                                    : LINUX_FD_WRITE_CHUNK;
         p.aux  = p.len;
         p.kind = LINUX_STAGE_RAW;
+    } else if (num == LINUX_TKILL) {
+        /* E7 increment 28: tkill's answer can BE a delivery — the sidecar's
+         * 80-byte act request for a handler disposition. The plan stages a
+         * bound with NO user address (dst 0): the bytes are not owed to a
+         * pointer in the task, and the deliver's SIGFRAME arm must not copy
+         * them anywhere. len is the exact size, so the kernel's clamp and
+         * the sidecar's bound are the same number (the twin rule the other
+         * numbers already obey). */
+        p.dst  = 0;
+        p.len  = LINUX_SIGDELIVER_BYTES;
+        p.aux  = LINUX_SIGDELIVER_BYTES;
+        p.kind = LINUX_STAGE_SIGFRAME;
     } else {
         return p;   /* not a reply-payload number (total function) */
     }
@@ -1025,12 +1177,15 @@ struct LinuxFdPathPlan linux_fd_path_plan(uint64_t num, const uint64_t args[6])
     p.src2 = 0;
     p.two = 0;
     p.refuse = 0;
-    if (num != LINUX_RENAME && num != LINUX_OPEN && num != LINUX_STAT &&
-        num != LINUX_LSTAT && num != LINUX_UNLINK && num != LINUX_MKDIR) {
+    if (num != LINUX_RENAME && num != LINUX_OPEN && num != LINUX_OPENAT &&
+        num != LINUX_STAT && num != LINUX_LSTAT && num != LINUX_UNLINK &&
+        num != LINUX_MKDIR) {
         return p;   /* this number carries no path (total function) */
     }
     if (!args) return p;
-    p.src  = args[0];
+    /* openat's args[0] is the dirfd; the pathname is args[1]. Every other
+     * path number names its path in args[0]. */
+    p.src  = (num == LINUX_OPENAT) ? args[1] : args[0];
     p.two  = (num == LINUX_RENAME);
     p.src2 = p.two ? args[1] : 0;
     return p;
@@ -1181,6 +1336,23 @@ int linux_reply_zero_ok(uint64_t num)
 {
     if (num == LINUX_READ || num == LINUX_GETDENTS64 ||
         num == LINUX_RECVFROM) return 1;
+    /* sigaltstack(&new, NULL) is a legal install with no old-stack
+     * out-pointer: the reply owes no struct and is STATUS_OK with zero
+     * payload. When args[1] is non-NULL the sidecar returns the 24-byte
+     * stack_t and this arm is not reachable for it (shape 2). */
+    if (num == LINUX_SIGALTSTACK) return 1;
+    /* tkill's staged payload IS the delivery request, and only a handler
+     * disposition owes one (shape 2, 80 bytes). The other three successes
+     * of that same arm owe NOTHING and Linux answers 0 for each: the
+     * signal was blocked and now PENDS, its disposition is SIG_IGN, or the
+     * call is the SIG 0 existence probe. The stage is armed for every
+     * forwarded tkill because the kernel cannot know which answer the
+     * disposition will produce, so without this rule the shape-1 check
+     * would refuse all three with -EPROTO — a protocol complaint to a task
+     * that asked for none. A delivery answer that arrives WITHOUT its
+     * frame is still refused: that reply is 80 bytes and shape 2, where
+     * linux_reply_shape_ok holds n to the exact bound. */
+    if (num == LINUX_TKILL) return 1;
     return 0;
 }
 
@@ -1212,6 +1384,16 @@ int linux_reply_shape_ok(uint64_t num, uint64_t ret, uint32_t n)
      * payload (or the wrong size) is refused before any byte is written. */
     if (num == LINUX_CLOCK_GETTIME)
         return ret == 0 && n == LINUX_TIMESPEC_BYTES;
+    /* sigaltstack: success and exactly one stack_t back when the caller
+     * asked for the old one. */
+    if (num == LINUX_SIGALTSTACK)
+        return ret == 0 && n == LINUX_STACK_T_BYTES;
+    /* E7 increment 28: tkill's success that RUNS a handler carries exactly
+     * the delivery request. A shorter payload is a request with a word the
+     * sidecar never sent; a longer one is a message from a different
+     * conversation — both refused before anything is built. */
+    if (num == LINUX_TKILL)
+        return ret == 0 && n == LINUX_SIGDELIVER_BYTES;
     return ret == 0;
 }
 
@@ -1301,6 +1483,377 @@ uint64_t linux_syscall_apply_reply(struct SLSLinuxSyscallRequest *req,
     if (req->status == 0)
         return req->ret;
     return (uint64_t)(int64_t)linux_errno_from_cap(req->status);
+}
+
+/* ─── E7 increment 27 (P1-C, "the delivery") ──────────────────────────────
+ * The frame builder's caller. Three pieces, each refusing before it mutates:
+ *
+ *   the REQUEST  — the sidecar's act words, decoded from a fixed 80-byte
+ *                  reply payload. A length that is not exactly 80 is not a
+ *                  truncated answer to be repaired; it is not an answer.
+ *   the ADDRESS  — si_addr, from the numbers the trap path actually has.
+ *                  CR2 for a fault that has an address, RIP for the two
+ *                  that fault on an instruction, nothing for the rest.
+ *   the WRITE    — build, then write the 440 bytes through
+ *                  linux_user_copy_in against the task's own cr3. Two
+ *                  phases, so a stack the task made read-only is -EFAULT
+ *                  with the guest's memory untouched: a signal is the last
+ *                  thing that may fault in ring 0.
+ *
+ * Registers are NOT applied here. The caller (the return-to-user path) owns
+ * that, which is what keeps this half host-testable against fake tables. */
+static uint64_t sig_get64(const uint8_t *p);
+static uint32_t sig_get32(const uint8_t *p);
+
+int linux_sig_deliver_req_parse(const uint8_t *bytes, uint32_t len,
+                                struct LinuxSigDeliverReq *out)
+{
+    if (!bytes || !out) return -LINUX_EINVAL;
+    if (len != LINUX_SIGDELIVER_BYTES) return -LINUX_EINVAL;
+
+    out->signo     = sig_get32(bytes + 0);
+    out->code      = sig_get32(bytes + 4);
+    out->addr      = sig_get64(bytes + 8);
+    out->handler   = sig_get64(bytes + 16);
+    out->restorer  = sig_get64(bytes + 24);
+    out->act_flags = sig_get64(bytes + 32);
+    out->act_mask  = sig_get64(bytes + 40);
+    out->blocked   = sig_get64(bytes + 48);
+    out->alt_sp    = sig_get64(bytes + 56);
+    out->alt_size  = sig_get64(bytes + 64);
+    out->alt_flags = sig_get32(bytes + 72);
+    out->siginfo   = sig_get32(bytes + 76);
+
+    /* The frame builder repeats these two refusals; doing them here as well
+     * means a decodable-but-unrunnable answer never reaches the write path
+     * at all. */
+    if (out->signo == 0u || out->signo > 64u) return -LINUX_EINVAL;
+    if (out->handler <= 1u) return -LINUX_EINVAL;   /* SIG_DFL / SIG_IGN */
+    if (out->restorer == 0u) return -LINUX_EINVAL;  /* a handler that cannot
+                                                    * return is not a delivery */
+    return 0;
+}
+
+int linux_sig_si_addr(uint32_t signo, uint64_t cr2, uint64_t rip, uint64_t *out)
+{
+    if (!out) return 0;
+    switch (signo) {
+    case 11u:                       /* SIGSEGV */
+    case 7u:                        /* SIGBUS  */
+        *out = cr2;                 /* cr2 == 0 is a real address here: the
+                                     * NULL a segfault was taken on */
+        return 1;
+    case 8u:                        /* SIGFPE  */
+    case 4u:                        /* SIGILL  */
+        *out = rip;                 /* the faulting INSTRUCTION — CR2 is
+                                     * stale or never loaded on this path */
+        return 1;
+    default:
+        return 0;                   /* no address belongs to it; the caller
+                                     * keeps the sidecar's own addr */
+    }
+}
+
+/* ─── E7 increment 28: the park-context bridge ───────────────────────────
+ * The offsets are CapParkCtx's, named by cap_recv_resume's asm (see the
+ * header). Read and install are exact mirrors, so a round trip through
+ * them is the identity on every word the return path reads. */
+int linux_sig_park_read(const uint64_t *w, uint32_t words,
+                        struct LinuxSigRegs *ctx)
+{
+    if (!w || !ctx) return -LINUX_EINVAL;
+    if (words < LINUX_PARK_WORDS) return -LINUX_EINVAL;
+
+    {
+        uint32_t i;
+        for (i = 0; i < (uint32_t)LINUX_SIGREG_COUNT; i++) ctx->r[i] = 0;
+    }
+    ctx->eflags = w[0];                        /* r11 */
+    ctx->r[LINUX_SIGREG_RIP] = w[1];            /* rcx */
+    ctx->r[LINUX_SIGREG_R15] = w[2];
+    ctx->r[LINUX_SIGREG_R14] = w[3];
+    ctx->r[LINUX_SIGREG_R13] = w[4];
+    ctx->r[LINUX_SIGREG_R12] = w[5];
+    ctx->r[LINUX_SIGREG_RBX] = w[6];
+    ctx->r[LINUX_SIGREG_RBP] = w[7];
+    ctx->r[LINUX_SIGREG_RSP] = w[8];            /* user_rsp */
+    ctx->r[LINUX_SIGREG_RDI] = w[9];
+    ctx->r[LINUX_SIGREG_RSI] = w[10];
+    ctx->r[LINUX_SIGREG_RDX] = w[11];
+    ctx->r[LINUX_SIGREG_R10] = w[12];
+    ctx->r[LINUX_SIGREG_R8]  = w[13];
+    ctx->r[LINUX_SIGREG_R9]  = w[14];
+    ctx->r[LINUX_SIGREG_RAX] = w[15];
+    return 0;
+}
+
+int linux_sig_park_install(uint64_t *w, uint32_t words,
+                           const struct LinuxSigRegs *entry)
+{
+    if (!w || !entry) return -LINUX_EINVAL;
+    if (words < LINUX_PARK_WORDS) return -LINUX_EINVAL;
+
+    w[0]  = entry->eflags;
+    w[1]  = entry->r[LINUX_SIGREG_RIP];
+    w[2]  = entry->r[LINUX_SIGREG_R15];
+    w[3]  = entry->r[LINUX_SIGREG_R14];
+    w[4]  = entry->r[LINUX_SIGREG_R13];
+    w[5]  = entry->r[LINUX_SIGREG_R12];
+    w[6]  = entry->r[LINUX_SIGREG_RBX];
+    w[7]  = entry->r[LINUX_SIGREG_RBP];
+    w[8]  = entry->r[LINUX_SIGREG_RSP];
+    w[9]  = entry->r[LINUX_SIGREG_RDI];
+    w[10] = entry->r[LINUX_SIGREG_RSI];
+    w[11] = entry->r[LINUX_SIGREG_RDX];
+    w[12] = entry->r[LINUX_SIGREG_R10];
+    w[13] = entry->r[LINUX_SIGREG_R8];
+    w[14] = entry->r[LINUX_SIGREG_R9];
+    w[15] = entry->r[LINUX_SIGREG_RAX];   /* the return value to sysret with */
+    return 0;
+}
+
+/* E7 increment 29b: the return trip's gate (see the header). Two questions,
+ * in the order the reply path can answer them:
+ *
+ *   1. is this the number whose answer IS a context restore? (15, and only
+ *      15 — the gate belongs to rt_sigreturn, not to the sig class, or a
+ *      successful rt_sigprocmask would restore a frame nobody built);
+ *   2. did the reply APPLY at all? -EPROTO means the payload was not the
+ *      request struct, so `status` still holds describe's zero and is not
+ *      the sidecar's answer — a reply that never arrived must not read as
+ *      consent.
+ *
+ * Only then is the status the sidecar's, and only status 0 means its 15 arm
+ * restored the saved mask. Everything else is "do not touch the frame": the
+ * refusal (no handler entered) reaches the task as the errno the apply's map
+ * already produced, never as a discarded value behind a restore. */
+int linux_sig_return_reply_ok(uint64_t num, uint64_t rax, int32_t status)
+{
+    if (num != LINUX_RT_SIGRETURN) return 0;
+    if (rax == (uint64_t)(int64_t)(-LINUX_EPROTO)) return 0;
+    return status == 0;
+}
+
+/* E7 increment 32: the fault frame's return gate (see the header). Four
+ * questions, all of which must be yes, and each one fail-closed:
+ *
+ *   1. is a frame installed at all? (no frame -> nothing to restore, and
+ *      -EINVAL is the honest answer the existing probe asserts);
+ *   2. did that frame come from the TRAP rather than from a sidecar
+ *      delivery? (a sidecar frame keeps the gate above — if the sidecar ever
+ *      refuses its own delivery, the task must hear that refusal);
+ *   3. was the answer a refusal (status != 0), not a consent — the kernel
+ *      must never treat "the sidecar says 0" as its own case, because the
+ *      gate above already handles that one;
+ *   4. is the errno the task would have heard exactly -EINVAL? A different
+ *      refusal is a different fact (a crashed sidecar, a refused class) and
+ *      stays the task's answer, by name, exactly as it was before. */
+int linux_sig_fault_return_ok(int sig_active, int fault_active, uint64_t rax,
+                              int32_t status)
+{
+    if (!sig_active)   return 0;
+    if (!fault_active) return 0;
+    if (status == 0)   return 0;
+    return rax == (uint64_t)(int64_t)(-LINUX_EINVAL);
+}
+
+/* E7 increment 33: the window's two decisions (see the header). The gate is
+ * a conjunction because the two flags answer different questions — a frame
+ * is installed, and THAT frame came from the trap — and only both together
+ * mean the sidecar was never told which mask the task is running under. */
+int linux_sig_mask_fault_owned(int sig_active, int fault_active)
+{
+    return sig_active && fault_active;
+}
+
+/* POSIX's three mask operations, written the way the sidecar's 14 arm writes
+ * them so the two ends cannot drift: BLOCK unions, UNBLOCK differences,
+ * SETMASK replaces, and a `how` Linux does not have refuses with `*out`
+ * untouched (a failed call never half-changes the mask). No KILL/STOP bit is
+ * stripped, because the sidecar's arm strips none — the twin rule P9 holds.
+ * The QUERY shape (`set` NULL) never reaches here: Linux ignores `how` then,
+ * and so does the arm this mirrors. */
+int linux_sig_mask_step(uint64_t cur, uint64_t how, uint64_t set,
+                        uint64_t *out)
+{
+    if (!out) return 0;
+    switch (how) {
+    case 0: *out = cur | set;  return 1;   /* SIG_BLOCK   */
+    case 1: *out = cur & ~set; return 1;   /* SIG_UNBLOCK */
+    case 2: *out = set;        return 1;   /* SIG_SETMASK */
+    default: return 0;                     /* not a `how` Linux has */
+    }
+}
+
+/* E7 increment 34: does moving from `old` to `new_mask` UNBLOCK anything?
+ * That is the only way a pending signal can be revealed, so it is the whole
+ * condition under which the call owes the sidecar a probe — the arithmetic
+ * is the kernel's (increment 33), the reveal is not. Total and pure: a bit
+ * that was already free cannot be revealed by freeing it again. */
+int linux_sig_mask_reveals(uint64_t old, uint64_t new_mask)
+{
+    return (old & ~new_mask) != 0;
+}
+
+/* The one decision the dispatch makes for a trap handler's 14: the new mask
+ * (the sidecar's own arithmetic) and whether the call also owes a reveal.
+ * Both outputs are written only on success, so a refusal is -EINVAL with the
+ * caller's state exactly as it was. */
+int linux_sig_mask_fault_plan(uint64_t old, uint64_t how, uint64_t set,
+                              uint64_t *new_mask, int *needs_probe)
+{
+    uint64_t nm = 0;
+
+    if (!new_mask) return 0;
+    if (!linux_sig_mask_step(old, how, set, &nm)) return 0;
+    *new_mask = nm;
+    if (needs_probe) *needs_probe = linux_sig_mask_reveals(old, nm);
+    return 1;
+}
+
+/* E7 increment 35: is the frame the handler was entered with BEHIND the task?
+ * The delivery's own geometry is the whole test: the handler is entered with
+ * rsp == the frame's address and a handler's stack only grows downward, so a
+ * handler still inside its frame answers rsp <= frame_rsp at every syscall it
+ * makes. A longjmp pops rsp back to the setjmp caller — the interrupted
+ * context's side of the frame — which is strictly above it, and no code path
+ * that stays in the handler can be there. No recorded frame is nothing to
+ * abandon, not an abandonment. */
+int linux_sig_frame_abandoned(uint64_t frame_rsp, uint64_t user_rsp)
+{
+    if (frame_rsp == 0) return 0;
+    return user_rsp > frame_rsp;
+}
+
+int linux_sig_deliver(uint64_t root, const struct LinuxSigDeliverReq *req,
+                      const struct LinuxSigRegs *ctx, uint64_t cr2,
+                      struct LinuxSigRegs *entry, uint64_t *entry_mask)
+{
+    uint8_t frame[LINUX_SIGFRAME_SIZE];
+    struct LinuxSigFrameSpec spec;
+    struct LinuxSigRegs entry_local;
+    uint64_t mask_local = 0;
+    uint64_t addr = 0;
+    int r;
+
+    if (!req || !ctx || !entry) return -LINUX_EINVAL;
+
+    spec.signo     = req->signo;
+    spec.code      = req->code;
+    spec.addr      = linux_sig_si_addr(req->signo, cr2,
+                                       ctx->r[LINUX_SIGREG_RIP], &addr)
+                     ? addr : req->addr;
+    spec.handler   = req->handler;
+    spec.restorer  = req->restorer;
+    spec.act_flags = req->act_flags;
+    spec.act_mask  = req->act_mask;
+    spec.blocked   = req->blocked;
+    spec.user_rsp  = ctx->r[LINUX_SIGREG_RSP];
+    spec.alt_sp    = req->alt_sp;
+    spec.alt_size  = req->alt_size;
+    spec.alt_flags = req->alt_flags;
+    spec.siginfo   = req->siginfo;
+    spec.regs      = *ctx;
+
+    r = linux_sig_frame_build(frame, LINUX_SIGFRAME_SIZE, &spec,
+                              &entry_local, &mask_local);
+    if (r != 0) return r;           /* nothing written: the builder refuses
+                                     * before its first store */
+
+    r = linux_user_copy_in(frame, root, entry_local.r[LINUX_SIGREG_RSP],
+                           LINUX_SIGFRAME_SIZE);
+    if (r != 0) return r;           /* -EFAULT with the guest untouched:
+                                     * phase 1 walks every page first */
+
+    *entry = entry_local;
+    if (entry_mask) *entry_mask = mask_local;
+    return 0;
+}
+
+/* ─── E7 increment 31 (P1-C): the FAULT's own delivery ─────────────────────
+ * The pure half: a decided act plus the interrupted context in, a built
+ * frame and the handler's entry context out. No user page is touched here —
+ * the caller copies the frame through linux_user_copy_in — which is what
+ * lets the host test drive every branch with no page tables at all. */
+int linux_fault_act_index(uint32_t signo)
+{
+    switch (signo) {
+    case LINUX_SIGILL:  return 0;
+    case LINUX_SIGBUS:  return 1;
+    case LINUX_SIGFPE:  return 2;
+    case LINUX_SIGSEGV: return 3;
+    default:            return -1;
+    }
+}
+
+int linux_fault_act_record(struct LinuxFaultAct *slots, uint32_t signo,
+                           const uint8_t act[LINUX_SIGACT_BYTES])
+{
+    int i = linux_fault_act_index(signo);
+    if (i < 0 || !slots || !act) return 0;
+    /* The word order is the one the REST of this tree uses on the wire —
+     * {handler, flags, mask, restorer} — because the sidecar is the other
+     * reader of these exact bytes (its `sig.act[2]` is sa_mask and `[3]` the
+     * restorer). One order, two readers; a kernel that read the x86-64
+     * uapi's `{handler, flags, restorer, mask}` here would swap the mask and
+     * the restorer with the sidecar and deliver with the wrong one of the
+     * two. §10.26 names the wider discrepancy this inherits. */
+    slots[i].handler  = sig_get64(act + 0);
+    slots[i].flags    = sig_get64(act + 8);
+    slots[i].mask     = sig_get64(act + 16);
+    slots[i].restorer = sig_get64(act + 24);
+    return 1;
+}
+
+int linux_fault_sig_plan(const struct LinuxFaultAct *act, uint64_t blocked,
+                         uint32_t signo, uint32_t code, uint64_t cr2,
+                         const struct LinuxSigRegs *ctx,
+                         uint8_t frame[LINUX_SIGFRAME_SIZE],
+                         struct LinuxSigRegs *entry, uint64_t *entry_mask)
+{
+    struct LinuxSigFrameSpec spec;
+    struct LinuxSigRegs entry_local;
+    uint64_t mask = 0;
+    uint64_t addr = 0;
+    int r;
+
+    if (!act || !ctx || !frame || !entry || !entry_mask) return -LINUX_EINVAL;
+
+    /* The two "no frame" answers, decided before anything is built: a
+     * disposition that is not a handler (SIG_DFL/SIG_IGN — the caller's kill
+     * is Linux's own answer), a blocked signal (it would PEND, and this path
+     * has no queue to pend it in), and no restorer (the builder's own
+     * refusal, hoisted so the refusal is not mistaken for a fault). */
+    if (!linux_sig_delivery_needed(blocked, signo, act->handler)) return 0;
+    if (act->restorer == 0) return 0;
+
+    spec.signo     = signo;
+    spec.code      = code;
+    spec.addr      = linux_sig_si_addr(signo, cr2,
+                                       ctx->r[LINUX_SIGREG_RIP], &addr)
+                     ? addr : 0;
+    spec.handler   = act->handler;
+    spec.restorer  = act->restorer;
+    spec.act_flags = act->flags;
+    spec.act_mask  = act->mask;
+    spec.blocked   = blocked;
+    spec.user_rsp  = ctx->r[LINUX_SIGREG_RSP];
+    /* v1 records no sigaltstack (increment 26's named limit), so the frame
+     * always goes on the interrupted stack. */
+    spec.alt_sp    = 0;
+    spec.alt_size  = 0;
+    spec.alt_flags = LINUX_SS_DISABLE;
+    spec.siginfo   = (act->flags & LINUX_SA_SIGINFO) ? 1u : 0u;
+    spec.regs      = *ctx;
+
+    r = linux_sig_frame_build(frame, LINUX_SIGFRAME_SIZE, &spec,
+                              &entry_local, &mask);
+    if (r != 0) return r;      /* nothing written: the builder refuses before
+                                * its first store */
+
+    *entry = entry_local;
+    *entry_mask = mask;
+    return 1;
 }
 
 /* ─── The initial stack and auxv (§5.2) ────────────────────────────────────
@@ -1480,4 +2033,288 @@ size_t linux_stack_hwm_headroom(const uint8_t *region, size_t bytes,
     if (!region) return 0;
     while (i < bytes && region[i] == poison) i++;
     return i;
+}
+
+/* ═══ E7 increment 26 (P1-C, "the frame") — the signal frame as bytes ════
+ * The header carries the why and the layout table. This is the mechanism's
+ * pure half: a byte writer, a byte reader and three predicates. No user
+ * memory is touched (the caller hands us a staging buffer), no allocation,
+ * no state — so the host test drives every branch and the guard's clause P
+ * pins the numbers.
+ *
+ * The layout is pinned THREE ways, deliberately redundant: the macros in
+ * the header (what the host test reads), a local mirror of the two kernel
+ * structs (below) and _Static_asserts tying one to the other. A field the
+ * compiler packs differently, or a number edited in one place, stops the
+ * build instead of producing a frame a libc misreads at run time. */
+
+/* The kernel's `struct sigcontext`, field for field (asm/sigcontext.h).
+ * Only the offsets matter; the types exist so offsetof can speak. */
+struct LinuxSigContextMirror {
+    uint64_t r8, r9, r10, r11, r12, r13, r14, r15;
+    uint64_t rdi, rsi, rbp, rbx, rdx, rax, rcx, rsp, rip;
+    uint64_t eflags;
+    uint16_t cs, gs, fs, pad0;
+    uint64_t err, trapno, oldmask, cr2;
+    uint64_t fpstate;
+    uint64_t reserved1[8];
+};
+
+/* The kernel's `struct ucontext` prefix, up to and including sigmask. */
+struct LinuxUContextMirror {
+    uint64_t uc_flags;
+    uint64_t uc_link;
+    struct { uint64_t ss_sp; int32_t ss_flags; uint32_t pad; uint64_t ss_size; } uc_stack;
+    struct LinuxSigContextMirror uc_mcontext;
+    uint64_t uc_sigmask;         /* the kernel-ABI sigset: 8 bytes */
+};
+
+/* `struct rt_sigframe` as this increment writes it (pretcode, uc, info). */
+struct LinuxRtSigframeMirror {
+    uint64_t pretcode;
+    struct LinuxUContextMirror uc;
+    uint8_t info[128];
+};
+
+_Static_assert(sizeof(struct LinuxSigContextMirror) == LINUX_SIGFRAME_MCONTEXT_BYTES,
+               "sigcontext is 256 bytes (asm/sigcontext.h)");
+_Static_assert(offsetof(struct LinuxSigContextMirror, r8) == 0,
+               "sigcontext's gregs start with r8, not rdi — the kernel order");
+_Static_assert(offsetof(struct LinuxSigContextMirror, rip) == 128,
+               "rip is greg 16, at 128 bytes into the sigcontext");
+_Static_assert(offsetof(struct LinuxSigContextMirror, eflags) == LINUX_SIGCTX_EFLAGS,
+               "eflags follows the 17 gregs");
+_Static_assert(offsetof(struct LinuxSigContextMirror, cs) == LINUX_SIGCTX_CS,
+               "cs/gs/fs are u16s after eflags");
+_Static_assert(offsetof(struct LinuxSigContextMirror, err) == LINUX_SIGCTX_ERR,
+               "err/trapno/oldmask/cr2 follow the selectors and their pad");
+_Static_assert(offsetof(struct LinuxSigContextMirror, fpstate) == LINUX_SIGCTX_FPSTATE,
+               "the fpstate pointer is the last named field before reserved1");
+_Static_assert(offsetof(struct LinuxUContextMirror, uc_mcontext) ==
+                   LINUX_SIGFRAME_MCONTEXT - LINUX_SIGFRAME_UC,
+               "uc_mcontext sits 40 bytes into the ucontext");
+_Static_assert(offsetof(struct LinuxUContextMirror, uc_sigmask) == 296,
+               "uc_sigmask follows the 256-byte sigcontext, 40 bytes into the ucontext");
+_Static_assert(offsetof(struct LinuxRtSigframeMirror, uc) == LINUX_SIGFRAME_UC,
+               "pretcode is one pointer, then the ucontext");
+_Static_assert(offsetof(struct LinuxRtSigframeMirror, info) == LINUX_SIGFRAME_INFO,
+               "siginfo follows the ucontext");
+_Static_assert(sizeof(struct LinuxRtSigframeMirror) == LINUX_SIGFRAME_SIZE,
+               "the frame ends where the (absent) fpstate would begin");
+
+/* Byte helpers: the kernel is freestanding and this file carries no libc
+ * dependency, so the frame is written little-endian by hand. */
+static void sig_put64(uint8_t *p, uint64_t v)
+{
+    int i;
+    for (i = 0; i < 8; i++) p[i] = (uint8_t)(v >> (8 * i));
+}
+
+static void sig_put32(uint8_t *p, uint32_t v)
+{
+    int i;
+    for (i = 0; i < 4; i++) p[i] = (uint8_t)(v >> (8 * i));
+}
+
+static void sig_put16(uint8_t *p, uint16_t v)
+{
+    int i;
+    for (i = 0; i < 2; i++) p[i] = (uint8_t)(v >> (8 * i));
+}
+
+static uint64_t sig_get64(const uint8_t *p)
+{
+    uint64_t v = 0;
+    int i;
+    for (i = 7; i >= 0; i--) v = (v << 8) | p[i];
+    return v;
+}
+
+static uint16_t sig_get16(const uint8_t *p)
+{
+    return (uint16_t)(p[0] | ((uint16_t)p[1] << 8));
+}
+static uint32_t sig_get32(const uint8_t *p)
+{
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+/* One delivery's stack choice, so the builder's two callers (build and the
+ * caller deciding where the handler runs) cannot disagree. Linux's rule:
+ * SA_ONSTACK with a usable altstack runs there and says SS_ONSTACK; without
+ * one the handler runs on the interrupted stack. */
+static uint64_t sig_handler_stack(const struct LinuxSigFrameSpec *spec,
+                                  int *onstack)
+{
+    *onstack = 0;
+    if (spec->alt_sp != 0 &&
+        spec->alt_size >= (uint64_t)LINUX_SIGFRAME_SIZE + 8u &&
+        (spec->alt_flags & (uint32_t)LINUX_SS_DISABLE) == 0 &&
+        (spec->act_flags & LINUX_SA_ONSTACK) != 0) {
+        *onstack = 1;
+        return spec->alt_sp + spec->alt_size;
+    }
+    return spec->user_rsp;
+}
+
+int linux_sig_frame_build(uint8_t *buf, uint32_t cap,
+                          const struct LinuxSigFrameSpec *spec,
+                          struct LinuxSigRegs *entry, uint64_t *entry_mask)
+{
+    uint64_t top, rsp, mask;
+    int onstack, i;
+
+    if (buf == 0 || spec == 0 || entry == 0) return -LINUX_EINVAL;
+    if (cap < LINUX_SIGFRAME_SIZE) return -LINUX_EINVAL;
+    if (spec->signo == 0 || spec->signo > 64) return -LINUX_EINVAL;
+    /* SIG_DFL (0) and SIG_IGN (1) are reserved words, never addresses: a
+     * frame for one would jump to NULL or to 1. */
+    if (spec->handler <= 1) return -LINUX_EINVAL;
+    /* No restorer, no return: the handler's `ret` would aim at whatever the
+     * frame's pretcode says, and Linux's fallback (the vDSO trampoline) does
+     * not exist here. Refusing is the honest answer. */
+    if (spec->restorer == 0) return -LINUX_EINVAL;
+
+    top = sig_handler_stack(spec, &onstack);
+    /* Room for the frame plus the 8-byte alignment step below, with a
+     * non-wrapping subtraction. */
+    if (top < (uint64_t)LINUX_SIGFRAME_SIZE + 24u) return -LINUX_EINVAL;
+    /* Linux's alignment: (sp - size) & -16, then -8, so the handler is
+     * entered with rsp % 16 == 8 — the ABI's "after a call" shape, which is
+     * what a compiler's prologue assumes. */
+    rsp = ((top - (uint64_t)LINUX_SIGFRAME_SIZE) & ~(uint64_t)0xF) - 8u;
+
+    /* The mask Linux installs for the handler: the thread's own blocked set,
+     * the action's mask, and the signal being delivered — unless SA_NODEFER
+     * asked for it not to be blocked (a handler that must see recursion). */
+    mask = spec->blocked | spec->act_mask;
+    if ((spec->act_flags & LINUX_SA_NODEFER) == 0)
+        mask |= (uint64_t)1u << (spec->signo - 1u);
+
+    for (i = 0; i < (int)LINUX_SIGFRAME_SIZE; i++) buf[i] = 0;
+
+    sig_put64(buf + LINUX_SIGFRAME_PRETCODE, spec->restorer);
+    sig_put64(buf + LINUX_SIGFRAME_UC_FLAGS, 0);
+    sig_put64(buf + LINUX_SIGFRAME_UC_LINK, 0);
+    if (onstack) {
+        sig_put64(buf + LINUX_SIGFRAME_UC_STACK + 0, spec->alt_sp);
+        sig_put32(buf + LINUX_SIGFRAME_UC_STACK + 8, LINUX_SS_ONSTACK);
+        sig_put64(buf + LINUX_SIGFRAME_UC_STACK + 16, spec->alt_size);
+    }
+
+    for (i = 0; i < (int)LINUX_SIGREG_COUNT; i++)
+        sig_put64(buf + LINUX_SIGFRAME_MCONTEXT + (uint64_t)i * 8u, spec->regs.r[i]);
+    sig_put64(buf + LINUX_SIGFRAME_MCONTEXT + LINUX_SIGCTX_EFLAGS, spec->regs.eflags);
+    sig_put16(buf + LINUX_SIGFRAME_MCONTEXT + LINUX_SIGCTX_CS, LINUX_SIGFRAME_USER_CS);
+    /* fpstate stays NULL: this increment carries no FP state (header's named
+     * limit). cr2/err/trapno/oldmask are 0 for the same reason — nothing
+     * here faults, and a stale fault address in a SIGTERM frame is a lie. */
+
+    /* uc_sigmask at 304 carries the mask the handler's RETURN restores —
+     * the thread's own blocked set as it was BEFORE this delivery — not the
+     * mask the handler runs under. Linux's own frame setup copies
+     * current->blocked here before it adds sa_mask and the signal, and
+     * sys_rt_sigreturn restores from this field; a frame that stored the
+     * handler's mask would leave the signal permanently blocked after one
+     * return. The handler's mask travels in *entry_mask (and, in
+     * production, in the task's own blocked state). */
+    sig_put64(buf + LINUX_SIGFRAME_SIGMASK, spec->blocked);
+
+    sig_put32(buf + LINUX_SIGFRAME_INFO + 0, spec->signo);  /* si_signo */
+    sig_put32(buf + LINUX_SIGFRAME_INFO + 4, 0);            /* si_errno */
+    sig_put32(buf + LINUX_SIGFRAME_INFO + 8, spec->code);   /* si_code  */
+    /* si_addr is the union's first member for the fault signals, 16 bytes
+     * in. Written unconditionally: a 0 there is "no address", not stale. */
+    sig_put64(buf + LINUX_SIGFRAME_INFO + 16, spec->addr);
+
+    /* The handler's entry context: the interrupted registers, with rsp/rip
+     * aimed at the frame and the handler, and the three arguments the ABI
+     * names (signo; then siginfo and ucontext when SA_SIGINFO was set). */
+    *entry = spec->regs;
+    entry->r[LINUX_SIGREG_RSP] = rsp;
+    entry->r[LINUX_SIGREG_RIP] = spec->handler;
+    entry->r[LINUX_SIGREG_RDI] = spec->signo;
+    if (spec->siginfo) {
+        entry->r[LINUX_SIGREG_RSI] = rsp + LINUX_SIGFRAME_INFO;
+        entry->r[LINUX_SIGREG_RDX] = rsp + LINUX_SIGFRAME_UC;
+    }
+    if (entry_mask) *entry_mask = mask;
+    return 0;
+}
+
+int linux_sig_frame_restore(const uint8_t *buf, uint32_t len,
+                            struct LinuxSigRegs *regs, uint64_t *mask)
+{
+    int i;
+
+    if (buf == 0 || regs == 0) return -LINUX_EINVAL;
+    if (len < LINUX_SIGFRAME_SIZE) return -LINUX_EINVAL;
+    /* The frame must have been built for a USER handler. cs is the one field
+     * a forged frame cannot pick correctly by accident, and a restore that
+     * accepted, say, cs=0x10 would return to ring 0 with the guest's
+     * registers. */
+    if (sig_get16(buf + LINUX_SIGFRAME_MCONTEXT + LINUX_SIGCTX_CS) !=
+        (uint16_t)LINUX_SIGFRAME_USER_CS)
+        return -LINUX_EINVAL;
+
+    for (i = 0; i < (int)LINUX_SIGREG_COUNT; i++)
+        regs->r[i] = sig_get64(buf + LINUX_SIGFRAME_MCONTEXT + (uint64_t)i * 8u);
+    regs->eflags = sig_get64(buf + LINUX_SIGFRAME_MCONTEXT + LINUX_SIGCTX_EFLAGS);
+    if (mask) *mask = sig_get64(buf + LINUX_SIGFRAME_SIGMASK);
+    return 0;
+}
+
+int linux_sig_default_action(uint32_t signo)
+{
+    switch (signo) {
+    case 17:                    /* SIGCHLD  */
+    case 23:                    /* SIGURG   */
+    case 28:                    /* SIGWINCH */
+        return LINUX_SIGDEF_IGNORE;
+    case 18:                    /* SIGCONT  */
+        return LINUX_SIGDEF_CONTINUE;
+    case 19:                    /* SIGSTOP  */
+    case 20:                    /* SIGTSTP  */
+    case 21:                    /* SIGTTIN  */
+    case 22:                    /* SIGTTOU  */
+        return LINUX_SIGDEF_STOP;
+    case 6:                     /* SIGABRT */
+    case 7:                     /* SIGBUS  */
+    case 8:                     /* SIGFPE  */
+    case 4:                     /* SIGILL  */
+    case 3:                     /* SIGQUIT */
+    case 11:                    /* SIGSEGV */
+    case 31:                    /* SIGSYS  */
+    case 5:                     /* SIGTRAP */
+    case 24:                    /* SIGXCPU */
+    case 25:                    /* SIGXFSZ */
+        return LINUX_SIGDEF_CORE;
+    case 0:
+        return LINUX_SIGDEF_NONE;
+    default:
+        /* 1..64 not named above terminate without a core (SIGHUP, SIGINT,
+         * SIGKILL, SIGTERM, SIGUSR1/2, the real-time range, ...), which is
+         * what Linux's table says for every one of them. */
+        return (signo <= 64) ? LINUX_SIGDEF_TERMINATE : LINUX_SIGDEF_NONE;
+    }
+}
+
+int linux_sig_delivery_needed(uint64_t blocked, uint32_t signo,
+                              uint64_t handler)
+{
+    if (signo == 0 || signo > 64) return 0;
+    if (blocked & ((uint64_t)1u << (signo - 1u))) return 0;
+    if (handler <= 1) return 0;   /* SIG_DFL / SIG_IGN: no frame */
+    return 1;
+}
+
+int linux_sig_park_is_eintr(uint32_t signo, uint64_t blocked,
+                            uint64_t handler, uint64_t act_flags)
+{
+    if (signo == 0 || signo > 64) return 0;
+    if (blocked & ((uint64_t)1u << (signo - 1u))) return 0;
+    if (handler <= 1) return 0;
+    if (act_flags & LINUX_SA_RESTART) return 0;
+    return 1;
 }

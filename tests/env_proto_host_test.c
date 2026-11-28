@@ -55,14 +55,14 @@ int main(void) {
           "the register body is a padding-free image of struct EnvCkptRegister");
     CHECK(ENV_REGISTER_REPLY_BODY_SIZE ==
               16 + ENV_CKPT_MAX_REGIONS * 16 + 4 + ENV_CKPT_MAX_CHANS * 4 +
-              4 + ENV_CKPT_MAX_TASKS * ENV_CKPT_NAME_LEN + ENV_CKPT_MAX_TASKS * 4,
-          "the body is field-sum, so a count change on either side moves it");
+              4 + ENV_CKPT_REG_TASKS * ENV_CKPT_NAME_LEN + ENV_CKPT_REG_TASKS * 4,
+          "the body is field-sum over the stable four-slot registration cap");
     CHECK(ENV_REQ_MAX == ENV_FRAME_SIZE + ENV_CREATE_BODY_SIZE &&
           ENV_REPLY_MAX == ENV_FRAME_SIZE + ENV_REGISTER_REPLY_BODY_SIZE,
           "ENV_REPLY_MAX covers the widest reply (a registration)");
     CHECK(ENV_CKPT_MAX_REGIONS == 3 && ENV_CKPT_MAX_CHANS == 4 &&
-          ENV_CKPT_MAX_TASKS == 4 && ENV_CKPT_NAME_LEN == 24,
-          "the register body's counts are the record's");
+          ENV_CKPT_REG_TASKS == 4 && ENV_CKPT_NAME_LEN == 24,
+          "the register body's counts are the wire's, independent of the record task cap");
     CHECK(ENV_CKPT_REGION_POSIX_HEAP == 1 && ENV_CKPT_REGION_RD_HEAP == 2 &&
           ENV_CKPT_REGION_RD_STORAGE == 3 &&
           ENV_CKPT_TASK_POSIX_SIDECAR == 0 && ENV_CKPT_TASK_RAMDISK_SIDECAR == 1 &&

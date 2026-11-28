@@ -279,7 +279,7 @@
 //   PERSIST_TLS_LBA   7680 + 8 sectors -> ends 7688
 //   +1 frame safety gap, matching every other boundary in this file
 //   PERSIST_ENV_CKPT_HDR_LBA 7696 + 8  -> ends 7704   (header: count + record size + version)
-//   PERSIST_ENV_CKPT_ENT_LBA 7704 + 8  -> ends 7712   (env_ckpt_table[]: 8 x 368 B = 2,944 B)
+//   PERSIST_ENV_CKPT_ENT_LBA 7704 + 8  -> ends 7712   (env_ckpt_table[]: 4 x 784 B = 3,136 B)
 //   PERSIST_ENVSTOR_* / PERSIST_ENV_PAYLOAD_* (below) -> ends 7760
 //   PERSIST_ENV_REPLICA_* (below)                      -> ends 7776   (P3 destination (a))
 //   STREAM_DIR_LBA    8192                             -> 416 sectors / 52 frames still free

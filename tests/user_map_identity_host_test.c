@@ -18,8 +18,10 @@
  *      faults fetching the next instruction (the exact QEMU failure);
  *   3. the kernel's own tables are never modified.
  *
- * Build and run:
- *   gcc -std=c11 -Wall -Wextra -I . -I kernel \
+ * Build and run (non-PIE: the teardown walk compares against the
+ * linker's low kernel-image end; a PIE binary would put it above the
+ * synthetic frames and refuse them all):
+ *   gcc -no-pie -std=c11 -Wall -Wextra -I . -I kernel \
  *       -o /tmp/user_map_identity_host_test \
  *       tests/user_map_identity_host_test.c arch/x86/user_paging.c
  *   /tmp/user_map_identity_host_test
@@ -58,8 +60,13 @@ char _kernel_image_end[1];
  * no-op — the host test only exercises the map/unmap arithmetic. */
 int cap_frame_in_arena(uint64_t paddr) { (void)paddr; return 0; }
 uint32_t frame_pool_frame_owner(uint64_t frame_index) { (void)frame_index; return 0; }
+static void* g_freed[1024];
+static int g_nfreed;
 int free_physical_ram_frame_for_partition(void* frame, uint32_t partition_id) {
-    (void)frame; (void)partition_id; return 0;
+    (void)partition_id;
+    if (g_nfreed < (int)(sizeof g_freed / sizeof g_freed[0]))
+        g_freed[g_nfreed++] = frame;
+    return 0;
 }
 
 
@@ -177,6 +184,39 @@ int main(void) {
     uint32_t ti2 = (uint32_t)((phys2 >> 12) & 0x1FF);
     CHECK((pt2[ti2] & USER_PTE_PRESENT) && (pt2[ti2] & USER_PTE_USER),
           "second page user-mapped, same PT reused");
+
+    /* 9. §10.15's soft state: an mprotect transition keeps the frame and
+     *    clears USER/WRITE while setting the software bit. The owner walk
+     *    must still find it; the copy walkers must not. */
+    CHECK(user_protect_page(child, phys,
+                            USER_PTE_PRESENT | USER_PTE_SOFT_NONE |
+                            USER_PTE_NOEXEC) == 0,
+          "a mapped leaf can be made soft-protected");
+    CHECK((pt[ti] & USER_PTE_SOFT_NONE) &&
+          !(pt[ti] & USER_PTE_USER) && !(pt[ti] & USER_PTE_WRITE) &&
+          (pt[ti] & USER_PTE_NOEXEC),
+          "the soft leaf is P|NX|SOFT_NONE, supervisor-only and not writable");
+    CHECK((pt[ti] & FRAME_MASK) == (phys & FRAME_MASK),
+          "the soft transition preserves the frame");
+    CHECK(user_protect_page(child, phys, flags) == 0 &&
+          (pt[ti] & USER_PTE_USER) && !(pt[ti] & USER_PTE_SOFT_NONE),
+          "the soft-to-normal transition clears SOFT_NONE and restores USER");
+    CHECK(user_protect_page(child, 0x22000000ULL, flags) == -1,
+          "a missing leaf is refused without allocating a table or frame");
+
+    /* 10. The teardown walk must free a soft leaf's frame exactly once:
+     *    it is present and owned, but its USER bit is clear. */
+    CHECK(user_protect_page(child, phys,
+                            USER_PTE_PRESENT | USER_PTE_SOFT_NONE |
+                            USER_PTE_NOEXEC) == 0,
+          "the cap page can be made soft before teardown");
+    int first = g_nfreed;
+    user_destroy_page_table((uint64_t)(uintptr_t)child);
+    int nphys = 0;
+    for (int i = first; i < g_nfreed; i++)
+        if (g_freed[i] == (void*)(uintptr_t)phys) nphys++;
+    CHECK(nphys == 1,
+          "teardown frees the soft leaf's frame exactly once");
 
     if (g_fail == 0) printf("\nALL PASS\n");
     else             printf("\n%d FAILURE(S)\n", g_fail);

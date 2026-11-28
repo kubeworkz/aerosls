@@ -76,7 +76,7 @@
 #define BOOT_DM_HEAP_BYTES          (256u * 1024u)
 /* The POSIX sidecar's budget heap — 4 MiB for VFS caches, process
  * table, and applet scripts. */
-#define BOOT_POSIX_HEAP_BYTES       (4u * 1024u * 1024u)
+#define BOOT_POSIX_HEAP_BYTES       (8u * 1024u * 1024u)
 /* The device registry region: 4 + MAX_DEVICES(16) × 64 = 1028 bytes
  * (devreg.rs), rounded to one page. */
 #define BOOT_REGISTRY_BYTES         4096u

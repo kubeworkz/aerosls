@@ -49,17 +49,29 @@
  * as the writing build saw it, which is the field that catches a same-version
  * rebuild with a different compiler/packing. All three are checked on adopt. */
 #define ENV_CKPT_REC_MAGIC    0x534C53454E564B31ULL   /* "SLSENVK1" */
-#define ENV_CKPT_REC_VERSION  1u
+#define ENV_CKPT_REC_VERSION  2u    /* v2: per-thread group identity */
 
 /* Environments per node in the first cut. v0.2 §8 sizes the node at four
- * environments; eight is the headroom, and the whole array must stay inside
- * one NVMe frame (the _Static_assert in env_ckpt.c is what holds that). */
-#define ENV_CKPT_MAX          8u
+ * environments. The task array grew for TG-2 (two sidecars + an eight-thread
+ * Linux group = ten tasks), and the whole array must still fit inside ONE
+ * NVMe frame (the _Static_assert in env_ckpt.c holds that). Four is the
+ * documented node size; the previous eight was headroom that the group
+ * schema spends. */
+#define ENV_CKPT_MAX          4u
 
 #define ENV_CKPT_NAME_LEN     24u
 #define ENV_CKPT_MAX_REGIONS  3u    /* POSIX heap + ramdisk heap + ramdisk storage */
-#define ENV_CKPT_MAX_TASKS    4u    /* the two sidecars, E7's Linux tenant (increment
-                                     * 20), and one spare slot */
+/* The ENV_REGISTER wire keeps its original four task slots. TG-2 group
+ * members are kernel-discovered at clone, so init still names at most the
+ * two sidecars and the Linux leader; keeping this separate from the record
+ * cap is what leaves the 200-byte body unchanged. */
+#define ENV_CKPT_REG_TASKS    4u
+/* Two sidecars + LINUX_THREADS_MAX (8) group members. */
+#define ENV_CKPT_MAX_TASKS    10u
+/* One Linux group's live-thread cap, mirrored from LINUX_THREADS_MAX so the
+ * record layer can validate thread indexes without depending on the process
+ * layer. */
+#define ENV_CKPT_MAX_THREADS  8u
 #define ENV_CKPT_MAX_CHANS    4u    /* init's messenger endpoints */
 
 /* Region kinds — the three cap regions E4 charges to the target partition.
@@ -95,10 +107,15 @@ struct EnvCkptRegion {
 };
 
 struct EnvCkptTask {
-    char     name[ENV_CKPT_NAME_LEN];  /* drv.ramdisk.<index> / aerosls.posix.<index> */
+    char     name[ENV_CKPT_NAME_LEN];  /* drv.ramdisk.<index> / aerosls.posix.<index>.
+                                        * Group members repeat their leader's name;
+                                        * (group_id, thread_index) is the identity. */
     uint8_t  kind;                     /* ENV_CKPT_TASK_* */
-    uint8_t  _pad[3];
+    uint8_t  leader;                   /* 1 only for a Linux group leader */
+    uint16_t thread_index;             /* leader = 0; siblings 1..MAX_THREADS-1 */
+    uint32_t group_id;                 /* Linux group id (leader pid); 0 until stamped */
     uint32_t cap_count;                /* capabilities this task was granted */
+    uint32_t _pad;                     /* keeps entry 8-byte aligned */
     uint64_t entry;                    /* where the restore re-enters it */
     uint64_t stack_bottom;
     uint64_t stack_top;
@@ -173,8 +190,8 @@ struct EnvCkptRegister {
     uint32_t n_chans;
     uint32_t chans[ENV_CKPT_MAX_CHANS];   /* init's messenger endpoints */
     uint32_t n_tasks;
-    char     task_name[ENV_CKPT_MAX_TASKS][ENV_CKPT_NAME_LEN];
-    uint32_t task_kind[ENV_CKPT_MAX_TASKS];
+    char     task_name[ENV_CKPT_REG_TASKS][ENV_CKPT_NAME_LEN];
+    uint32_t task_kind[ENV_CKPT_REG_TASKS];
     /* No padding hole anywhere, so sizeof() is field-sum and both sides can
      * assert it: 16 + 3*16 + 4 + 4*4 + 4 + 4*24 + 4*4 = 200 bytes. */
 };
@@ -244,7 +261,7 @@ int env_ckpt_record(const struct EnvCkptRecord* rec);
  * restore. Refusal-over-partial-application applies here too: nothing is
  * stored. */
 int env_ckpt_register_from(const struct EnvCkptRegister* reg,
-                           const uint64_t task_entry[ENV_CKPT_MAX_TASKS],
+                           const uint64_t task_entry[ENV_CKPT_REG_TASKS],
                            uint32_t console_id, uint64_t sequence);
 
 /* ─── E7 increment 20: the Linux task's kernel-side half ─────────────────────
@@ -272,6 +289,60 @@ int env_ckpt_linux_task_stamp(uint32_t partition_id,
                               uint64_t entry,
                               uint64_t stack_bottom, uint64_t stack_top,
                               uint32_t cap_count);
+
+/* ─── TG-2a: kernel-side group identity ──────────────────────────────────────
+ * The leader's group id/index/flag are stamped after linux_group_create(),
+ * once the group exists; the registration slot is still found by the spawning
+ * POSIX sidecar's name, exactly as the entry stamp above does. `is_leader`
+ * must agree with the group layer's descriptor (thread 0 is the leader).
+ * Returns 1 when a matching Linux slot was stamped, 0 otherwise. */
+int env_ckpt_linux_group_stamp(uint32_t partition_id,
+                               const char* parent_name,
+                               const char* child_name,
+                               uint32_t group_id, uint16_t thread_index,
+                               uint8_t is_leader);
+
+/* A clone's per-thread record. There is no registration slot for a sibling,
+ * so this APPENDS one to the environment's record (up to MAX_TASKS). The
+ * record is found by (partition, group_id); a task with the same group and
+ * thread index is updated in place, which makes a repeated stamp idempotent.
+ * Returns 1 when added/updated, 0 when no record names that group or the
+ * record is full. */
+int env_ckpt_linux_group_thread_stamp(uint32_t partition_id,
+                                      uint32_t group_id,
+                                      uint16_t thread_index,
+                                      const char* child_name,
+                                      uint64_t entry);
+
+/* A clone that exits can no longer be captured: its descriptor is cleared as
+ * the thread leaves, so a record that still names it would make every later
+ * capture of the group fail its identity lookup. Remove that sibling entry by
+ * (partition, group, thread index), keeping the rest of the record dense and
+ * in order. The leader is deliberately not removable while siblings live: its
+ * descriptor stays as the group's zombie identity. Returns 1 when the entry
+ * was removed, 0 when there is no such sibling (or the layout would no longer
+ * validate). Idempotent. */
+int env_ckpt_linux_group_thread_drop(uint32_t partition_id,
+                                     uint32_t group_id,
+                                     uint16_t thread_index);
+
+/* TG-2d: the sibling indexes a replay create must build after it has created
+ * the held leader. The record is found by (partition, leader name, group id);
+ * only Linux tasks carrying that group and `leader == 0` are returned, in
+ * record order. Returns the count, 0 when no matching record/leader exists,
+ * or -1 when the record names a malformed/duplicate index or the caller's
+ * buffer is too small. Read-only. */
+int env_ckpt_linux_group_restore_indexes(uint32_t partition_id,
+                                         const char* leader_name,
+                                         uint32_t group_id,
+                                         uint16_t* out_indexes,
+                                         uint32_t cap);
+
+/* TG-2d: hold the replay's pre-create record while the fresh registration
+ * replaces the table slot. The accessor above consults this copy when the
+ * live record names the leader but not the captured siblings. */
+void env_ckpt_linux_group_restore_hint(const struct EnvCkptRecord* rec);
+void env_ckpt_linux_group_restore_hint_clear(void);
 
 /* Drop the record for (partition_id, index), if any. */
 int env_ckpt_drop(uint32_t partition_id, uint32_t index);
@@ -472,7 +543,7 @@ int env_ckpt_drop_env(uint32_t partition_id, uint32_t env_id);
  *      partition is gone".
  *   4. The environment that comes back must be the one the record described
  *      (env_ckpt_restore_same_identity()). Identity is the record's stable
- *      half -- partition, index, the task names and kinds, the region kinds --
+ *      half -- partition, index, the REGISTERED task names and kinds, the region kinds --
  *      NOT its pids, its env_id, its per-boot frame bases, its freshly minted
  *      channels or the console key init binds at create (the region frame
  *      counts ARE compared: they are the environment's shape, constants in the
@@ -568,12 +639,16 @@ int env_ckpt_restore_refused_record(uint32_t partition_id, uint32_t index);
 int env_ckpt_restore_pending_record(uint32_t partition_id, uint32_t index);
 
 /* 1 when `got` -- the record the create's own ENV_REGISTER produced -- is the
- * environment `want` described. Compares identity only: (partition, index), the
- * task names and kinds, and the region kinds and their frame counts. Bases,
- * entries, channels, env_id, console_id and the sequence are per-boot facts a
- * create legitimately re-decides; the payload increment is what will make the
- * bases matter, and until then asserting them would be asserting a number
- * nothing yet reproduces. 0 when either side is NULL or disagrees. */
+ * environment `want` described. Compares identity only: (partition, index),
+ * the REGISTERED task names and kinds, and the region kinds and their frame
+ * counts. `got->n_tasks` is the registered prefix; `want` may append clone-
+ * created Linux siblings beyond it, which are captured state only when each
+ * is a non-leader, same-name, same-group task with an in-range unique thread
+ * index. Bases, entries, channels, env_id, console_id and the sequence are
+ * per-boot facts a create legitimately re-decides; the payload increment is
+ * what will make the bases matter, and until then asserting them would be
+ * asserting a number nothing yet reproduces. 0 when either side is NULL or
+ * disagrees. */
 int env_ckpt_restore_same_identity(const struct EnvCkptRecord* want,
                                    const struct EnvCkptRecord* got);
 

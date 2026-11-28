@@ -64,7 +64,13 @@ pub mod boot;
 pub mod catalog_client;
 pub mod e7_candidate;
 pub mod e7_firstuser;
+pub mod e7_go_gate;
+pub mod e7_group_ckpt;
+pub mod e7_futex_probe;
+pub mod e7_openat_probe;
 pub mod e7_probe;
+pub mod e7_thread_probe;
+pub mod e7_thread_death;
 pub mod heap;
 pub mod linux;
 #[cfg(feature = "m1_net_probe")]

@@ -399,6 +399,7 @@ fn gate_boot_stretch(k: &RealKernel, console_r: Option<u32>) {
 pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
     let bib = unsafe { BootInfo::from_raw(bib_ptr) }.expect("[POSIX] corrupt boot info");
     let caps = BootCaps::from_bib(&bib).expect("missing initial caps");
+    klog(b"[POSIX] budget_len=", caps.budget_len as u32, b"");
 
     // Budget → heap and the request-buffer arena. The budget MEM cap is the
     // whole region; the main bump heap and BudgetAlloc must NOT both claim
@@ -413,10 +414,25 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
     // first MiB (256 x 4 KiB buffers — ample for the mount + demo reads),
     // the main heap owns the rest.
     const REQ_BUF_ARENA: u64 = 1024 * 1024;   /* grant-buffer arena within the budget */
+    /* The live Go gate stages its 2.3 MiB ELF at the budget tail just
+     * before SYS_SLS_LINUX_SPAWN. That tail is NOT heap: without this
+     * reservation the copy starts at budget_base + 1 MiB — the bump heap's
+     * first page — and replaces the console Arc/VFS objects with Go bytes
+     * (observed live: the console pump's first drain panicked
+     * "not a console"). The regular profiles reserve nothing. */
+    let gate_reserve = if cfg!(feature = "e7_go_gate") {
+        crate::e7_go_gate::GO_GATE_RESERVE
+    } else if cfg!(feature = "e7_group_ckpt") {
+        crate::e7_group_ckpt::GROUP_RESERVE
+    } else {
+        0
+    };
     unsafe {
         HEAP.init(
             (caps.budget_base + REQ_BUF_ARENA) as usize,
-            caps.budget_len.saturating_sub(REQ_BUF_ARENA) as usize,
+            caps.budget_len
+                .saturating_sub(REQ_BUF_ARENA)
+                .saturating_sub(gate_reserve) as usize,
         );
     }
     let alloc = BudgetAlloc::new(caps.budget_slot, caps.budget_base, REQ_BUF_ARENA);
@@ -520,7 +536,73 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
     // selector, not a grant: the tenant's caps are exactly the plain
     // profile's, and the BIB is the one thing every sidecar already reads.
     let gate = bib.is_gate_profile();
-    if census_host || gate {
+    // POSIX-Environments E3: an E3 image's system POSIX carries
+    // FLAG_E3_PROFILE (BOOT_INFO_FLAG_E3_PROFILE). Its boot already carries
+    // three tenant environments, and the E7 census work below (the native
+    // probes and the first-user measurement) is an instrument for the plain
+    // image: on E3 it only competes with those tenants for the serial wire
+    // and boot time. A gate TENANT is a different manifest and does not carry
+    // the flag, so the E7 gate image still runs its own workload.
+    let e3_profile = bib.is_e3_profile();
+    // E7 census scope: the plain boot that measures it (its system POSIX owns
+    // the NIC) or a gate tenant. An E3 image drops it — there it would only
+    // compete with the tenants for the serial wire.
+    let e7_census = !cfg!(feature = "e7_go_gate")
+        && !cfg!(feature = "e7_group_ckpt")
+        && (census_host || gate)
+        && !e3_profile;
+    // The thread-death arms in the event loop keep that scope WITHOUT the E3
+    // exclusion: an E3 boot (the unified env boot, the M1 net image) has always
+    // run them, and dropping them there perturbs the sidecar's event-loop
+    // timing — CI showed it as `[nettest] FAIL: accept()` and a destroy left
+    // unanswered. What they must NOT do is spawn in a tenant ENVIRONMENT's
+    // POSIX sidecar: that one has no `nic0.bar0` and no gate profile, and its
+    // children outlived the environment — parked BLOCKED on a killed parent's
+    // channels — holding proc_table slots (PROC_MAX = 16) that the next create
+    // needed (measured: 3–5 leaked slots per environment, which is what stopped
+    // E5's recycle loop at cycle 5–10 with CAP_ETABLEFULL). NIC-less is exactly
+    // what this predicate keeps.
+    let e7_arms = !cfg!(feature = "e7_go_gate")
+        && !cfg!(feature = "e7_group_ckpt")
+        && (census_host || gate);
+    /* E7 TG-1's live Go acceptance profile: a dedicated build (never the
+     * shipped image) spawns the real static Go fixture from the system POSIX
+     * sidecar instead of the native probes. Its markers are the G1.1–G1.5
+     * evidence; the kernel's clone/exit lines are G1.2/G1.7. */
+    if cfg!(feature = "e7_go_gate") {
+        if !e3_profile {
+            match crate::e7_go_gate::stage(&mut booted.proc.vfs, 0) {
+                Ok(()) => match crate::e7_go_gate::spawn(
+                    &RealKernel,
+                    caps.budget_base,
+                    caps.budget_len,
+                ) {
+                    Ok(sp) => match booted.proc.vfs.add_task() {
+                        Ok(vt) => {
+                            if crate::linux::track(
+                                sp.ch_r,
+                                sp.ch_w,
+                                crate::e7_go_gate::GO_GATE_NAME,
+                                0,
+                                sp.heap_base,
+                                sp.heap_limit,
+                                vt,
+                                false,
+                            ) {
+                                klog(b"[GTG] spawned ch_r=", sp.ch_r, b"");
+                            } else {
+                                klog(b"[GTG] TRACK TABLE FULL ch_r=", sp.ch_r, b"");
+                            }
+                        }
+                        Err(_) => klog(b"[GTG] VFS task alloc FAILED ch_r=", sp.ch_r, b""),
+                    },
+                    Err(rc) => klog(b"[GTG] spawn FAILED rc=", rc as u32, b""),
+                },
+                Err(e) => klog(b"[GTG] stage-fail", e.code() as u32, b"errno"),
+            }
+        }
+    }
+    if e7_census {
         if !gate {
             // E7 boot proof (Linux ABI Shim Design §3.3 steps 5-7): spawn the
             // Linux-personality probe from THIS sidecar — the design-true creator
@@ -556,6 +638,98 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
                     }
                 }
                 Err(rc) => klog(b"[E7] probe: spawn FAILED rc=", rc as u32, b""),
+            }
+
+            // E7 TG-1 I2: the native two-thread probe. Same creator tree and
+            // same real create path; its clone/gettid/getpid/shared-write/
+            // exit flow is what tests/linux_thread_probe_check.sh asserts on
+            // a live boot. Logged, never fatal, like the probe above.
+            match crate::e7_thread_probe::spawn(&RealKernel, caps.budget_base, caps.budget_len) {
+                Ok(sp) => {
+                    match booted.proc.vfs.add_task() {
+                        Ok(vt) => {
+                            if crate::linux::track(
+                                sp.ch_r,
+                                sp.ch_w,
+                                crate::e7_thread_probe::PROBE_NAME,
+                                0,
+                                sp.heap_base,
+                                sp.heap_limit,
+                                vt,
+                                false,
+                            ) {
+                                klog(b"[E7] thread-probe: spawned ch_r=", sp.ch_r, b"");
+                            } else {
+                                klog(b"[E7] thread-probe: spawned but TRACK TABLE FULL ch_r=", sp.ch_r, b"");
+                            }
+                        }
+                        Err(_) => klog(b"[E7] thread-probe: VFS task alloc FAILED ch_r=", sp.ch_r, b""),
+                    }
+                }
+                Err(rc) => klog(b"[E7] thread-probe: spawn FAILED rc=", rc as u32, b""),
+            }
+
+            // E7 TG-1 I5b's two death arms are created from the EVENT LOOP
+            // below, not here: see the block after linux::service().
+
+            // E7 TG-1 I3: the native futex probe. Same create path, its own
+            // payload slot; the parent parks in FUTEX_WAIT_PRIVATE, its
+            // cloned sibling's wake returns 1, and a 20 ms relative wait
+            // returns ETIMEDOUT. tests/linux_futex_probe_check.sh asserts
+            // the markers on a live boot. Logged, never fatal.
+            match crate::e7_futex_probe::spawn(&RealKernel, caps.budget_base, caps.budget_len) {
+                Ok(sp) => {
+                    match booted.proc.vfs.add_task() {
+                        Ok(vt) => {
+                            if crate::linux::track(
+                                sp.ch_r,
+                                sp.ch_w,
+                                crate::e7_futex_probe::PROBE_NAME,
+                                0,
+                                sp.heap_base,
+                                sp.heap_limit,
+                                vt,
+                                false,
+                            ) {
+                                klog(b"[E7] futex-probe: spawned ch_r=", sp.ch_r, b"");
+                            } else {
+                                klog(b"[E7] futex-probe: spawned but TRACK TABLE FULL ch_r=", sp.ch_r, b"");
+                            }
+                        }
+                        Err(_) => klog(b"[E7] futex-probe: VFS task alloc FAILED ch_r=", sp.ch_r, b""),
+                    }
+                }
+                Err(rc) => klog(b"[E7] futex-probe: spawn FAILED rc=", rc as u32, b""),
+            }
+
+            // E7 TG-1 I4: the native openat probe. Same create path, its own
+            // payload slot; the LEADER never forwards — its cloned sibling
+            // openat(257)s "/" and close(3)s the result across the group's
+            // channels, so the replies and wakes must land on the child.
+            // tests/linux_openat_probe_check.sh asserts the markers live.
+            match crate::e7_openat_probe::spawn(&RealKernel, caps.budget_base, caps.budget_len) {
+                Ok(sp) => {
+                    match booted.proc.vfs.add_task() {
+                        Ok(vt) => {
+                            if crate::linux::track(
+                                sp.ch_r,
+                                sp.ch_w,
+                                crate::e7_openat_probe::PROBE_NAME,
+                                0,
+                                sp.heap_base,
+                                sp.heap_limit,
+                                vt,
+                                false,
+                            ) {
+                                klog(b"[E7] openat-probe: spawned ch_r=", sp.ch_r, b"");
+                            } else {
+                                klog(b"[E7] openat-probe: spawned but TRACK TABLE FULL ch_r=", sp.ch_r, b"");
+                            }
+                        }
+                        Err(_) => klog(b"[E7] openat-probe: VFS task alloc FAILED ch_r=", sp.ch_r, b""),
+                    }
+                }
+                Err(rc) => klog(b"[E7] openat-probe: spawn FAILED rc=", rc as u32, b""),
             }
 
             // E7 increment 7 (§5.1/§5.2): the SAME create over a REAL ELF64 image
@@ -599,7 +773,7 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
         // v1's `argv = { name }` measurement. Like the pair above: logged,
         // never fatal.
         let firstuser = if gate {
-            match crate::e7_firstuser::stage_gate(&mut booted.proc.vfs, 0) {
+            (match crate::e7_firstuser::stage_gate(&mut booted.proc.vfs, 0) {
                 Ok(()) => {
                     let used = unsafe { HEAP.used() };
                     let remaining = unsafe { HEAP.remaining() };
@@ -628,35 +802,94 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
                     klog(b"[E7-GATE] stage-fail", e.code() as u32, b"errno");
                     Err(-3)
                 }
-            }
+            })
+            .map(|sp| (sp.ch_r, sp.ch_w, sp.heap_base, sp.heap_limit))
         } else {
             crate::e7_firstuser::spawn(&RealKernel, caps.budget_base, caps.budget_len)
+                .map(|sp| (sp.ch_r, sp.ch_w, sp.heap_base, sp.heap_limit))
         };
 
         match firstuser {
-            Ok(sp) => {
+            Ok((ch_r, ch_w, heap_base, heap_limit)) => {
                 match booted.proc.vfs.add_task() {
                     Ok(vt) => {
                         if crate::linux::track(
-                            sp.ch_r,
-                            sp.ch_w,
+                            ch_r,
+                            ch_w,
                             if gate {
                                 crate::e7_firstuser::GATE_TASK_NAME
                             } else {
                                 crate::e7_firstuser::USER_NAME
                             },
                             0,
-                            sp.heap_base,
-                            sp.heap_limit,
+                            heap_base,
+                            heap_limit,
                             vt,
                             gate,
                         ) {
-                            klog(b"[E7] firstuser: spawned ch_r=", sp.ch_r, b"");
+                            klog(b"[E7] firstuser: spawned ch_r=", ch_r, b"");
                         } else {
-                            klog(b"[E7] firstuser: spawned but TRACK TABLE FULL ch_r=", sp.ch_r, b"");
+                            klog(b"[E7] firstuser: spawned but TRACK TABLE FULL ch_r=", ch_r, b"");
                         }
                     }
-                    Err(_) => klog(b"[E7] firstuser: VFS task alloc FAILED ch_r=", sp.ch_r, b""),
+                    Err(_) => klog(b"[E7] firstuser: VFS task alloc FAILED ch_r=", ch_r, b""),
+                }
+            }
+            Err(rc) => klog(b"[E7] firstuser: spawn FAILED rc=", rc as u32, b""),
+        }
+    }
+
+    /* TG-2d's group profile replaces the census block above: stage and spawn
+     * only the two-thread fixture from the gate tenant. The tenant is the
+     * designated first user, so it keeps the same name/track/gate flag; the
+     * sibling appears later through the fixture's raw clone, not here. */
+    if cfg!(feature = "e7_group_ckpt") && gate && !e3_profile {
+        let group_firstuser = (match crate::e7_group_ckpt::stage(&mut booted.proc.vfs, 0) {
+            Ok(()) => {
+                let used = unsafe { HEAP.used() };
+                let remaining = unsafe { HEAP.remaining() };
+                klog(b"[E7-GROUP] stage", 64 * 1024, b"bytes");
+                klog(b"[E7-GROUP] heap-used", used as u32, b"");
+                klog(b"[E7-GROUP] heap-free", remaining as u32, b"");
+                let need = (crate::e7_group_ckpt::GROUP_RESERVE + 4096) as usize;
+                if remaining < need {
+                    klog(b"[E7-GROUP] no-headroom", remaining as u32, b"refused");
+                    Err(-2)
+                } else {
+                    crate::e7_group_ckpt::spawn(
+                        &RealKernel,
+                        caps.budget_base,
+                        caps.budget_len,
+                    )
+                }
+            }
+            Err(e) => {
+                klog(b"[E7-GROUP] stage-fail", e.code() as u32, b"errno");
+                Err(-3)
+            }
+        })
+        .map(|sp| (sp.ch_r, sp.ch_w, sp.heap_base, sp.heap_limit));
+
+        match group_firstuser {
+            Ok((ch_r, ch_w, heap_base, heap_limit)) => {
+                match booted.proc.vfs.add_task() {
+                    Ok(vt) => {
+                        if crate::linux::track(
+                            ch_r,
+                            ch_w,
+                            crate::e7_firstuser::GATE_TASK_NAME,
+                            0,
+                            heap_base,
+                            heap_limit,
+                            vt,
+                            true,
+                        ) {
+                            klog(b"[E7] firstuser: spawned ch_r=", ch_r, b"");
+                        } else {
+                            klog(b"[E7] firstuser: spawned but TRACK TABLE FULL ch_r=", ch_r, b"");
+                        }
+                    }
+                    Err(_) => klog(b"[E7] firstuser: VFS task alloc FAILED ch_r=", ch_r, b""),
                 }
             }
             Err(rc) => klog(b"[E7] firstuser: spawn FAILED rc=", rc as u32, b""),
@@ -767,6 +1000,141 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
         let (vfs, net) = booted.proc.vfs_and_net();
         crate::linux::service(&RealKernel, &booted.console, vfs, net);
         booted.proc.drain_wakes();
+        // E7 TG-1 I5b: the two death arms — I5 proves the clear on exit(60);
+        // these prove it where a joiner would otherwise hang: a thread that
+        // dies of a Ring-3 #PF, and a group that goes down through exit_group,
+        // each with a sibling parked on the dying thread's TID word.
+        //
+        // They are created HERE rather than at boot because of a measured
+        // refusal: a synchronous create at boot answers -EAGAIN ("group cap or
+        // resources exhausted") — PROC_MAX is 16 and this boot's probe fleet
+        // already holds every slot, while the two arms need three descriptors
+        // each. Retrying every few passes (the loop is woken by the parked
+        // forwards, so it does pass) creates them through the SAME real create
+        // path as soon as the earlier probes release their slots.
+        if e7_arms {
+            use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+            static PASSES: AtomicU32 = AtomicU32::new(0);
+            static FAULT_SPAWNED: AtomicBool = AtomicBool::new(false);
+            static GROUP_SPAWNED: AtomicBool = AtomicBool::new(false);
+            static FH_SPAWNED: AtomicBool = AtomicBool::new(false);
+            static FR_SPAWNED: AtomicBool = AtomicBool::new(false);
+            static FRV_SPAWNED: AtomicBool = AtomicBool::new(false);
+            static AB_SPAWNED: AtomicBool = AtomicBool::new(false);
+            let n = PASSES.fetch_add(1, Ordering::Relaxed) + 1;
+            if n % 4 == 0 {
+                if !FAULT_SPAWNED.load(Ordering::Relaxed) {
+                    if let Ok(sp) = crate::e7_thread_death::spawn_fault(
+                        &RealKernel, caps.budget_base, caps.budget_len) {
+                        if let Ok(vt) = booted.proc.vfs.add_task() {
+                            if crate::linux::track(
+                                sp.ch_r, sp.ch_w,
+                                crate::e7_thread_death::FAULT_NAME,
+                                0, sp.heap_base, sp.heap_limit, vt, false,
+                            ) {
+                                FAULT_SPAWNED.store(true, Ordering::Relaxed);
+                                klog(b"[E7] death-fault: spawned ch_r=", sp.ch_r, b"");
+                            }
+                        }
+                    }
+                }
+                if !GROUP_SPAWNED.load(Ordering::Relaxed) {
+                    if let Ok(sp) = crate::e7_thread_death::spawn_group(
+                        &RealKernel, caps.budget_base, caps.budget_len) {
+                        if let Ok(vt) = booted.proc.vfs.add_task() {
+                            if crate::linux::track(
+                                sp.ch_r, sp.ch_w,
+                                crate::e7_thread_death::GROUP_NAME,
+                                0, sp.heap_base, sp.heap_limit, vt, false,
+                            ) {
+                                GROUP_SPAWNED.store(true, Ordering::Relaxed);
+                                klog(b"[E7] death-group: spawned ch_r=", sp.ch_r, b"");
+                            }
+                        }
+                    }
+                }
+                // E7 increment 31: the SAME #PF with a handler installed. One
+                // arm is a kill and the other is a delivery, on one boot, so
+                // the difference is the handler and nothing else.
+                if !FH_SPAWNED.load(Ordering::Relaxed) {
+                    if let Ok(sp) = crate::e7_thread_death::spawn_fault_handler(
+                        &RealKernel, caps.budget_base, caps.budget_len) {
+                        if let Ok(vt) = booted.proc.vfs.add_task() {
+                            if crate::linux::track(
+                                sp.ch_r, sp.ch_w,
+                                crate::e7_thread_death::FAULT_HANDLER_NAME,
+                                0, sp.heap_base, sp.heap_limit, vt, false,
+                            ) {
+                                FH_SPAWNED.store(true, Ordering::Relaxed);
+                                klog(b"[E7] fault-handler: spawned ch_r=", sp.ch_r, b"");
+                            }
+                        }
+                    }
+                }
+                // E7 increment 32: the handler RETURNS. It fixes the faulted
+                // register in its own ucontext and issues rt_sigreturn(15),
+                // so the kernel must resume the instruction that faulted —
+                // the arm writes E7FR-OK only if the retried load saw the
+                // pointer the handler supplied.
+                if !FR_SPAWNED.load(Ordering::Relaxed) {
+                    if let Ok(sp) = crate::e7_thread_death::spawn_fault_return(
+                        &RealKernel, caps.budget_base, caps.budget_len) {
+                        if let Ok(vt) = booted.proc.vfs.add_task() {
+                            if crate::linux::track(
+                                sp.ch_r, sp.ch_w,
+                                crate::e7_thread_death::FAULT_RETURN_NAME,
+                                0, sp.heap_base, sp.heap_limit, vt, false,
+                            ) {
+                                FR_SPAWNED.store(true, Ordering::Relaxed);
+                                klog(b"[E7] fault-return: spawned ch_r=", sp.ch_r, b"");
+                            }
+                        }
+                    }
+                }
+                // E7 increment 34: an UNMASK inside a trap handler must
+                // REVEAL what it frees. SIGTERM is blocked and pended before
+                // the fault; the handler unblocks it, so the sidecar's reveal
+                // ladder runs inside that call and the task dies there — a
+                // boot line naming sig=15 is the positive, and the handler's
+                // own E7RV-AFTER is the failure.
+                if !FRV_SPAWNED.load(Ordering::Relaxed) {
+                    if let Ok(sp) = crate::e7_thread_death::spawn_fault_reveal(
+                        &RealKernel, caps.budget_base, caps.budget_len) {
+                        if let Ok(vt) = booted.proc.vfs.add_task() {
+                            if crate::linux::track(
+                                sp.ch_r, sp.ch_w,
+                                crate::e7_thread_death::FAULT_REVEAL_NAME,
+                                0, sp.heap_base, sp.heap_limit, vt, false,
+                            ) {
+                                FRV_SPAWNED.store(true, Ordering::Relaxed);
+                                klog(b"[E7] fault-reveal: spawned ch_r=", sp.ch_r, b"");
+                            }
+                        }
+                    }
+                }
+                // E7 increment 35: a handler that LEAVES its fault frame by
+                // longjmp never sends the 15 that closes the mask window. The
+                // first 14 made above the frame must close it — the mask goes
+                // back to the frame's recorded set and the frame is dropped,
+                // so the query is answered by the sidecar and a later 15 is
+                // -EINVAL again.
+                if !AB_SPAWNED.load(Ordering::Relaxed) {
+                    if let Ok(sp) = crate::e7_thread_death::spawn_fault_abandon(
+                        &RealKernel, caps.budget_base, caps.budget_len) {
+                        if let Ok(vt) = booted.proc.vfs.add_task() {
+                            if crate::linux::track(
+                                sp.ch_r, sp.ch_w,
+                                crate::e7_thread_death::FAULT_ABANDON_NAME,
+                                0, sp.heap_base, sp.heap_limit, vt, false,
+                            ) {
+                                AB_SPAWNED.store(true, Ordering::Relaxed);
+                                klog(b"[E7] fault-abandon: spawned ch_r=", sp.ch_r, b"");
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // One-shot boot diagnostic: report what task 0 (init) did and how
         // many tasks are live, so a quiet boot can be told apart from a
         // crashed one. Runs ONCE after boot — the per-iteration repetition
@@ -802,7 +1170,17 @@ pub extern "C" fn rust_entry(bib_ptr: *const u8) -> ! {
             // to a stale device vs. a parse failure.
             klog(b"[POSIX] aero state=", booted.proc.vfs.aerofs_state(), b"");
         }
-        match booted.proc.run_next() {
+        /* The dedicated Go gate image runs the fixture, not the E7 applet
+         * suite. `irqtest` p4 deliberately kills its driver process and
+         * relies on init respawning the environment; when the gate fixture
+         * is the co-resident workload that kill orphans the Go child mid-run
+         * and G1.6/G1.7 can never be read from one clean run. Ordinary and
+         * E7 gate images keep the suite unchanged. */
+        match if cfg!(feature = "e7_go_gate") || cfg!(feature = "e7_group_ckpt") {
+            None
+        } else {
+            booted.proc.run_next()
+        } {
             Some(_) => {
                 // Drain irqtest's pending output ring. The applet only
                 // stores (ptr,len) of 'static byte strings and yields; this

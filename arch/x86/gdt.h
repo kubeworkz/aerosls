@@ -37,4 +37,18 @@ struct TaskStateSegment {
 
 void init_gdt(void);
 
+/* Point the TSS RSP0 at the stack a CPL-3 entry must land on. A low-linked
+ * ET_EXEC lives at 0x400000, which overlaps the static interruption_stack
+ * in the kernel's low .bss; every switch into a user task therefore points
+ * RSP0 at that task's dedicated (supervisor, identity-mapped) kernel
+ * syscall stack instead. */
+void tss_set_rsp0(uint64_t top);
+
+/* The high canonical aliases of the kernel's GDT/TSS/IDT. init_gdt() and
+ * init_idt() load the CPU's descriptors from these, so a low-linked ET_EXEC
+ * cannot shadow the tables it needs on every privilege transition. */
+uint64_t kernel_tables_gdt_va(void);
+uint64_t kernel_tables_tss_va(void);
+uint64_t kernel_tables_idt_va(void);
+
 #endif

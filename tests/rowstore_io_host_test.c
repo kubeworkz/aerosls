@@ -24,6 +24,13 @@
  * rather than garbage, and the source comment says exactly that. Asserting it
  * behaves as documented is worth as much as catching the write -- a sweep that
  * reported both as defects would be one a reader learns to ignore.
+ *
+ * Build and run:
+ *   gcc -Wall -Wextra -std=c11 -D_GNU_SOURCE -I tests -I kernel -I . -I net -I arch/x86 \
+ *       -o /tmp/rowstore_io_host_test \
+ *       tests/rowstore_io_host_test.c tests/rowstore_io_stubs.c \
+ *       tests/fake_nvme.c kernel/rowstore.c
+ *   /tmp/rowstore_io_host_test
  */
 
 #include <stdio.h>

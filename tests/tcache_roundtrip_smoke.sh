@@ -58,6 +58,7 @@ set -u
 cd "$(dirname "$0")/.."   # repo root
 guard=tests/tcache_roundtrip_check.sh
 fails=0
+ART_SHA=""
 
 command -v python3 >/dev/null 2>&1 || { echo "ABORT: python3 not found" >&2; exit 2; }
 
@@ -122,12 +123,29 @@ make_artifacts() {   # $1 = directory
         '[QEMU-SLS TCACHE] synced: 141 TBs, 126686 code bytes (buffer high-water, includes inter-block alignment)' \
         '[QEMU-SLS TCACHE] warm start — codebuf_used=126686, codebuf=0x0000000007ae1000' > "$1/boot.log"
     printf '%s' '{"status":0,"seq":1,"count":141}' > "$1/checkpoint.json"
+    ART_SHA="$(cat "$1"/* | sha256sum | cut -d' ' -f1)"
+}
+
+artifacts_sha() { cat "$TD"/art/* | sha256sum | cut -d' ' -f1; }
+
+# require_mutated <label> — 0 only when the artifact set differs from the one
+# make_artifacts() last wrote. A sed whose line or pattern stopped matching
+# would leave the well-formed set in place, and the guard would reject the
+# TOOTH for the wrong reason (or accept it, for --shape).
+require_mutated() {
+    if [ "$(artifacts_sha)" = "$ART_SHA" ]; then
+        echo "TOOTH $1 FAIL  mutation did not apply: the artifact set is byte-identical to the well-formed one this tooth started from"
+        fails=$((fails + 1))
+        return 1
+    fi
+    return 0
 }
 
 # tooth NAME  -> runs the guard against the current artifacts
 tooth() {   # $1 = tooth name, $2 = expected failure substring
     local name="$1" expect="$2"
     local out rc
+    require_mutated "$name" || return
     out="$(bash "$guard" --replay "$TD/art" 2>&1)"
     rc=$?
     if [ "$rc" -ne 1 ]; then
@@ -279,15 +297,17 @@ fi
 make_artifacts "$TD/art"
 sed -i '17s/"blocks":17/"blocks":18/' "$TD/art/cold_sweep.json"
 sed -i '17s/"tcache_hits":17/"tcache_hits":18/' "$TD/art/warm_sweep.json"
-out="$(bash "$guard" --replay "$TD/art" --shape "1 2 3 4 5 6 7 8 9 10 11 13 14 15 16 19" 2>&1)"
-rc=$?
-if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "pinned shape"; then
-    echo "TOOTH 18 OK   (--shape still asserts its sequence)"
-else
-    echo "TOOTH 18 FAIL  --shape with a wrong sequence did not fail for the "
-    echo "               sequence reason (rc=$rc):"
-    printf '%s\n' "$out" | sed 's/^/      /'
-    fails=$((fails + 1))
+if require_mutated "18 (--shape asserts)"; then
+    out="$(bash "$guard" --replay "$TD/art" --shape "1 2 3 4 5 6 7 8 9 10 11 13 14 15 16 19" 2>&1)"
+    rc=$?
+    if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "pinned shape"; then
+        echo "TOOTH 18 OK   (--shape still asserts its sequence)"
+    else
+        echo "TOOTH 18 FAIL  --shape with a wrong sequence did not fail for the "
+        echo "               sequence reason (rc=$rc):"
+        printf '%s\n' "$out" | sed 's/^/      /'
+        fails=$((fails + 1))
+    fi
 fi
 
 if [ "$fails" -eq 0 ]; then

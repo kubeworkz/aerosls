@@ -8,6 +8,9 @@
 # include_bytes!s it, the cap host test reads it at boot-check time):
 # keep the one file the build script regenerates trackable.
 !user/sidecar/fixtures/e7_candidate.elf
+# The E7 TG-1 live Go fixture is likewise a COMMITTED input: e7_go_gate.rs
+# include_bytes!s it, so a fresh checkout must build without a local Go toolchain.
+!user/sidecar/fixtures/go_thread_gate_live.elf
 *.so
 *.a
 # POSIX-Environments E3 boot image (init built with e3_envs). The shipped
@@ -23,6 +26,13 @@ sidecars_e3.cpio
 sidecars_e3.cpio.digest
 sidecars_e3.cpio.sha256
 sidecars_e3.cpio.stamps
+# The group-checkpoint archive (SIDECAR_GROUP_CKPT=1, TG-2d) is the same kind
+# of per-image build output, written by the same packer with its own stamp
+# quartet: the E7 group arm builds it, then leaves all four beside the tree.
+sidecars_gtg.cpio
+sidecars_gtg.cpio.digest
+sidecars_gtg.cpio.sha256
+sidecars_gtg.cpio.stamps
 
 # Rust sidecar workspace build output
 user/target/
@@ -62,6 +72,33 @@ cluster/
 # nobody but whoever ran them, and neither build inputs nor test fixtures.
 *.out
 commit_*_msg.txt
+# health.json: the ISO service smoke's /api/health response, written in the repo
+#   root by the CI step's own `curl ... > health.json` when the smoke is run
+#   locally. A run's body dump, re-created (and asserted) on every run.
+/health.json
+
+# ─── Live-arm run scratch ────────────────────────────────────────────────────
+# The live E7 arms (tests/e7_gate_check.sh --live, --group, --selfkill, the
+# thread-group arm and their cousins) deposit one directory per run under
+# evidence/: boot1.log/boot2.log (*.log covers those), the `facts` line file,
+# the create/checkpoint/restore JSON the API answered, QEMU's stderr
+# (*_qerr.txt, *.qemuerr) and the harness's exit `rc`. These are what a run DID,
+# not what any guard reads: tests/e7_gate_evidence_check.sh validates the
+# recorded runs that are committed (evidence/e7_gate_drill_adaptive and the
+# flat *.log transcripts), which stay tracked because they are in the index
+# already and an ignore rule never removes a tracked file. A new curated
+# recording is therefore added on purpose with `git add -f`, the way the
+# committed *.elf fixtures already are.
+/evidence/*/facts
+/evidence/*/checkpoint.json
+/evidence/*/create.json
+/evidence/*/pcreate.json
+/evidence/*/restore.json
+/evidence/*/rc
+/evidence/*/*_qerr.txt
+/evidence/*/qemu_stderr.txt
+/evidence/*/*.qemuerr
+/evidence/*.qemuerr
 
 # ─── Local-only helpers ──────────────────────────────────────────────────────
 # qemu: a symlink to a QEMU checkout OUTSIDE this repository (the build reads
@@ -74,3 +111,9 @@ commit_*_msg.txt
 /qemu
 /probe_console_run.sh
 /tools/add_intent_standins.sh
+# .ci-rerun.py / .ci-watch.py: throwaway drivers for "re-run that workflow and
+#   tail it", with this worktree's paths and one run's ids baked in. What they
+#   drive is the CI step itself (pinned by thread_group_ckpt_check.sh T7);
+#   keeping a copy here would ship a second, staler way to run it.
+/.ci-rerun.py
+/.ci-watch.py

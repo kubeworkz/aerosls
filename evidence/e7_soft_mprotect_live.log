@@ -1,0 +1,25 @@
+# E7 §10.15 — live soft-PROT_NONE probe and ELF candidate
+#
+# Boot: make x86-iso; qemu-system-x86_64 -cdrom sls_operating_system.iso
+#       -display none -m 4G -no-reboot -netdev user,id=net0
+#       -device e1000,netdev=net0,mac=52:54:00:12:34:01
+#       -serial file:/tmp/e7_soft_live.log
+#
+# Captured 2026-11-09. Lines are in serial order; CR padding is omitted.
+# The probe's mprotect page is the second brk page (base + 0x1000); the
+# candidate's layout gives base + 0x2000. No num=00000195 (MARKER 405) or
+# num=00000196 (MARKER 406) line appears in the boot.
+
+[E7] linux mprotect addr=0x400000006000 len=4096 prot=0x6 refused before post: write+execute is refused (§5.4)
+[E7] linux mprotect addr=0x400000007000 len=4096 prot=0x6 refused before post: write+execute is refused (§5.4)
+[E7] linux: num=0000000A child=e7.linux.probe.0 ok
+[E7] mprotect addr=0x400000007000 len=4096 prot=0x0: 1 page(s) soft-protected (P=1 U=0)
+[E7] linux: num=00000001 child=e7.linux.probe.0 write ok len=14 |E7MEM-SOFT-OK.|
+[FAULT] Ring-3 #PF  error=0x5  addr=0x0000400000007000  rip=0x0000400000000341  rdi=0x0000000000000001 — killing process.
+[PROC] PID 105 'e7.linux.probe.0' exited (code=139).
+
+[E7] linux: num=0000000A child=e7.linux.cand.0 ok
+[E7] mprotect addr=0x400000008000 len=4096 prot=0x0: 1 page(s) soft-protected (P=1 U=0)
+[E7] linux: num=00000001 child=e7.linux.cand.0 write ok len=14 |E7MEM-SOFT-OK.|
+[FAULT] Ring-3 #PF  error=0x5  addr=0x0000400000008000  rip=0x0000000000400341  rdi=0x0000000000000001 — killing process.
+[PROC] PID 106 'e7.linux.cand.0' exited (code=139).

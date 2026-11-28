@@ -1,6 +1,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "../arch/x86/lapic.h"
+#include "../arch/x86/gdt.h"
 #include "../arch/x86/idt.h"   /* idt_load_this_cpu: an AP must load the IDT */
 #include "microkernel.h"
 #include "smp.h"
@@ -18,7 +19,18 @@ extern volatile uint64_t kernel_tick_counter;
 
 extern uint8_t trampoline_start;
 extern uint8_t trampoline_end;
-extern uint64_t gdt_ptr;
+extern struct GDTPointer gdt_ptr;
+
+/* The AP's 32-bit phase cannot consume the kernel's 10-byte long-mode GDT
+ * pointer: `lgdt` with a 32-bit operand size reads only six bytes (limit +
+ * base low 32). The kernel GDT lives at 0xFFFF8000_0000_00xx, so that read
+ * loaded base 0x80 — the low half of the high VA — and the AP's first far
+ * jump used garbage descriptors, #GP'd, then triple-faulted through the
+ * reset IDTR (QEMU trace: GDT=00000000_00000080, IDT=0, v=0d, v=08,
+ * Triple fault). Put a byte copy of the real table in low memory and give
+ * the trampoline a six-byte pointer to it; the copy keeps the same 64-bit
+ * code/data descriptors, so the AP can enter and stay in long mode. */
+#define AP_GDT_LOW_ADDR 0x07400u
 
 // Global tracking structure used for multicore handshakes
 volatile uint32_t ap_bootstrap_lock = 0;
@@ -35,13 +47,17 @@ int boot_application_processors(uint8_t target_apic_id) {
     __asm__ volatile("mov %%cr3, %0" : "=r"(current_cr3));
     *(volatile uint32_t*)(0x07000) = (uint32_t)current_cr3;
 
-    // The trampoline does `lgdt [0x07010]` which reads the struct CONTENTS
-    // at 0x07010, NOT a pointer to the struct.  Copy the 10-byte GDTPointer
-    // struct directly into the handshake area.
+    /* The trampoline's 32-bit `lgdt [0x07010]` reads a SIX-byte pointer
+     * (limit + 32-bit base), not the kernel's packed 10-byte long-mode
+     * descriptor. Copy the GDT CONTENTS down to AP_GDT_LOW_ADDR and publish
+     * a 32-bit-compatible pointer to that copy. */
     {
-        volatile uint8_t* dst = (volatile uint8_t*)0x07010;
-        const uint8_t* src = (const uint8_t*)&gdt_ptr;
-        for (int gi = 0; gi < 10; gi++) dst[gi] = src[gi];
+        volatile uint8_t* gdt_low = (volatile uint8_t*)AP_GDT_LOW_ADDR;
+        const uint8_t* gdt_src = (const uint8_t*)(uintptr_t)gdt_ptr.base;
+        for (uint16_t gi = 0; gi <= gdt_ptr.limit; gi++)
+            gdt_low[gi] = gdt_src[gi];
+        *(volatile uint16_t*)(0x07010) = gdt_ptr.limit;
+        *(volatile uint32_t*)(0x07012) = (uint32_t)AP_GDT_LOW_ADDR;
     }
 
     *(volatile uint64_t*)(0x07020) = (uint64_t)ap_kernel_main;
