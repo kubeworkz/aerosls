@@ -182,6 +182,9 @@ if [ -n "$gid" ]; then
     grep -aqF "[E7] futex timeout: TID $gid " "$LOG" \
         && ok "the timed waiter was resumed with -ETIMEDOUT" \
         || bad "no futex timeout line for TID $gid"
+    echo "      --- futex ts lines (diagnostic) ---"
+    grep -a "futex ts:" "$LOG" 2>/dev/null | sed 's/^/      /' | head -20
+    echo "      --- end ---"
     grep -aqF "[E7] thread exit: TID $ctid " "$LOG" \
         && ok "exit(60) logged the child TID $ctid as a thread-local exit" \
         || bad "no thread-exit line for the cloned TID $ctid"
