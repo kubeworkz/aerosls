@@ -809,6 +809,11 @@ uint64_t do_syscall(uint64_t num, void* arg) {
                             /* A zero timespec is Linux's "do not block":
                              * the value matched, so the answer is the
                              * timeout itself, with no park. */
+                            kernel_serial_printf(
+                                "[E7] futex ts: largs3=0x%lx tv0=%lu tv1=%lu\n",
+                                (unsigned long)largs[3],
+                                (unsigned long)tv[0],
+                                (unsigned long)tv[1]);
                             if (tv[0] == 0 && tv[1] == 0)
                                 return (uint64_t)(int64_t)(-LINUX_ETIMEDOUT);
                             frc = linux_futex_deadline(tv[0], tv[1],
